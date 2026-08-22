@@ -24,6 +24,7 @@ from rl_injector.schema import (  # noqa: E402
 from rl_injector.errors import InjectorError  # noqa: E402
 from rl_injector.xml_export import (  # noqa: E402
     _b64,
+    build_account_doc,
     build_account_xml,
     decode_account,
     encode_account,
@@ -95,6 +96,7 @@ def _mini_template() -> str:
     account = (
         '<Account>'
         '<ID DataType="14">90000</ID>'
+        '<RECVR_NUM DataType="3">1</RECVR_NUM>'
         '<ACCOUNT_NUM DataType="3">1</ACCOUNT_NUM>'
         f'<NAME DataType="1">{_b64("TEMPLATE")}</NAME>'
         f'<ADDRESS DataType="1">{_b64("OLD ADDR")}</ADDRESS>'
@@ -136,6 +138,44 @@ def test_build_account_xml_from_design():
     assert s["keypads"] == 2                         # two keypad DeviceInfo blocks
     # old internal id fully re-pointed
     assert ">90000<" not in xml and xml.count(">92250<") >= 1
+
+
+def test_receiver_number_is_written_when_staging_provides_one():
+    """The receiver accepted by the public API must land in the account XML."""
+    acct = build_staging_account(_rl_design(), "2250", receiver_num="7")
+
+    doc = build_account_doc(acct, _mini_template())
+
+    assert doc.row("Account").text("RECVR_NUM") == "7"
+
+
+def test_blank_receiver_keeps_the_template_default():
+    """Legacy callers that omit receiver number retain the dealer default."""
+    acct = build_staging_account(_rl_design(), "2250", receiver_num="")
+
+    doc = build_account_doc(acct, _mini_template())
+
+    assert doc.row("Account").text("RECVR_NUM") == "1"
+
+
+def test_identity_rebadge_leaves_unrelated_matching_number_untouched():
+    """A field whose value happens to equal the old ID is not an identity ref."""
+    template = _mini_template().replace(
+        "</Account>",
+        '<PNL_BAUD DataType="3">90000</PNL_BAUD></Account>',
+    )
+    acct = build_staging_account(_rl_design(), "2250", receiver_num="")
+
+    doc = build_account_doc(acct, template)
+
+    assert doc.row("Account").text("ID") == "92250"
+    assert doc.row("Account").text("PNL_BAUD") == "90000"
+    assert {
+        field.raw
+        for row in doc.iter_rows()
+        for field in row.fields
+        if field.name == "ACCOUNT_ID"
+    } == {"92250"}
 
 
 def test_generate_account_xml_writes_file(tmp_path):

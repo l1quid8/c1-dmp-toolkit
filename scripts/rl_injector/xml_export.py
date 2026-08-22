@@ -19,13 +19,19 @@ keypads in <DeviceInfoList> as <DeviceInfo> blocks.
 from __future__ import annotations
 
 import hashlib
-import re
 from pathlib import Path
 from typing import Optional
 
 from Crypto.Cipher import AES
 
-from .account_doc import _b64, _unb64
+from .account_doc import (
+    AccountDoc,
+    SafetyIntent,
+    _b64,
+    _unb64,
+    parse_account_xml,
+    verify_account_doc,
+)
 from .errors import InjectorError
 from .schema import build_staging_account
 
@@ -64,107 +70,87 @@ def encode_account(xml_text: str, passphrase: str) -> str:
     return AES.new(_key(passphrase), AES.MODE_ECB).encrypt(raw).hex().upper()
 
 
-# --------------------------------------------------------------- xml render ---
+def _apply_account_edits(doc: AccountDoc, acct, sentinel: int) -> None:
+    """Apply the legacy account edits precisely through the document model."""
+    account = doc.row("Account")
+    account.set("ID", str(sentinel))
 
-def _set(xml: str, tag: str, inner: str, *, count: int = 1) -> str:
-    """Replace the inner text of the first `count` <tag ...>...</tag> (count=0 = all)."""
-    pat = re.compile(rf"(<{tag}\b[^>]*>).*?(</{tag}>)", re.S)
-    return pat.sub(lambda m: m.group(1) + inner + m.group(2), xml, count=count)
+    # Identity fields occur throughout the document. Match by tag rather than
+    # replacing every numeric value equal to the template's old internal ID.
+    for row in doc.iter_rows():
+        row.set("ACCOUNT_ID", str(sentinel))
+        row.set("ACCOUNT_NUM", acct.account_num)
+        row.set("ACCT_NUM", acct.account_num)
+    account.set("NAME", acct.name)
+    if acct.receiver_num:
+        account.set("RECVR_NUM", acct.receiver_num)
+
+    for tag, value in (
+        ("ADDRESS", acct.address),
+        ("CITY", acct.city),
+        ("STATE", acct.state),
+        ("ZIP", acct.zip_code),
+        ("PHONE", acct.phone),
+    ):
+        if value:
+            account.set(tag, value)
+
+    areas = doc.find_table("AreaInfoList")
+    if areas is not None:
+        for area in areas.rows:
+            area.set("NAME", acct.name)
+
+    users = doc.find_table("UsersList")
+    if users is not None:
+        for user in users.rows:
+            code = {
+                "1": acct.account_num,
+                "9999": "1" + acct.account_num,
+            }.get(user.text("USER_NUM"))
+            if code is not None:
+                user.set("CODE", code)
+
+    zones = doc.find_table("ZoneInfoList")
+    if zones is None or not zones.rows:
+        raise InjectorError("template has no <ZoneInfo> block to clone from")
+    prototypes = {}
+    for row in zones.rows:
+        prototypes.setdefault(row.text("TYPE"), row)
+    default_prototype = prototypes.get("NT") or zones.rows[0]
+    staged_zones = []
+    for zone in sorted(acct.zones, key=lambda item: item.number):
+        row = prototypes.get(zone.zone_type, default_prototype).clone()
+        row.set("NUMBER", str(zone.number))
+        row.set("NAME", f"Z{zone.number} {zone.name}")
+        staged_zones.append(row)
+    zones.rows = staged_zones
+
+    devices = doc.find_table("DeviceInfoList")
+    if devices is not None and devices.rows and acct.keypads:
+        prototype = devices.rows[0]
+        staged_devices = []
+        for number in acct.keypads:
+            row = prototype.clone()
+            row.set("NUMBER", str(number))
+            row.set("NAME", f"KEYPAD {number}")
+            staged_devices.append(row)
+        devices.rows = staged_devices
 
 
-def _field(block: str, tag: str) -> Optional[str]:
-    m = re.search(rf'<{tag}\b[^>]*DataType="(\d+)"[^>]*>(.*?)</{tag}>', block, re.S)
-    if not m:
-        return None
-    return _unb64(m.group(2)) if m.group(1) == "1" else m.group(2)
-
-
-def _replace_list(xml: str, list_tag: str, inner: str) -> str:
-    return re.sub(rf"(<{list_tag}>).*?(</{list_tag}>)",
-                  lambda m: m.group(1) + inner + m.group(2), xml, count=1, flags=re.S)
-
-
-def _rebadge_identity(xml: str, *, account_num: str, name: str, sentinel: int) -> str:
-    """Re-point the internal ID (referenced by every child <ACCOUNT_ID>) and the
-    two account-number fields, and set the account NAME (first NAME only)."""
-    m = re.search(r"<ID\b[^>]*>(\d+)</ID>", xml)
-    old_id = m.group(1) if m else None
-    xml = _set(xml, "ACCOUNT_NUM", account_num, count=0)
-    xml = _set(xml, "ACCT_NUM", account_num, count=0)
-    if old_id is not None and old_id != str(sentinel):
-        xml = xml.replace(f">{old_id}<", f">{sentinel}<")
-    xml = _set(xml, "NAME", _b64(name), count=1)
-    return xml
+def build_account_doc(acct, template_xml: str, *, sentinel: Optional[int] = None,
+                      safety_intent: SafetyIntent | None = None) -> AccountDoc:
+    """Build a structured account while preserving the legacy output bytes."""
+    if sentinel is None:
+        sentinel = SENTINEL_BASE + int(acct.account_num)
+    doc = parse_account_xml(template_xml)
+    _apply_account_edits(doc, acct, sentinel)
+    verify_account_doc(doc, safety_intent or SafetyIntent())
+    return doc
 
 
 def build_account_xml(acct, template_xml: str, *, sentinel: Optional[int] = None) -> str:
-    """Render a StagingAccount into a full RemoteLink account XML by cloning the
-    template's per-type zone blocks and keypad block."""
-    if sentinel is None:
-        sentinel = SENTINEL_BASE + int(acct.account_num)
-    xml = _rebadge_identity(template_xml, account_num=acct.account_num,
-                            name=acct.name, sentinel=sentinel)
-
-    # Account address block from the design (kept as base64 DataType=1 fields).
-    for tag, val in (("ADDRESS", acct.address), ("CITY", acct.city),
-                     ("STATE", acct.state), ("ZIP", acct.zip_code),
-                     ("PHONE", acct.phone)):
-        if val:
-            xml = _set(xml, tag, _b64(val), count=1)
-
-    # Area name = the school/account name (matches real exports). Every AreaInfo
-    # block's NAME is set; other area settings (exit delay, etc.) come from the
-    # template's dealer-standard defaults.
-    xml = re.sub(
-        r"<AreaInfo>.*?</AreaInfo>",
-        lambda m: re.sub(r"(<NAME\b[^>]*>).*?(</NAME>)",
-                         lambda n: n.group(1) + _b64(acct.name) + n.group(2),
-                         m.group(0), count=1, flags=re.S),
-        xml, flags=re.S)
-
-    # User-code defaults: USER (#1) = the site code, TECHNICIAN (#9999) =
-    # "1" + the site code. Other users (if any) keep the template's codes.
-    def _set_user_code(m):
-        blk = m.group(0)
-        num = re.search(r'<USER_NUM DataType="3">(\d+)</USER_NUM>', blk)
-        if not num:
-            return blk
-        code = {"1": acct.account_num,
-                "9999": "1" + acct.account_num}.get(num.group(1))
-        if code is None:
-            return blk
-        return re.sub(r"(<CODE\b[^>]*>).*?(</CODE>)",
-                      lambda c: c.group(1) + _b64(code) + c.group(2),
-                      blk, count=1, flags=re.S)
-    xml = re.sub(r"<Users>.*?</Users>", _set_user_code, xml, flags=re.S)
-
-    # Zones: clone a prototype block per DMP zone TYPE so type-specific
-    # programming fields (AREA_LIST, action messages, SWGR_BYPS) come along.
-    protos: dict[str, str] = {}
-    for zb in re.findall(r"<ZoneInfo>.*?</ZoneInfo>", xml, re.S):
-        protos.setdefault(_field(zb, "TYPE"), zb)
-    if not protos:
-        raise InjectorError("template has no <ZoneInfo> block to clone from")
-    default_proto = protos.get("NT") or next(iter(protos.values()))
-    blocks = []
-    for z in sorted(acct.zones, key=lambda x: x.number):
-        proto = protos.get(z.zone_type, default_proto)
-        b = _set(proto, "NUMBER", str(z.number), count=1)
-        b = _set(b, "NAME", _b64(f"Z{z.number} {z.name}"), count=1)
-        blocks.append(b)
-    xml = _replace_list(xml, "ZoneInfoList", "".join(blocks))
-
-    # Keypads: clone the DeviceInfo prototype, one per keypad bus number.
-    dproto = re.search(r"<DeviceInfo>.*?</DeviceInfo>", xml, re.S)
-    if dproto and acct.keypads:
-        dblocks = []
-        for n in acct.keypads:
-            d = _set(dproto.group(0), "NUMBER", str(n), count=1)
-            d = _set(d, "NAME", _b64(f"KEYPAD {n}"), count=1)
-            dblocks.append(d)
-        xml = _replace_list(xml, "DeviceInfoList", "".join(dblocks))
-
-    return xml
+    """Render a staged account through the structured document model."""
+    return build_account_doc(acct, template_xml, sentinel=sentinel).serialize()
 
 
 # ------------------------------------------------------------------- public ---
