@@ -260,14 +260,23 @@ def test_user_codes_default_from_account(tmp_path):
     assert codes.get("9999") == "12250"   # TECHNICIAN = 1 + site code
 
 
-def test_area_schedule_default(tmp_path):
-    import re
+def test_generated_account_has_no_arming_schedule(tmp_path):
+    """A generated account must not carry an auto-arming schedule.
+
+    The template used to ship a TimeScheds entry named "ARMING SCHEDULE" with
+    Area 1 bound to it (AreaTimeScheds SCHED_1=1). Imported as-is that self-arms
+    the panel on a timer, which is a per-site decision the tech makes in Remote
+    Link — not something a freshly-staged account should stamp in. Both were
+    removed from the template; this asserts the property on the generated
+    output, so it also catches a template regression.
+    """
     out = generate_account_xml(_rl_design(), "2250", template_path=BUNDLED_TEMPLATE,
                                passphrase="p", out_dir=tmp_path)
     xml = decode_account(out.read_text(), "p")
-    a1 = re.search(r"<AreaTimeScheds>.*?<NUMBER DataType=\"3\">1</NUMBER>.*?</AreaTimeScheds>",
-                   xml, re.S).group(0)
-    assert '<SCHED_1 DataType="3">1</SCHED_1>' in a1   # area 1 uses schedule 1
+    # No area is linked to a schedule number.
+    assert "<SCHED_1" not in xml
+    # No schedule definitions survive (the "ARMING SCHEDULE" block is gone).
+    assert "<TimeScheds>" not in xml
 
 
 def test_no_base64_padding_in_bundled_template():
