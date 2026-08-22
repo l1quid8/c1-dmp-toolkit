@@ -22,6 +22,7 @@ from rl_injector.rl_config import (  # noqa: E402
     config_from_dict,
     config_to_dict,
     resolve_config,
+    validate_config,
 )
 
 
@@ -129,4 +130,74 @@ def test_malformed_config_values_fall_back_to_safe_defaults():
     assert restored.arming.advanced == RLAdvanced()
     assert restored.keypads == {
         2: RLKeypad("17", "keypad", "keypad_bus", "FFFFFFFF")
+    }
+
+
+def test_valid_configuration_has_no_validation_warnings():
+    """Safe defaults resolved from a numeric school code are immediately usable."""
+    assert validate_config(RemoteLinkConfig(), _design()) == []
+
+
+def test_duplicate_user_numbers_and_codes_are_reported_separately():
+    """Both collisions matter because RemoteLink keys users by number and code."""
+    config = RemoteLinkConfig(
+        users=[
+            RLUser(7, "ONE", "7777", "1"),
+            RLUser(7, "TWO", "7777", "2"),
+        ],
+        users_customized=True,
+    )
+
+    issues = validate_config(config, _design())
+
+    assert {issue.code for issue in issues} == {
+        "remotelink.user_number_duplicate",
+        "remotelink.user_code_duplicate",
+    }
+
+
+def test_nonnumeric_and_short_user_codes_are_reported():
+    """Invalid panel codes should be visible before encrypted generation."""
+    config = RemoteLinkConfig(
+        users=[
+            RLUser(1, "ALPHA", "A123", "1"),
+            RLUser(2, "SHORT", "12", "1"),
+        ],
+        users_customized=True,
+    )
+
+    issues = validate_config(config, _design())
+
+    assert [issue.code for issue in issues].count("remotelink.user_code_invalid") == 2
+
+
+def test_port_outside_tcp_range_is_reported():
+    """A numeric but unusable port cannot silently reach the account."""
+    config = RemoteLinkConfig(comm=RLComm(port="70000"))
+
+    assert {issue.code for issue in validate_config(config, _design())} == {
+        "remotelink.port_invalid"
+    }
+
+
+def test_incomplete_enabled_schedule_day_is_reported():
+    """An open time without its close partner is ambiguous and unsafe."""
+    config = RemoteLinkConfig(arming=RLArming(advanced=RLAdvanced(
+        schedule_enabled=True,
+        schedule={"mon": RLScheduleDay(open_time="08:00", close_time="")},
+    )))
+
+    assert {issue.code for issue in validate_config(config, _design())} == {
+        "remotelink.schedule_incomplete"
+    }
+
+
+def test_invalid_keypad_display_area_mask_is_reported():
+    """Displayed areas must use RemoteLink's eight-digit hexadecimal mask."""
+    config = RemoteLinkConfig(keypads={
+        1: RLKeypad("LOBBY", "keypad", "keypad_bus", "AREA 1"),
+    })
+
+    assert {issue.code for issue in validate_config(config, _design())} == {
+        "remotelink.display_areas_invalid"
     }

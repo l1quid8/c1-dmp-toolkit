@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Callable, Iterator, Optional
 
 from parse_dmp_worksheet import DMPDesign
+from rl_injector.rl_config import RemoteLinkConfig, validate_config
 
 # Tabs the editor exposes; Issue.tab routes badges and "Go to" buttons.
 TAB_SITE = "SITE"
@@ -20,6 +21,7 @@ TAB_ZONES = "ZONES"
 TAB_SPLITTERS = "SPLITTERS"
 TAB_KEYPADS = "KEYPADS"
 TAB_POWER = "POWER"
+TAB_REMOTELINK = "REMOTELINK"
 
 
 @dataclass(frozen=True)
@@ -179,11 +181,23 @@ RULES: list[Callable[[DMPDesign, dict], Iterator[Issue]]] = [
 
 # -------- entry points --------
 
-def validate_design(design: DMPDesign, *, topology_confirmed: bool = False) -> list[Issue]:
+def validate_design(design: DMPDesign, *, topology_confirmed: bool = False,
+                    remotelink: RemoteLinkConfig | None = None) -> list[Issue]:
     ctx = {"topology_confirmed": topology_confirmed}
     issues: list[Issue] = []
     for rule in RULES:
         issues.extend(rule(design, ctx))
+    if remotelink is not None:
+        issues.extend(
+            Issue(
+                code=problem.code,
+                severity="warning",
+                tab=TAB_REMOTELINK,
+                ref=problem.ref,
+                message=problem.message,
+            )
+            for problem in validate_config(remotelink, design)
+        )
     return issues
 
 

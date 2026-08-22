@@ -28,6 +28,7 @@ from validation import (  # noqa: E402
     rsp_hyphen_fix,
     validate_design,
 )
+from rl_injector.rl_config import RLComm, RemoteLinkConfig  # noqa: E402
 
 
 def _valid_design() -> DMPDesign:
@@ -216,6 +217,24 @@ def test_sourced_keypads_silent():
     design.keypads = [Keypad(number=1, source="MSP")]
     issues = validate_design(design, topology_confirmed=True)
     assert "keypad.source_missing" not in _codes(issues)
+
+
+# -------- RemoteLink configuration warnings --------
+
+def test_remotelink_config_issue_routes_to_warning_badge_without_blocking():
+    """Configuration problems are review warnings, not worksheet hard stops."""
+    design = _valid_design()
+    design.site_info.school_code = "2250"
+    config = RemoteLinkConfig(comm=RLComm(port="70000"))
+
+    issues = validate_design(
+        design, topology_confirmed=True, remotelink=config,
+    )
+    hit = next(i for i in issues if i.code == "remotelink.port_invalid")
+
+    assert hit.tab == "REMOTELINK"
+    assert hit.severity == "warning"
+    assert finalize_ok(issues)
 
 
 # -------- aggregation --------

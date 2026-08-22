@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -77,6 +78,13 @@ class ResolvedRemoteLinkConfig:
     comm: RLComm
     arming: RLArming
     keypads: dict[int, RLKeypad]
+
+
+@dataclass(frozen=True)
+class RLConfigIssue:
+    code: str
+    ref: str | None
+    message: str
 
 
 def _text(value: Any, default: str = "") -> str:
@@ -208,3 +216,78 @@ def resolve_config(config: RemoteLinkConfig, design) -> ResolvedRemoteLinkConfig
         arming=copied.arming,
         keypads=copied.keypads,
     )
+
+
+def _duplicates(values: list) -> set:
+    seen = set()
+    duplicates = set()
+    for value in values:
+        if value in seen:
+            duplicates.add(value)
+        seen.add(value)
+    return duplicates
+
+
+def validate_config(config: RemoteLinkConfig, design) -> list[RLConfigIssue]:
+    """Return non-blocking operator warnings for editable RemoteLink values."""
+    resolved = resolve_config(config, design)
+    issues: list[RLConfigIssue] = []
+
+    for number in sorted(_duplicates([user.number for user in resolved.users])):
+        issues.append(RLConfigIssue(
+            code="remotelink.user_number_duplicate",
+            ref=f"user:{number}",
+            message=f"RemoteLink user number {number} is used more than once",
+        ))
+
+    duplicate_codes = _duplicates([
+        user.code.strip() for user in resolved.users if user.code.strip()
+    ])
+    for code in sorted(duplicate_codes):
+        issues.append(RLConfigIssue(
+            code="remotelink.user_code_duplicate",
+            ref="users",
+            message=f"RemoteLink user code {code} is used more than once",
+        ))
+
+    for user in resolved.users:
+        code = user.code.strip()
+        if not code.isdigit() or len(code) < 3:
+            issues.append(RLConfigIssue(
+                code="remotelink.user_code_invalid",
+                ref=f"user:{user.number}",
+                message=f"RemoteLink user {user.number} needs a numeric code "
+                        "with at least 3 digits",
+            ))
+
+    port = resolved.comm.port.strip()
+    try:
+        valid_port = 1 <= int(port) <= 65535
+    except ValueError:
+        valid_port = False
+    if not valid_port:
+        issues.append(RLConfigIssue(
+            code="remotelink.port_invalid",
+            ref="field:port",
+            message="RemoteLink panel port must be a number from 1 to 65535",
+        ))
+
+    advanced = resolved.arming.advanced
+    if advanced.schedule_enabled:
+        for day, schedule in advanced.schedule.items():
+            if bool(schedule.open_time.strip()) != bool(schedule.close_time.strip()):
+                issues.append(RLConfigIssue(
+                    code="remotelink.schedule_incomplete",
+                    ref=f"schedule:{day}",
+                    message=f"{day.title()} schedule needs both open and close times",
+                ))
+
+    for number, keypad in resolved.keypads.items():
+        if not re.fullmatch(r"[0-9A-Fa-f]{8}", keypad.disp_areas.strip()):
+            issues.append(RLConfigIssue(
+                code="remotelink.display_areas_invalid",
+                ref=f"keypad:{number}",
+                message=f"Keypad {number} displayed areas must be 8 hexadecimal digits",
+            ))
+
+    return issues

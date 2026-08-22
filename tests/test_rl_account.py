@@ -14,7 +14,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from parse_dmp_worksheet import DMPDesign, SiteInfo, RSP, Keypad, Zone  # noqa: E402
+from parse_dmp_worksheet import (  # noqa: E402
+    DMPDesign, SiteInfo, RSP, Keypad, Zone, ZoneInfo,
+)
 from rl_injector.schema import (  # noqa: E402
     ZONE_TYPE_NIGHT,
     ZONE_TYPE_SPARE,
@@ -71,6 +73,31 @@ def test_build_staging_account_zone_types():
     assert types[505] == ZONE_TYPE_SPARE
     assert types[515] == ZONE_TYPE_SUPERVISORY
     assert types[516] == ZONE_TYPE_SUPERVISORY
+
+
+def test_explicit_zone_type_override_wins_over_automatic_derivation():
+    """A field-tech Exit selection must replace the default Night type."""
+    design = _rl_design()
+    design.zones = [ZoneInfo(number=501, rl_type="EX")]
+
+    acct = build_staging_account(design, "2250", receiver_num="")
+
+    assert {z.number: z.zone_type for z in acct.zones}[501] == "EX"
+
+
+def test_auto_zone_type_preserves_derivation_and_spare_cannot_be_overridden():
+    """Auto remains today's behavior and an unused point always stays Spare."""
+    design = _rl_design()
+    design.zones = [
+        ZoneInfo(number=501, rl_type=""),
+        ZoneInfo(number=505, rl_type="NT"),
+    ]
+
+    acct = build_staging_account(design, "2250", receiver_num="")
+    types = {z.number: z.zone_type for z in acct.zones}
+
+    assert types[501] == "NT"
+    assert types[505] == "--"
 
 
 def test_build_staging_account_filters_uninstalled_zones():

@@ -162,13 +162,23 @@ def build_staging_account(
     for rsp in design.rsps:
         real_zone_numbers.update(rsp.zones)
 
+    rl_type_by_number = {
+        zone.number: zone.rl_type
+        for zone in design.zones
+        if zone.rl_type in (ZONE_TYPE_NIGHT, ZONE_TYPE_EXIT,
+                            ZONE_TYPE_SUPERVISORY)
+    }
+
     for z in sorted(design.master_zones, key=lambda x: x.number):
         if real_zone_numbers and z.number not in real_zone_numbers:
             continue
+        zone_type = derive_zone_type(z)
+        if not z.is_spare:
+            zone_type = rl_type_by_number.get(z.number, zone_type)
         acct.zones.append(StagingZone(
             number=z.number,
             name=derive_zone_room(z),
-            zone_type=derive_zone_type(z),
+            zone_type=zone_type,
             area=DEFAULT_AREA,
             is_spare=z.is_spare,
         ))
