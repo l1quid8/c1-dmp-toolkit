@@ -51,6 +51,15 @@ from session import (  # noqa: E402
     unique_session_path,
     write_recovery,
 )
+from rl_injector.rl_config import (  # noqa: E402
+    RLAdvanced,
+    RLArming,
+    RLComm,
+    RLKeypad,
+    RLScheduleDay,
+    RLUser,
+    RemoteLinkConfig,
+)
 
 
 def _populated_design() -> DMPDesign:
@@ -171,6 +180,91 @@ def test_save_load_session(tmp_sessions_dir):
     assert loaded.source_name == "DARBY_INTRUSION_DESIGN.pdf"
     assert loaded.saved_at is not None
     assert loaded.path == path
+
+
+def test_session_saves_schema_two_and_top_level_remotelink_config(tmp_sessions_dir):
+    """Older apps must reject configured projects instead of erasing new fields."""
+    session = Session(
+        design=_populated_design(),
+        remotelink=RemoteLinkConfig(account_num="3141", receiver_num="7"),
+    )
+
+    path = save_session(session)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+
+    assert SCHEMA_VERSION == 2
+    assert raw["schema_version"] == 2
+    assert raw["remotelink"]["account_num"] == "3141"
+    assert raw["remotelink"]["receiver_num"] == "7"
+
+
+def test_pre_feature_session_without_remotelink_loads_safe_defaults(tmp_sessions_dir):
+    """Schema-one projects need no migration step before opening."""
+    path = tmp_sessions_dir / "OLD.dmps"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "source": {"kind": "xlsx", "name": "old.xlsx"},
+        "topology_confirmed": False,
+        "design": design_to_dict(_populated_design()),
+    }), encoding="utf-8")
+
+    loaded = load_session(path)
+
+    assert loaded.remotelink == RemoteLinkConfig()
+
+
+def test_session_round_trip_preserves_complete_remotelink_config(tmp_sessions_dir):
+    """Nested RemoteLink programming is part of the saved project contract."""
+    config = RemoteLinkConfig(
+        account_num="3141",
+        receiver_num="7",
+        users=[RLUser(7, "CUSTODIAN", "7777", "2")],
+        users_customized=True,
+        comm=RLComm("network", "2201", "FAKE0001"),
+        arming=RLArming(
+            entry_delays=(15, 30, 45, 60),
+            exit_delay=90,
+            arm_mode="area",
+            advanced=RLAdvanced(
+                schedule_enabled=True,
+                schedule={"sun": RLScheduleDay("08:00", "22:00")},
+                ambush_reports=True,
+                ambush_output="7",
+                morn_ambush_min="5",
+                auto_arm=True,
+                auto_disarm=True,
+            ),
+        ),
+        keypads={1: RLKeypad("LOBBY", "keypad", "keypad_bus", "FFFFFFFF")},
+    )
+
+    loaded = load_session(save_session(Session(
+        design=_populated_design(), remotelink=config,
+    )))
+
+    assert loaded.remotelink == config
+
+
+def test_zone_remotelink_type_round_trips_and_missing_value_defaults_to_auto():
+    """Per-zone overrides persist while pre-feature rows remain automatic."""
+    explicit = design_to_dict(DMPDesign(zones=[
+        ZoneInfo(number=501, location="ROOM", rl_type="EX"),
+    ]))
+    old = design_to_dict(DMPDesign(zones=[
+        ZoneInfo(number=502, location="ROOM"),
+    ]))
+    old["zones"][0].pop("rl_type", None)
+
+    assert design_from_dict(explicit).zones[0].rl_type == "EX"
+    assert design_from_dict(old).zones[0].rl_type == ""
+
+
+def test_unknown_zone_remotelink_type_loads_as_auto():
+    """Unsupported hand-edited values cannot leak into generated XML."""
+    raw = design_to_dict(DMPDesign(zones=[ZoneInfo(number=501)]))
+    raw["zones"][0]["rl_type"] = "UNKNOWN"
+
+    assert design_from_dict(raw).zones[0].rl_type == ""
 
 
 def test_unique_session_path_avoids_overwriting_existing_project(tmp_sessions_dir):

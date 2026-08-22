@@ -83,6 +83,7 @@ class ZoneInfo:
     location: Optional[str] = None
     device_type: Optional[str] = None  # "Motion", "Supervisory", etc.
     partition: Optional[int] = None
+    rl_type: str = ""                   # ""=Auto, or NT/EX/SV override
 
 
 @dataclass

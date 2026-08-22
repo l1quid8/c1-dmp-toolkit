@@ -35,8 +35,13 @@ from parse_dmp_worksheet import (
     ZoneInfo,
     _master_zones_from_point_info,
 )
+from rl_injector.rl_config import (
+    RemoteLinkConfig,
+    config_from_dict,
+    config_to_dict,
+)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SESSION_EXT = ".dmps"
 RECOVERY_SUFFIX = ".recovery"
 
@@ -49,6 +54,7 @@ class SessionLoadError(Exception):
 class Session:
     """A DMPDesign plus the editing state that must survive app restarts."""
     design: DMPDesign
+    remotelink: RemoteLinkConfig = field(default_factory=RemoteLinkConfig)
     source_kind: str = ""            # "pdf" | "xlsx" | ""
     source_name: str = ""            # original input filename, display only
     topology_confirmed: bool = False
@@ -160,11 +166,15 @@ def _power_supply_from_dict(d: dict) -> PowerSupply:
 
 
 def _zone_info_from_dict(d: dict) -> ZoneInfo:
+    rl_type = d.get("rl_type", "")
+    if rl_type not in ("", "NT", "EX", "SV"):
+        rl_type = ""
     return ZoneInfo(
         number=d.get("number", 0),
         location=d.get("location"),
         device_type=d.get("device_type"),
         partition=d.get("partition"),
+        rl_type=rl_type,
     )
 
 
@@ -308,6 +318,7 @@ def _session_to_dict(session: Session) -> dict:
         "saved_at": session.saved_at,
         "source": {"kind": session.source_kind, "name": session.source_name},
         "topology_confirmed": session.topology_confirmed,
+        "remotelink": config_to_dict(session.remotelink),
         "design": design_to_dict(session.design),
     }
 
@@ -323,6 +334,7 @@ def _session_from_dict(d: dict, path: Path) -> Session:
     source = d.get("source") or {}
     return Session(
         design=design_from_dict(d.get("design") or {}),
+        remotelink=config_from_dict(d.get("remotelink") or {}),
         source_kind=source.get("kind", ""),
         source_name=source.get("name", ""),
         topology_confirmed=bool(d.get("topology_confirmed", False)),
