@@ -51,3 +51,7 @@ class ODBCApplyError(InjectorError):
 
 class VerificationError(InjectorError):
     """Post-write read-back did not match the source design."""
+
+
+class AccountSafetyError(InjectorError):
+    """Generated programming contains dangerous behavior without operator intent."""
