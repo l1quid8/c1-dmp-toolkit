@@ -18,7 +18,6 @@ keypads in <DeviceInfoList> as <DeviceInfo> blocks.
 """
 from __future__ import annotations
 
-import base64
 import hashlib
 import re
 from pathlib import Path
@@ -26,6 +25,7 @@ from typing import Optional
 
 from Crypto.Cipher import AES
 
+from .account_doc import _b64, _unb64
 from .errors import InjectorError
 from .schema import build_staging_account
 
@@ -65,23 +65,6 @@ def encode_account(xml_text: str, passphrase: str) -> str:
 
 
 # --------------------------------------------------------------- xml render ---
-
-def _b64(text: str) -> str:
-    """Encode a DataType=1 string value the way RemoteLink does.
-
-    DMP NUL-pads the text to a multiple of 3 bytes so the base64 carries NO '='
-    padding (real exports use '=' in none of their string fields). RemoteLink's
-    importer mis-decodes '='-padded values into garbage characters, which showed
-    up as trailing junk on zone names whose length was ≡1 mod 3.
-    """
-    raw = text.encode("latin-1")
-    raw += b"\x00" * ((3 - len(raw) % 3) % 3)
-    return base64.b64encode(raw).decode("ascii")
-
-
-def _unb64(value: str) -> str:
-    return base64.b64decode(value).decode("latin-1").rstrip("\x00")
-
 
 def _set(xml: str, tag: str, inner: str, *, count: int = 1) -> str:
     """Replace the inner text of the first `count` <tag ...>...</tag> (count=0 = all)."""
