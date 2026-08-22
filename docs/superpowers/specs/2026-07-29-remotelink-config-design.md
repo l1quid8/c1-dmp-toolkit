@@ -1,7 +1,7 @@
 # RemoteLink account configuration — design
 
 Date: 2026-07-29
-Status: approved in discussion; pending spec review
+Status: approved
 
 ## Goal
 
