@@ -30,6 +30,7 @@ from rl_injector.rl_config import (  # noqa: E402
     resolve_config,
     validate_config,
 )
+from editor_zones import rl_type_display, rl_type_from_label  # noqa: E402
 
 
 FIELD_MAPS = json.loads(
@@ -78,6 +79,21 @@ def test_schedule_field_map_matches_calibrated_monday_and_known_weekday_dates():
         expected["static_fields"]
     assert SCHEDULE_FIELD_MAP["area_link_field"] == expected["area_link_field"]
     assert SCHEDULE_FIELD_MAP["schedule_number"] == expected["schedule_number"]
+
+
+def test_zone_type_display_distinguishes_auto_explicit_and_spare():
+    assert rl_type_display("", automatic="NT") == "Auto → Night"
+    assert rl_type_display("EX", automatic="NT") == "Exit"
+    assert rl_type_display("SV", automatic="NT") == "Supervisory"
+    assert rl_type_display("NT", automatic="EX", spare=True) == "Spare"
+
+
+def test_zone_type_label_parser_stores_auto_as_blank_code():
+    assert rl_type_from_label("Auto") == ""
+    assert rl_type_from_label("Auto → Night") == ""
+    assert rl_type_from_label("Night") == "NT"
+    assert rl_type_from_label("Exit") == "EX"
+    assert rl_type_from_label("Supervisory") == "SV"
 
 
 def test_untouched_config_resolves_account_and_users_from_school_code():

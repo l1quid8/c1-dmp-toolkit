@@ -24,22 +24,51 @@ import customtkinter as ctk
 
 import theme
 from parse_dmp_worksheet import DMPDesign, ZoneInfo
+from rl_injector.schema import derive_zone_type
 from ui_widgets import Card, Chip, accent_outline_button, attach_tooltip
 
 DEVICE_TYPES = ["Motion", "Door Contact", "Glass Break", "Panic",
                 "Supervisory", "Spare"]
 
-COLUMNS = ("zone", "description", "device_type", "partition", "expander")
+COLUMNS = ("zone", "description", "device_type", "rl_type", "partition", "expander")
 HEADINGS = {"zone": "ZONE", "description": "DESCRIPTION",
-            "device_type": "DEVICE TYPE", "partition": "PART#",
+            "device_type": "DEVICE TYPE", "rl_type": "TYPE",
+            "partition": "PART#",
             "expander": "EXP#"}
 # The spec allots PART# 60 and EXP# 56, but a ttk heading reserves ~10px of
 # internal padding on top of the text, and the letter-spaced label needs 58/45.
 # Widening the two numeric columns beats clipping their headers; DESCRIPTION is
 # the flex column, so it gives up the difference.
-WIDTHS = {"zone": 70, "description": 260, "device_type": 150,
+WIDTHS = {"zone": 70, "description": 200, "device_type": 135,
+          "rl_type": 120,
           "partition": 72, "expander": 62}
-EDITABLE = {"description", "device_type", "partition"}
+EDITABLE = {"description", "device_type", "rl_type", "partition"}
+
+RL_TYPE_LABELS = {
+    "NT": "Night",
+    "EX": "Exit",
+    "SV": "Supervisory",
+}
+RL_TYPE_CHOICES = ("Auto", "Night", "Exit", "Supervisory")
+
+
+def rl_type_display(stored: str, *, automatic: str = "NT",
+                    spare: bool = False) -> str:
+    """Return the operator-facing RemoteLink TYPE without touching the model."""
+    if spare:
+        return "Spare"
+    if stored in RL_TYPE_LABELS:
+        return RL_TYPE_LABELS[stored]
+    return f"Auto → {RL_TYPE_LABELS.get(automatic, automatic or 'Night')}"
+
+
+def rl_type_from_label(label: str) -> str:
+    """Map the readonly editor label to the persisted blank/NT/EX/SV code."""
+    label = (label or "").strip()
+    if label == "Auto" or label.startswith("Auto →"):
+        return ""
+    return next((code for code, name in RL_TYPE_LABELS.items()
+                 if name == label), "")
 
 FILTERS = ["All", "Needs attention", "Spares", "Errors"]
 
@@ -175,7 +204,7 @@ class ZonesTab(ctk.CTkFrame):
             style="Zones.Treeview", selectmode="browse", height=12,
         )
         for col in COLUMNS:
-            anchor = "w" if col in ("description", "device_type") else "center"
+            anchor = "w" if col in ("description", "device_type", "rl_type") else "center"
             self.tree.heading(col, text=theme.tracked(HEADINGS[col]), anchor=anchor)
             # Description is the only flexible column; the rest hold the
             # handoff's fixed widths at every window size.
@@ -257,6 +286,16 @@ class ZonesTab(ctk.CTkFrame):
         predicate, so the tint, the chip count and the filter never diverge."""
         return self._row_passes(zi, "", "Needs attention")
 
+    @staticmethod
+    def _is_spare(zi: ZoneInfo) -> bool:
+        return ((zi.location or "").strip().upper() == "SPARE"
+                or (zi.device_type or "").strip().lower() == "spare")
+
+    def _automatic_rl_type(self, zi: ZoneInfo) -> str:
+        zone = next((zone for zone in self.design.master_zones
+                     if zone.number == zi.number), None)
+        return derive_zone_type(zone) if zone is not None else "NT"
+
     def _values_for(self, zi: ZoneInfo, exp_map: dict[int, int]) -> tuple:
         """Display values only. Never write these back into a ZoneInfo: the
         description carries the FILL_IN decoration the spec's inline tag stands
@@ -265,7 +304,12 @@ class ZonesTab(ctk.CTkFrame):
         desc = zi.location or ""
         if self._needs_attention(zi):
             desc = f"{desc}{FILL_IN_SUFFIX}" if desc else FILL_IN
-        return (f"Z{zi.number}", desc, zi.device_type or "",
+        rl_display = rl_type_display(
+            zi.rl_type,
+            automatic=self._automatic_rl_type(zi),
+            spare=self._is_spare(zi),
+        )
+        return (f"Z{zi.number}", desc, zi.device_type or "", rl_display,
                 zi.partition if zi.partition is not None else "",
                 exp_map.get(zi.number, ""))
 
@@ -390,7 +434,10 @@ class ZonesTab(ctk.CTkFrame):
             if zi.number not in self._error_zones:
                 return False
         if needle:
-            hay = f"z{zi.number} {zi.location or ''}".lower()
+            hay = (
+                f"z{zi.number} {zi.location or ''} {zi.device_type or ''} "
+                f"{rl_type_display(zi.rl_type, automatic=self._automatic_rl_type(zi), spare=self._is_spare(zi))}"
+            ).lower()
             if needle not in hay:
                 return False
         return True
@@ -422,7 +469,9 @@ class ZonesTab(ctk.CTkFrame):
         col_id = self.tree.identify_column(event.x)
         if iid and col_id:
             col = COLUMNS[int(col_id[1:]) - 1]
-            if col in EDITABLE:
+            zi = self._zone_info(int(iid))
+            if col in EDITABLE and not (
+                    col == "rl_type" and zi is not None and self._is_spare(zi)):
                 self._begin_edit(iid, col)
 
     def _on_return(self, _event):
@@ -433,13 +482,15 @@ class ZonesTab(ctk.CTkFrame):
 
     def _begin_edit(self, iid: str, col: str):
         self._cancel_edit()
+        zi = self._zone_info(int(iid))
+        if col == "rl_type" and zi is not None and self._is_spare(zi):
+            return
         bbox = self.tree.bbox(iid, col)
         if not bbox:
             return
         x, y, w, h = bbox
         # Seed from the model, not the cell: the description cell may carry the
         # FILL_IN decoration, which must never become the edited value.
-        zi = self._zone_info(int(iid))
         if col == "description" and zi is not None:
             current = zi.location or ""
         else:
@@ -450,6 +501,13 @@ class ZonesTab(ctk.CTkFrame):
                                   style="Zones.TCombobox",
                                   font=(self._ui_family, theme.SIZE["body"]))
             widget.set(current)
+        elif col == "rl_type":
+            widget = ttk.Combobox(
+                self.tree, values=RL_TYPE_CHOICES, state="readonly",
+                style="Zones.TCombobox",
+                font=(self._ui_family, theme.SIZE["body"]),
+            )
+            widget.set("Auto" if current.startswith("Auto →") else current)
         else:
             widget = ttk.Entry(self.tree, style="Zones.TEntry",
                                font=(self._ui_family, theme.SIZE["body"]))
@@ -493,6 +551,9 @@ class ZonesTab(ctk.CTkFrame):
             zi.device_type = value or None
             if value.lower() == "spare" and (zi.location or "").upper() != "SPARE":
                 zi.location = "SPARE"
+        elif col == "rl_type":
+            if not self._is_spare(zi):
+                zi.rl_type = rl_type_from_label(value)
         elif col == "partition":
             try:
                 zi.partition = int(value) if value else None
