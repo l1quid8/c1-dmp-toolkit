@@ -20,6 +20,7 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 import theme
+from topology_service import refresh_connections_from_legacy
 from hardware import snapshot_refs, diff_refs
 from session import Session, save_session, sync_master_zones, write_recovery, clear_recovery
 from validation import validate_design, badge_counts, badge_counts_by_severity
@@ -516,6 +517,7 @@ class EditorFrame(ctk.CTkFrame):
 
     def _on_structure_change(self):
         """Hardware was added or removed: every tab's choices and rows shift."""
+        refresh_connections_from_legacy(self.session.design)
         sync_master_zones(self.session.design)
         self.mark_dirty()
         self.refresh_validation()

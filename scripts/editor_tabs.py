@@ -43,6 +43,7 @@ from hardware import (
     renumber_splitter,
 )
 from session import Session
+from topology_service import refresh_connections_from_legacy
 from ui_widgets import (
     AutocompleteEntry,
     Card,
@@ -847,6 +848,7 @@ class SplittersTab(ctk.CTkFrame):
         key = next(iter(splitter.inputs), None) or (
             "LX-Bus In" if splitter.splitter_type == "LX" else "KP-Bus In")
         splitter.inputs = {key: val} if val else {}
+        refresh_connections_from_legacy(self.session.design)
         self.on_change()
         self._schedule_topology_rebuild()
 
@@ -856,6 +858,7 @@ class SplittersTab(ctk.CTkFrame):
             outs.append("Spare")
         outs[index] = value
         splitter.outputs = outs
+        refresh_connections_from_legacy(self.session.design)
         self.on_change()
         self._schedule_topology_rebuild()
 

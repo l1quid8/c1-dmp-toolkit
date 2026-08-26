@@ -46,6 +46,7 @@ from riser_model import (
     default_riser_document,
     derive_legacy_connections,
 )
+from topology_service import ensure_explicit_topology, project_legacy_topology
 
 SCHEMA_VERSION = 2
 SESSION_EXT = ".dmps"
@@ -415,6 +416,8 @@ def _atomic_write(path: Path, text: str) -> None:
 def save_session(session: Session, path: Path | None = None) -> Path:
     """Explicit save: commit the session and clear any recovery file."""
     target = path or session.path or default_session_path(session.design)
+    ensure_explicit_topology(session.design)
+    project_legacy_topology(session.design)
     sync_master_zones(session.design)
     session.saved_at = datetime.now().isoformat(timespec="seconds")
     session.path = target
@@ -462,6 +465,8 @@ def write_recovery(session: Session) -> Path:
     """Background snapshot of unsaved work. Never shown unless offered on open."""
     target = session.path or default_session_path(session.design)
     rec = recovery_path(target)
+    ensure_explicit_topology(session.design)
+    project_legacy_topology(session.design)
     sync_master_zones(session.design)
     d = _session_to_dict(session)
     d["saved_at"] = datetime.now().isoformat(timespec="seconds")

@@ -43,6 +43,7 @@ from session import (
     unique_session_path,
 )
 from editor_frame import EditorFrame
+from topology_service import ensure_explicit_topology, project_legacy_topology
 from editor_tabs import auto_hide_scrollbar
 from rl_injector.xml_export import generate_account_xml
 import theme
@@ -1231,6 +1232,7 @@ class App:
         ensure_editable_zones(session.design)
         normalize_rsp_tokens(session.design)
         normalize_zone_descriptions(session.design)
+        ensure_explicit_topology(session.design)
         self.session = session
         self.parsed_design = session.design  # generation flows read this
         self.state = "editing"
@@ -1364,6 +1366,7 @@ class App:
 
         def proceed():
             design = self.session.design
+            project_legacy_topology(design)
             sync_master_zones(design)
             # Persist the per-machine site defaults (tech, IP, ...). Phone and
             # install date are deliberately excluded: phone is school-specific

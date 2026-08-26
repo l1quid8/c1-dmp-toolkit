@@ -31,6 +31,7 @@ import re
 
 from extract_topology import cluster_devices, extract_spans
 from inject_door_chart import _slugify
+from topology_service import ensure_explicit_topology, project_legacy_topology
 
 # Phase 3 (vector-line edge detection) is optional — gracefully degrade if it's not in place.
 try:
@@ -852,6 +853,8 @@ def write_dmp_xlsx(design: DMPDesign, template_path: Path, output_path: Path,
     DMPStatus doc property (drafts are refused on re-import — the session is
     the source of truth); "FINAL" adds only the doc property.
     """
+    ensure_explicit_topology(design)
+    project_legacy_topology(design)
     import shutil
     shutil.copy(template_path, output_path)
 
