@@ -317,3 +317,29 @@ def test_non_display_device_uses_verified_two_digit_area_value():
     })
 
     assert validate_config(config, _design()) == []
+
+
+def test_invalid_schedule_time_is_reported_before_generation():
+    config = RemoteLinkConfig(arming=RLArming(advanced=RLAdvanced(
+        schedule_enabled=True,
+        schedule={"mon": RLScheduleDay("25:99", "22:00")},
+    )))
+
+    assert {issue.code for issue in validate_config(config, _design())} == {
+        "remotelink.schedule_time_invalid"
+    }
+
+
+def test_unverified_enum_values_are_never_accepted_as_raw_programming():
+    config = RemoteLinkConfig(
+        comm=RLComm(connect_type="mystery"),
+        arming=RLArming(arm_mode="mystery"),
+        keypads={1: RLKeypad("X", "mystery", "mystery", "FFFFFFFF")},
+    )
+
+    assert {issue.code for issue in validate_config(config, _design())} == {
+        "remotelink.connect_type_invalid",
+        "remotelink.arm_mode_invalid",
+        "remotelink.keypad_device_type_invalid",
+        "remotelink.keypad_comm_type_invalid",
+    }

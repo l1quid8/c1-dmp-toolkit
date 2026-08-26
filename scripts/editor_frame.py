@@ -24,6 +24,7 @@ from hardware import snapshot_refs, diff_refs
 from session import Session, save_session, sync_master_zones, write_recovery, clear_recovery
 from validation import validate_design, badge_counts, badge_counts_by_severity
 from editor_zones import ZonesTab
+from editor_remotelink import RemoteLinkTab
 from editor_tabs import (
     KeypadsTab,
     PowerTab,
@@ -66,7 +67,7 @@ def _format_install_date(d) -> str:
     suffix = "th" if 11 <= n % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
     return f"{d.strftime('%B').upper()} {n}{suffix} {d.year}"
 
-TAB_TITLES = ["SITE", "ZONES", "SPLITTERS", "KEYPADS", "POWER"]
+TAB_TITLES = ["SITE", "ZONES", "SPLITTERS", "KEYPADS", "POWER", "REMOTELINK"]
 
 
 def _bind_click_tree(widget, command):
@@ -438,6 +439,11 @@ class EditorFrame(ctk.CTkFrame):
             widget.grid(row=0, column=0, sticky="nsew")
             setattr(self, attr, widget)
 
+        self.remotelink_tab = RemoteLinkTab(
+            self.tabs.tab("REMOTELINK"), self.session, self._on_remotelink_edit,
+        )
+        self.remotelink_tab.grid(row=0, column=0, sticky="nsew")
+
         self._build_footer()
 
     def _build_footer(self):
@@ -509,12 +515,23 @@ class EditorFrame(ctk.CTkFrame):
         sync_master_zones(self.session.design)
         self.mark_dirty()
         self.refresh_validation()
+        self._refresh_remotelink_receipt()
 
     def _on_design_edit(self):
         """Splitter/keypad/power edits: RSP locations feed master rows too."""
         sync_master_zones(self.session.design)
         self.mark_dirty()
         self.refresh_validation()
+        self._refresh_remotelink_receipt()
+
+    def _on_remotelink_edit(self):
+        self.mark_dirty()
+        self.refresh_validation()
+
+    def _refresh_remotelink_receipt(self):
+        tab = getattr(self, "remotelink_tab", None)
+        if tab is not None:
+            tab.refresh_receipt()
 
     def _on_structure_change(self):
         """Hardware was added or removed: every tab's choices and rows shift."""
@@ -522,6 +539,7 @@ class EditorFrame(ctk.CTkFrame):
         self.mark_dirty()
         self.refresh_validation()
         self.refresh_all_tabs()
+        self._refresh_remotelink_receipt()
 
     def apply_hardware_change(self, mutate):
         """Run a removal that may cascade, then surface what it rewired.
@@ -606,6 +624,7 @@ class EditorFrame(ctk.CTkFrame):
         self.splitters_tab.refresh()
         self.keypads_tab.refresh()
         self.power_tab.refresh()
+        self.remotelink_tab.refresh()
 
     # ------------------------------------------------------------------ #
     # Pre-generate issue summary (warn, never block)                        #
@@ -619,6 +638,8 @@ class EditorFrame(ctk.CTkFrame):
         if ref.startswith("zone:") and hasattr(self, "zones"):
             with contextlib.suppress(ValueError):
                 self.zones.select_zone(int(ref.split(":", 1)[1]))
+        elif issue.tab == "REMOTELINK" and hasattr(self, "remotelink_tab"):
+            self.remotelink_tab.focus_issue(ref)
 
     def show_issues_dialog(self, on_proceed, *, proceed_label: str,
                            note: str | None = None):
@@ -762,8 +783,11 @@ class EditorFrame(ctk.CTkFrame):
     # ------------------------------------------------------------------ #
 
     def refresh_validation(self):
-        issues = validate_design(self.session.design,
-                                 topology_confirmed=self.session.topology_confirmed)
+        issues = validate_design(
+            self.session.design,
+            topology_confirmed=self.session.topology_confirmed,
+            remotelink=self.session.remotelink,
+        )
         counts = badge_counts(issues)
         if counts:
             text = "   ".join(f"{tab} ⚠{n}" for tab, n in counts.items())
@@ -951,6 +975,7 @@ class EditorFrame(ctk.CTkFrame):
         setattr(self.session.remotelink.comm, attr, value.strip())
         self.mark_dirty()
         self.refresh_validation()
+        self._refresh_remotelink_receipt()
 
     def _on_site_edit(self, attr: str, var: ctk.StringVar):
         if self._suspend_traces:
@@ -958,6 +983,7 @@ class EditorFrame(ctk.CTkFrame):
         setattr(self.session.design.site_info, attr, var.get().strip() or None)
         self.mark_dirty()
         self.refresh_validation()
+        self._refresh_remotelink_receipt()
         # School name doubles as the project title in the toolbar.
         if attr == "school_name":
             self._notify_status()

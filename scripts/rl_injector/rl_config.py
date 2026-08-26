@@ -355,6 +355,19 @@ def validate_config(config: RemoteLinkConfig, design) -> list[RLConfigIssue]:
     resolved = resolve_config(config, design)
     issues: list[RLConfigIssue] = []
 
+    if resolved.comm.connect_type not in CONNECT_TYPES:
+        issues.append(RLConfigIssue(
+            code="remotelink.connect_type_invalid",
+            ref="field:connect_type",
+            message="Choose a verified RemoteLink connection type",
+        ))
+    if resolved.arming.arm_mode not in ARM_MODES:
+        issues.append(RLConfigIssue(
+            code="remotelink.arm_mode_invalid",
+            ref="field:arm_mode",
+            message="Choose a verified RemoteLink arming type",
+        ))
+
     for number in sorted(_duplicates([user.number for user in resolved.users])):
         issues.append(RLConfigIssue(
             code="remotelink.user_number_duplicate",
@@ -403,8 +416,30 @@ def validate_config(config: RemoteLinkConfig, design) -> list[RLConfigIssue]:
                     ref=f"schedule:{day}",
                     message=f"{day.title()} schedule needs both open and close times",
                 ))
+            for value in (schedule.open_time.strip(), schedule.close_time.strip()):
+                if value and not re.fullmatch(
+                        r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+                    issues.append(RLConfigIssue(
+                        code="remotelink.schedule_time_invalid",
+                        ref=f"schedule:{day}",
+                        message=f"{day.title()} schedule times must use HH:MM "
+                                "in 24-hour time",
+                    ))
+                    break
 
     for number, keypad in resolved.keypads.items():
+        if keypad.device_type not in KEYPAD_DEVICE_TYPES:
+            issues.append(RLConfigIssue(
+                code="remotelink.keypad_device_type_invalid",
+                ref=f"keypad:{number}",
+                message=f"Keypad {number} needs a verified device type",
+            ))
+        if keypad.comm_type not in KEYPAD_COMM_TYPES:
+            issues.append(RLConfigIssue(
+                code="remotelink.keypad_comm_type_invalid",
+                ref=f"keypad:{number}",
+                message=f"Keypad {number} needs a verified communication type",
+            ))
         expected_width = 2 if keypad.device_type in (
             "zone_expander", "vplex_pl500",
         ) else 8
