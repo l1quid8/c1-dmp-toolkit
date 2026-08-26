@@ -66,6 +66,28 @@ def test_layout_is_deterministic_balanced_and_groups_shared_locations():
     assert first.routes and all(route.points for route in first.routes.values())
 
 
+def test_layout_keeps_location_modules_compact_and_non_overlapping():
+    document = layout_riser(branched_design())
+    locations = [element for element in document.elements.values()
+                 if element.kind == "location"]
+
+    assert document.elements["location:MDF"].width < 1000
+    for index, first in enumerate(locations):
+        for second in locations[index + 1:]:
+            assert not (first.x < second.x + second.width and
+                        first.x + first.width > second.x and
+                        first.y < second.y + second.height and
+                        first.y + first.height > second.y)
+
+
+def test_auto_layout_places_cable_labels_clear_of_device_symbols():
+    design = branched_design()
+    document = layout_riser(design)
+
+    assert not [issue for issue in validate_riser(design, document)
+                if issue.code == "scene.label_overlap"]
+
+
 def test_sync_preserves_manual_geometry_and_places_new_devices_in_tray():
     d = branched_design()
     document = layout_riser(d)

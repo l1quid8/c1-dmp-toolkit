@@ -19,6 +19,7 @@ from riser_scene import (
     layout_riser,
     port_point,
     route_connection,
+    route_label_point,
     sync_riser_document,
     validate_riser,
 )
@@ -358,6 +359,7 @@ class RiserTab(ctk.CTkFrame):
         self._gesture = None
         self._connect_source: DevicePortRef | None = None
         self._preview_item = None
+        self._initial_fit_done = False
         self._tool_buttons: dict[str, ctk.CTkButton] = {}
         self._title_vars: dict[str, tk.StringVar] = {}
         self.layer_visibility = {
@@ -377,8 +379,11 @@ class RiserTab(ctk.CTkFrame):
     def _build_toolbar(self):
         bar = ctk.CTkFrame(self, fg_color=theme.CHROME, corner_radius=0,
                            height=48)
+        self.toolbar = bar
         bar.grid(row=0, column=0, sticky="ew")
-        bar.grid_propagate(False)
+        # Every child is pack-managed. Without disabling *pack* propagation,
+        # CTkFrame's 200px default child height can inflate this 48px strip.
+        bar.pack_propagate(False)
         for name in self.TOOLS:
             button = ctk.CTkButton(
                 bar, text=name, width=max(58, len(name) * 8), height=28,
@@ -389,8 +394,8 @@ class RiserTab(ctk.CTkFrame):
             button.pack(side="left", padx=(6 if name == "Select" else 1, 0), pady=10)
             self._tool_buttons[name] = button
 
-        ctk.CTkFrame(bar, width=1, fg_color=theme.BORDER).pack(
-            side="left", fill="y", padx=8, pady=9)
+        ctk.CTkFrame(bar, width=1, height=28, fg_color=theme.BORDER,
+                     corner_radius=0).pack(side="left", padx=8, pady=10)
         for text, command in (("Undo", self.undo), ("Redo", self.redo),
                               ("Duplicate", self.duplicate_selected),
                               ("Delete", self.delete_selected)):
@@ -409,12 +414,10 @@ class RiserTab(ctk.CTkFrame):
         self._grid_switch.select()
         self._grid_switch.pack(side="left", padx=2)
 
-        ctk.CTkButton(bar, text="Generate Riser", width=116, height=30,
-                      fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
-                      command=self.on_generate).pack(side="right", padx=10)
         ctk.CTkButton(bar, text="Re-layout All", width=96, height=28,
                       fg_color="transparent", hover_color=theme.HOVER_SUBTLE,
-                      text_color=theme.TEXT, command=self.relayout).pack(side="right")
+                      text_color=theme.TEXT, command=self.relayout).pack(
+                          side="right", padx=(0, 8))
         ctk.CTkButton(bar, text="Auto-layout", width=90, height=28,
                       fg_color="transparent", hover_color=theme.HOVER_SUBTLE,
                       text_color=theme.TEXT, command=self.auto_layout).pack(side="right")
@@ -428,6 +431,10 @@ class RiserTab(ctk.CTkFrame):
         ctk.CTkButton(bar, text="−", width=28, height=28,
                       fg_color="transparent", text_color=theme.TEXT,
                       command=lambda: self.set_zoom(self.zoom / 1.2)).pack(side="right")
+        ctk.CTkButton(bar, text="Fit", width=42, height=28,
+                      fg_color=theme.SURFACE_CHIP,
+                      hover_color=theme.HOVER_SUBTLE, text_color=theme.TEXT,
+                      command=self.fit_to_view).pack(side="right", padx=(8, 2))
 
     def _build_workspace(self):
         body = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
@@ -467,6 +474,7 @@ class RiserTab(ctk.CTkFrame):
         self.canvas.bind("<MouseWheel>", self._on_wheel)
         self.canvas.bind("<Button-4>", lambda _e: self.set_zoom(self.zoom * 1.1))
         self.canvas.bind("<Button-5>", lambda _e: self.set_zoom(self.zoom / 1.1))
+        self.canvas.bind("<Configure>", self._fit_when_ready, add="+")
 
     def _section(self, text, row):
         label = ctk.CTkLabel(
@@ -552,11 +560,22 @@ class RiserTab(ctk.CTkFrame):
     # ---- drawing ------------------------------------------------------
 
     def _xy(self, point):
-        return point[0] * self.zoom + 24, point[1] * self.zoom + 24
+        origin_x, origin_y = self._page_origin()
+        return point[0] * self.zoom + origin_x, point[1] * self.zoom + origin_y
+
+    def _page_origin(self):
+        doc = self.controller.document
+        canvas_width = max(1, self.canvas.winfo_width())
+        canvas_height = max(1, self.canvas.winfo_height())
+        return (
+            max(24.0, (canvas_width - doc.page_width * self.zoom) / 2),
+            max(24.0, (canvas_height - doc.page_height * self.zoom) / 2),
+        )
 
     def _world(self, event):
-        return ((self.canvas.canvasx(event.x) - 24) / self.zoom,
-                (self.canvas.canvasy(event.y) - 24) / self.zoom)
+        origin_x, origin_y = self._page_origin()
+        return ((self.canvas.canvasx(event.x) - origin_x) / self.zoom,
+                (self.canvas.canvasy(event.y) - origin_y) / self.zoom)
 
     def _snap(self, point):
         if not self.snap_enabled:
@@ -567,19 +586,21 @@ class RiserTab(ctk.CTkFrame):
         self.canvas.delete("all")
         doc = self.controller.document
         width, height = doc.page_width * self.zoom, doc.page_height * self.zoom
-        self.canvas.create_rectangle(24, 24, 24 + width, 24 + height,
+        origin_x, origin_y = self._page_origin()
+        self.canvas.create_rectangle(origin_x, origin_y,
+                                     origin_x + width, origin_y + height,
                                      fill="#ffffff", outline="#c7cdd4", width=1,
                                      tags=("page",))
         if self.grid_enabled and self.zoom >= 0.25:
             step = GRID * self.zoom
-            x = 24.0
-            while x <= 24 + width:
-                self.canvas.create_line(x, 24, x, 24 + height,
+            x = origin_x
+            while x <= origin_x + width:
+                self.canvas.create_line(x, origin_y, x, origin_y + height,
                                         fill="#edf0f2", tags=("grid",))
                 x += step
-            y = 24.0
-            while y <= 24 + height:
-                self.canvas.create_line(24, y, 24 + width, y,
+            y = origin_y
+            while y <= origin_y + height:
+                self.canvas.create_line(origin_x, y, origin_x + width, y,
                                         fill="#edf0f2", tags=("grid",))
                 y += step
 
@@ -603,7 +624,9 @@ class RiserTab(ctk.CTkFrame):
         if self.layer_visibility["Title block"]:
             self._draw_title_block()
         self._draw_selection()
-        self.canvas.configure(scrollregion=(0, 0, width + 48, height + 48))
+        self.canvas.configure(scrollregion=(
+            0, 0, max(self.canvas.winfo_width(), origin_x + width + 24),
+            max(self.canvas.winfo_height(), origin_y + height + 24)))
         self._refresh_inspector()
 
     def _draw_element(self, element):
@@ -616,9 +639,12 @@ class RiserTab(ctk.CTkFrame):
                 x1, y1, x2, y2, fill="#fbfcfd", outline="#99a6b2",
                 dash=(5, 4), width=2 if selected else 1,
                 tags=(tag, "selectable"))
+            self.canvas.create_line(
+                x1, y1 + 34 * self.zoom, x2, y1 + 34 * self.zoom,
+                fill="#d7dde3", width=1, tags=(tag, "selectable"))
             self.canvas.create_text(x1 + 8, y1 + 7, text=element.ref,
                                     anchor="nw", fill="#4f5964",
-                                    font=("TkDefaultFont", max(7, round(10 * self.zoom))),
+                                    font=("TkDefaultFont", max(5, round(8 * self.zoom))),
                                     tags=(tag, "selectable"))
             return
         fill = "#fff7e8" if element.stale else "#ffffff"
@@ -675,10 +701,12 @@ class RiserTab(ctk.CTkFrame):
                 *coords, fill="#111111", width=3 if route_id == selected_id else 1.5,
                 joinstyle="round", tags=(tag, "selectable"))
             edge = edges.get(route_id)
-            if edge:
-                midpoint = route.points[len(route.points) // 2]
-                lx, ly = self._xy((midpoint[0] + route.label_offset[0],
-                                   midpoint[1] + route.label_offset[1]))
+            if edge and self.zoom >= 0.45:
+                label_point = route_label_point(route.points)
+                if label_point is None:
+                    continue
+                lx, ly = self._xy((label_point[0] + route.label_offset[0],
+                                   label_point[1] + route.label_offset[1]))
                 self.canvas.create_text(
                     lx, ly - 5, text=edge.label, anchor="s", fill="#111111",
                     font=("TkDefaultFont", max(6, round(9 * self.zoom))),
@@ -1083,6 +1111,25 @@ class RiserTab(ctk.CTkFrame):
         self.zoom = min(1.75, max(0.18, value))
         self._zoom_label.configure(text=f"{round(self.zoom * 100)}%")
         self.redraw()
+
+    def fit_to_view(self):
+        """Fit the canonical sheet inside the current canvas without cropping."""
+        width = self.canvas.winfo_width()
+        height = self.canvas.winfo_height()
+        if width < 100 or height < 100:
+            return
+        document = self.controller.document
+        fitted = min((width - 48) / document.page_width,
+                     (height - 48) / document.page_height)
+        self.set_zoom(fitted)
+        self.canvas.xview_moveto(0)
+        self.canvas.yview_moveto(0)
+
+    def _fit_when_ready(self, event):
+        if self._initial_fit_done or event.width < 100 or event.height < 100:
+            return
+        self._initial_fit_done = True
+        self.after_idle(self.fit_to_view)
 
     def _toggle_snap(self):
         self.snap_enabled = bool(self._snap_switch.get())

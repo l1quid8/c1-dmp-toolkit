@@ -10,7 +10,7 @@ from pathlib import Path
 import fitz
 
 from paths import resource_path
-from riser_scene import TITLE_BLOCK_WIDTH, find_bridges
+from riser_scene import TITLE_BLOCK_WIDTH, find_bridges, route_label_point
 
 
 MASTER_WIDTH = 36 * 72
@@ -63,15 +63,6 @@ def _route_path(connection_id: str, points, bridges) -> str:
     return " ".join(commands)
 
 
-def _label_point(points) -> tuple[float, float]:
-    segments = list(zip(points, points[1:]))
-    if not segments:
-        return points[0] if points else (0.0, 0.0)
-    horizontal = [(abs(b[0] - a[0]), a, b) for a, b in segments if a[1] == b[1]]
-    _length, a, b = max(horizontal or [(0.0, *segments[0])], key=lambda item: item[0])
-    return ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2 - 9)
-
-
 def _device_detail(design, ref: str) -> str:
     if ref.startswith("RSP-"):
         number = int(ref.split("-", 1)[1])
@@ -115,9 +106,11 @@ def _svg_bytes(design, document, *, width, height, physical_width: str,
                 f'<g id="{_esc(element.id)}" class="location"><rect x="{element.x:.2f}" '
                 f'y="{element.y:.2f}" width="{element.width:.2f}" height="{element.height:.2f}" '
                 'rx="8" fill="none" stroke="#8b949e" stroke-width="1" '
-                'stroke-dasharray="8 5"/><text x="{:.2f}" y="{:.2f}" '
+                'stroke-dasharray="8 5"/><line x1="{:.2f}" y1="{:.2f}" x2="{:.2f}" y2="{:.2f}" '
+                'stroke="#d7dde3" stroke-width="1"/><text x="{:.2f}" y="{:.2f}" '
                 'font-size="{:.1f}" font-weight="bold">{}</text></g>'.format(
-                    element.x + 12, element.y + 18,
+                    element.x, element.y + 34, element.x + element.width, element.y + 34,
+                    element.x + 12, element.y + 22,
                     13.2 if small else 13, _esc(element.ref)))
             continue
         if element.kind != "device":
@@ -154,7 +147,7 @@ def _svg_bytes(design, document, *, width, height, physical_width: str,
         edge = connections.get(connection_id)
         if edge is None or not route.points:
             continue
-        x, y = _label_point(route.points)
+        x, y = route_label_point(route.points) or (0.0, 0.0)
         x += route.label_offset[0]
         y += route.label_offset[1]
         lines.append(f'<text x="{x:.2f}" y="{y:.2f}" text-anchor="middle">{_esc(edge.label)}</text>')

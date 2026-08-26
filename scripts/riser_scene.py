@@ -62,7 +62,12 @@ def _location(design, device_id: str) -> str:
 
 
 def _normal_location(value: str) -> str:
-    return re.sub(r"\s+", " ", (value or "UNSPECIFIED").strip()).upper()
+    text = (value or "UNSPECIFIED").upper()
+    text = re.sub(r"\(\s*SERVICE\s+KEYPAD\s*\)", "", text)
+    text = re.sub(r"\bBLDG\b", "BUILDING", text)
+    text = re.sub(r"\bFLR\b", "FLOOR", text)
+    text = re.sub(r"[()_,./-]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _kind(device_id: str) -> str:
@@ -114,31 +119,129 @@ def _snap(value: float) -> float:
 
 
 def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserDocument:
-    """Create a deterministic balanced 24x36 scene from the electrical graph."""
+    """Create a deterministic location-first 24x36 electrical scene."""
     document = default_riser_document(design)
     if title_source is not None:
         document.title_block = title_source.title_block
         document.annotations = list(title_source.annotations)
-    usable_right = document.page_width - TITLE_BLOCK_WIDTH - PAGE_MARGIN
-    center = usable_right / 2
+    drawing_left = PAGE_MARGIN
+    drawing_right = document.page_width - TITLE_BLOCK_WIDTH - PAGE_MARGIN
+    drawing_width = drawing_right - drawing_left
     branch, depth = _branch_and_depth(design)
 
-    positions: dict[str, tuple[float, float]] = {"MSP": (center - 110.0, 90.0)}
-    for side in ("kp", "lx"):
-        devices = [d for d in _device_ids(design) if d != "MSP" and branch[d] == side]
-        by_depth: dict[int, list[str]] = {}
-        for device_id in devices:
-            by_depth.setdefault(depth[device_id], []).append(device_id)
-        left, right = ((PAGE_MARGIN + 90, center - 170) if side == "kp"
-                       else (center + 170, usable_right - 90))
-        for level, level_devices in sorted(by_depth.items()):
-            ordered = sorted(level_devices, key=lambda d: (_normal_location(_location(design, d)), d))
-            y = 270.0 + min(level, 6) * 190.0
-            span = max(0.0, right - left)
-            for index, device_id in enumerate(ordered):
-                width, _height = _size(device_id)
-                anchor = left + span * (index + 1) / (len(ordered) + 1)
-                positions[device_id] = (_snap(anchor - width / 2), _snap(y))
+    device_ids = _device_ids(design)
+    raw_locations = {device_id: _normal_location(_location(design, device_id))
+                     for device_id in device_ids}
+    known_locations = set(raw_locations.values())
+
+    def physical_location(key: str) -> str:
+        # If the only difference is an explicit floor qualifier, prefer the
+        # already-known room name. This joins e.g. "MAIN BUILDING 1ST FLOOR
+        # SUPPLY ROOM" to "MAIN BUILDING SUPPLY ROOM" without ever merging
+        # two distinct floor-qualified locations.
+        without_floor = re.sub(r"\b\d+(?:ST|ND|RD|TH)\s+FLOOR\b", "", key)
+        without_floor = re.sub(r"\s+", " ", without_floor).strip()
+        return without_floor if without_floor in known_locations else key
+
+    locations = {device_id: physical_location(key)
+                 for device_id, key in raw_locations.items()}
+    location_devices: dict[str, list[str]] = {}
+    for device_id in device_ids:
+        location_devices.setdefault(locations[device_id], []).append(device_id)
+
+    H_GAP = 54.0
+    V_GAP = 126.0
+    FRAME_X = 30.0
+    FRAME_TOP = 70.0
+    FRAME_BOTTOM = 26.0
+
+    def module_geometry(location: str, members: list[str]):
+        rows: dict[int, list[str]] = {}
+        for device_id in members:
+            rows.setdefault(depth[device_id], []).append(device_id)
+        ordered_rows = []
+        for level in sorted(rows):
+            ordered = sorted(rows[level], key=lambda item: (
+                {"kp": 0, "root": 1, "lx": 2}.get(branch[item], 1), item))
+            ordered_rows.append(ordered)
+        row_widths = [sum(_size(item)[0] for item in row) +
+                      H_GAP * max(0, len(row) - 1) for row in ordered_rows]
+        row_heights = [max(_size(item)[1] for item in row) for row in ordered_rows]
+        label_width = min(drawing_width, len(location) * 9.5 + FRAME_X * 2)
+        width = max(max(row_widths, default=220.0) + FRAME_X * 2,
+                    label_width)
+        height = FRAME_TOP + sum(row_heights) + V_GAP * max(0, len(ordered_rows) - 1) + FRAME_BOTTOM
+        local_positions = {}
+        y = FRAME_TOP
+        for row, row_width, row_height in zip(ordered_rows, row_widths, row_heights):
+            x = (width - row_width) / 2
+            for device_id in row:
+                item_width, item_height = _size(device_id)
+                local_positions[device_id] = (x, y + (row_height - item_height) / 2)
+                x += item_width + H_GAP
+            y += row_height + V_GAP
+        return width, height, local_positions
+
+    modules = {location: module_geometry(location, members)
+               for location, members in location_devices.items()}
+    root_location = locations["MSP"]
+    module_origins: dict[str, tuple[float, float]] = {}
+    root_width, root_height, _root_positions = modules[root_location]
+    root_x = drawing_left + (drawing_width - root_width) / 2
+    root_y = 108.0
+    module_origins[root_location] = (_snap(root_x), _snap(root_y))
+
+    def lane(location: str) -> int:
+        sides = {branch[item] for item in location_devices[location]} - {"root"}
+        if sides == {"kp"}:
+            return 0
+        if sides == {"lx"}:
+            return 2
+        return 1
+
+    remaining = [location for location in location_devices if location != root_location]
+    by_rank: dict[int, list[str]] = {}
+    for location in remaining:
+        by_rank.setdefault(min(depth[item] for item in location_devices[location]), []).append(location)
+
+    cursor_y = root_y + root_height + 126.0
+    MODULE_GAP = 54.0
+    ROW_GAP = 108.0
+    for rank in sorted(by_rank):
+        pending = sorted(by_rank[rank], key=lambda location: (lane(location), location))
+        rows: list[list[str]] = []
+        current: list[str] = []
+        current_width = 0.0
+        for location in pending:
+            width = modules[location][0]
+            added = width if not current else width + MODULE_GAP
+            if current and current_width + added > drawing_width:
+                rows.append(current)
+                current, current_width = [], 0.0
+                added = width
+            current.append(location)
+            current_width += added
+        if current:
+            rows.append(current)
+        for row in rows:
+            row_width = sum(modules[location][0] for location in row) + \
+                MODULE_GAP * max(0, len(row) - 1)
+            x = drawing_left + max(0.0, (drawing_width - row_width) / 2)
+            row_height = max(modules[location][1] for location in row)
+            for location in row:
+                width, height, _positions = modules[location]
+                module_origins[location] = (_snap(x), _snap(cursor_y + (row_height - height) / 2))
+                x += width + MODULE_GAP
+            cursor_y += row_height + ROW_GAP
+
+    positions: dict[str, tuple[float, float]] = {}
+    for location, members in location_devices.items():
+        origin_x, origin_y = module_origins[location]
+        _width, _height, local_positions = modules[location]
+        for device_id in members:
+            local_x, local_y = local_positions[device_id]
+            positions[device_id] = (_snap(origin_x + local_x),
+                                    _snap(origin_y + local_y))
 
     for device_id in _device_ids(design):
         x, y = positions[device_id]
@@ -149,22 +252,15 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
         )
         document.elements[element.id] = element
 
-    # Location frames are a presentation grouping only. Their bounds follow
-    # the device geometry and never affect electrical connectivity.
-    location_members: dict[str, list[RiserElement]] = {}
-    for device_id in _device_ids(design):
-        location_members.setdefault(_normal_location(_location(design, device_id)), []).append(
-            document.elements[f"device:{device_id}"])
-    for location, members in sorted(location_members.items()):
-        pad_x, pad_top, pad_bottom = 24.0, 34.0, 22.0
-        x1 = min(m.x for m in members) - pad_x
-        y1 = min(m.y for m in members) - pad_top
-        x2 = max(m.x + m.width for m in members) + pad_x
-        y2 = max(m.y + m.height for m in members) + pad_bottom
+    # Location frames are compact modules assigned before device placement,
+    # so one room can never become a giant dashed box spanning both branches.
+    for location, members in sorted(location_devices.items()):
+        x1, y1 = module_origins[location]
+        module_width, module_height, _positions = modules[location]
         key = f"location:{location}"
         document.elements[key] = RiserElement(
             id=key, kind="location", ref=location,
-            x=x1, y=y1, width=x2 - x1, height=y2 - y1,
+            x=x1, y=y1, width=module_width, height=module_height,
         )
 
     location_ids = sorted(k for k, e in document.elements.items() if e.kind == "location")
@@ -180,6 +276,7 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
         end = port_point(target, edge.target.port_id, output=False)
         points = route_connection(start, end, obstacles, source_ref=source.ref, target_ref=target.ref)
         document.routes[edge.id] = RiserRoute(edge.id, points)
+    _place_route_labels(design, document)
     return document
 
 
@@ -316,17 +413,63 @@ def _boxes_overlap(first, second) -> bool:
 
 
 def _route_label_box(edge, route):
-    segments = list(_segments(route.points))
+    point = route_label_point(route.points)
+    if point is None:
+        return None
+    x = point[0] + route.label_offset[0]
+    y = point[1] + route.label_offset[1]
+    width = max(42.0, len(edge.label) * 7.5)
+    return (x - width / 2, y - 14, x + width / 2, y + 3)
+
+
+def route_label_point(points):
+    segments = list(_segments(points))
     if not segments:
         return None
     horizontals = [(abs(b[0] - a[0]), a, b) for a, b in segments
                    if a[1] == b[1]]
     _length, first, second = max(
         horizontals or [(0.0, *segments[0])], key=lambda item: item[0])
-    x = (first[0] + second[0]) / 2 + route.label_offset[0]
-    y = (first[1] + second[1]) / 2 - 9 + route.label_offset[1]
-    width = max(42.0, len(edge.label) * 7.5)
-    return (x - width / 2, y - 14, x + width / 2, y + 3)
+    return ((first[0] + second[0]) / 2,
+            (first[1] + second[1]) / 2 - 9)
+
+
+def _place_route_labels(design, document: RiserDocument) -> None:
+    """Move generated cable labels into nearby clear drafting space."""
+    device_boxes = [
+        (element.x - 5, element.y - 5,
+         element.x + element.width + 5, element.y + element.height + 5)
+        for element in document.elements.values() if element.kind == "device"
+    ]
+    used_boxes = []
+    edges = {edge.id: edge for edge in design.connections}
+    offsets = [(0.0, 0.0)]
+    offsets.extend(
+        (dx, dy)
+        for dy in (-28.0, 28.0, -56.0, 56.0, -84.0, 84.0, -112.0, 112.0)
+        for dx in (0.0, -72.0, 72.0, -144.0, 144.0, -216.0, 216.0)
+    )
+    for route_id, route in document.routes.items():
+        edge = edges.get(route_id)
+        if edge is None:
+            continue
+        chosen = None
+        for offset in offsets:
+            route.label_offset = offset
+            box = _route_label_box(edge, route)
+            if box is None:
+                continue
+            inside = (box[0] >= PAGE_MARGIN / 2 and box[1] >= PAGE_MARGIN / 2 and
+                      box[2] <= document.page_width - TITLE_BLOCK_WIDTH - PAGE_MARGIN / 2 and
+                      box[3] <= document.page_height - PAGE_MARGIN / 2)
+            if (inside and not any(_boxes_overlap(box, item) for item in device_boxes)
+                    and not any(_boxes_overlap(box, item) for item in used_boxes)):
+                chosen = box
+                break
+        if chosen is None:
+            route.label_offset = (0.0, 0.0)
+        else:
+            used_boxes.append(chosen)
 
 
 def _graph_cycle(design) -> bool:
