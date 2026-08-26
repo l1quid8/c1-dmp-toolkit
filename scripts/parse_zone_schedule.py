@@ -218,8 +218,8 @@ def extract_combus_lines(text: str) -> list[CombusLine]:
 
     PyMuPDF emits each table cell on its own line. Two layout variants exist across
     designs:
-      Variant A (e.g. O'Melveny):  ID, building, floor, room, FED_FROM, CABLE_TYPE
-      Variant B (e.g. Academy):    ID, building, floor, room, CABLE_TYPE, [FED_FROM]
+      Variant A (layout variant A):  ID, building, floor, room, FED_FROM, CABLE_TYPE
+      Variant B (layout variant B):    ID, building, floor, room, CABLE_TYPE, [FED_FROM]
 
     Plus the OCR may insert noise lines between rows (page sidebar text, addresses).
 
@@ -272,7 +272,7 @@ def extract_combus_lines(text: str) -> list[CombusLine]:
 
         # For cells 4 and 5 (cable_type and fed_from in either order): consume cells
         # that match cable or fed patterns. Stop on the FIRST line that's neither
-        # — it's either noise (Academy) or the next entry's ID (which fed_re might
+        # — it's either noise in layout variant B or the next entry's ID (which fed_re might
         # otherwise eat). Continue past empty lines.
         cable_type = ""
         fed_from = ""
@@ -298,7 +298,7 @@ def extract_combus_lines(text: str) -> list[CombusLine]:
                 fed_from = t.rstrip()
                 j += 1
                 continue
-            # Neither cable nor fed — stop. Could be noise (Academy: 'PROJECT MGMT')
+            # Neither cable nor fed — stop. Could be source-drawing noise.
             # or a next-entry ID (caught on next outer-loop iteration).
             break
 
@@ -371,7 +371,7 @@ def extract_zones(text: str) -> list[ZoneRecord]:
             continue
 
         # Detect supervisory rows. Different designs use different terminology for the
-        # AC-loss supervisory: "AC POWER" (O'Melveny), "AC TROUBLE" (Academy), or
+        # AC-loss supervisory: "AC POWER" in layout variant A, "AC TROUBLE" in layout variant B, or
         # "A/C LOSS". Battery is consistently "BATTERY TROUBLE".
         joined_upper = " ".join(body).upper()
         if re.search(r"\bA/?C\s+(POWER|TROUBLE|LOSS)\b", joined_upper):

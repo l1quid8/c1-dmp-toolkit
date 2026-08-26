@@ -113,7 +113,7 @@ def test_bus_boundary_addressing():
     assert list(zone_block_for(7))[0] == 601
     assert list(zone_block_for(12))[0] == 681
     assert list(zone_block_for(13))[0] == 701
-    assert list(zone_block_for(15)) == list(range(733, 749))  # matches ACADEMY
+    assert list(zone_block_for(15)) == list(range(733, 749))
 
     d = _design_with_expanders(6)
     rsp7 = add_expander(d, "714-8")
@@ -243,7 +243,7 @@ def test_remove_keypad_scrubs_outputs():
 
 def test_add_expander_absorbs_orphan_block_zones():
     """Real worksheets carry stray SPARE/PS zone rows beyond the installed
-    expanders (DARBY has 47). Adding an expander into such a block must
+    expanders (a legacy design has 47). Adding an expander into such a block must
     replace them — duplicates corrupt the zone grid and Master write."""
     d = _design_with_expanders(1)
     # Orphans sitting in module 2's block (Z517-532), owned by no RSP
@@ -265,7 +265,7 @@ def test_add_expander_absorbs_orphan_block_zones():
 def test_add_expander_materializes_zones_from_master():
     """Designs parsed from an xlsx with uncached Point Info formulas carry
     zone data only in master_zones; adding hardware must not let the next
-    master re-sync wipe it (regression: 48 DARBY rooms vanished)."""
+    master re-sync wipe it (regression: 48 parsed rooms vanished)."""
     from parse_dmp_worksheet import Zone
     from session import sync_master_zones
     d = DMPDesign(

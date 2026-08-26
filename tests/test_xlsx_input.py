@@ -25,7 +25,7 @@ from parse_dmp_worksheet import (  # noqa: E402
 )
 from inject_door_chart import inject  # noqa: E402
 
-WORKSHEET_FIXTURE = REPO_ROOT / "input" / "O'melveny DMP Worksheet_MOE.xlsx"
+WORKSHEET_FIXTURE = REPO_ROOT / "input" / "test_dmp_worksheet.xlsx"
 DOOR_CHART_TEMPLATE = REPO_ROOT / "door_chart_template_blank.xlsx"
 
 pytestmark = pytest.mark.skipif(

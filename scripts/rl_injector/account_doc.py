@@ -10,6 +10,7 @@ account that will later be sent to a panel.
 from __future__ import annotations
 
 import base64
+import binascii
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -29,14 +30,46 @@ _LEAF_RE = re.compile(
 
 def _b64(text: str) -> str:
     """Encode a DataType=1 value using RemoteLink's padding convention."""
-    raw = text.encode("latin-1")
+    try:
+        raw = text.encode("latin-1")
+    except UnicodeEncodeError as exc:
+        raise InjectorError(
+            "RemoteLink DataType 1 text must be latin-1 encodable"
+        ) from exc
     raw += b"\x00" * ((3 - len(raw) % 3) % 3)
     return base64.b64encode(raw).decode("ascii")
 
 
 def _unb64(value: str) -> str:
     """Decode a RemoteLink DataType=1 value and remove its NUL fill."""
-    return base64.b64decode(value).decode("latin-1").rstrip("\x00")
+    try:
+        return base64.b64decode(value, validate=True).decode("latin-1").rstrip("\x00")
+    except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
+        raise InjectorError("invalid base64 in RemoteLink DataType 1 field") from exc
+
+
+_INTEGER_RE = re.compile(r"-?\d+")
+_DATETIME_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}")
+
+
+def _validate_raw(data_type: str, value: str) -> None:
+    """Validate the exact scalar spellings accepted by the account format."""
+    if data_type == "1":
+        _unb64(value)
+        return
+    if any(char in value for char in "<>&"):
+        raise InjectorError(
+            f"RemoteLink DataType {data_type} value contains XML metacharacters"
+        )
+    valid = (
+        data_type in {"3", "14"} and _INTEGER_RE.fullmatch(value)
+        or data_type == "5" and value in {"True", "False"}
+        or data_type == "11" and _DATETIME_RE.fullmatch(value)
+    )
+    if not valid:
+        raise InjectorError(
+            f"invalid RemoteLink DataType {data_type} value: {value!r}"
+        )
 
 
 @dataclass
@@ -51,9 +84,14 @@ class Field:
 
     def set_text(self, value: str) -> None:
         value = str(value)
-        self.raw = _b64(value) if self.data_type == "1" else value
+        if self.data_type == "1":
+            self.raw = _b64(value)
+            return
+        _validate_raw(self.data_type, value)
+        self.raw = value
 
     def serialize(self) -> str:
+        _validate_raw(self.data_type, self.raw)
         return (
             f'<{self.name} DataType="{self.data_type}">'
             f"{self.raw}</{self.name}>"
@@ -515,7 +553,9 @@ def _leaf_at(text: str, pos: int) -> tuple[Field, int] | None:
     match = _LEAF_RE.match(text, pos)
     if match is None:
         return None
-    return Field(match.group(1), match.group(2), match.group(3)), match.end()
+    field = Field(match.group(1), match.group(2), match.group(3))
+    _validate_raw(field.data_type, field.raw)
+    return field, match.end()
 
 
 def _parse_row_body(text: str, pos: int, row_name: str) -> tuple[list[Field], int]:

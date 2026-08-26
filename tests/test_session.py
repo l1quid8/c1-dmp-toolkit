@@ -66,16 +66,16 @@ def _populated_design() -> DMPDesign:
     from generate_dmp_ws import LocationConflict
     return DMPDesign(
         site_info=SiteInfo(
-            school_name="DARBY AVENUE ELEMENTARY SCHOOL",
-            school_code="1234567",
+            school_name="MAPLEWOOD ELEMENTARY SCHOOL",
+            school_code="5812",
             phone="(818) 555-0000",
-            install_tech="T. CALDWELL",
+            install_tech="CONVERGEONE",
             install_date="2026-05-29",
-            ip_address="10.101.148.96",
-            default_gateway="10.101.148.1",
+            ip_address="192.0.2.50",
+            default_gateway="192.0.2.1",
             xr550_location="MAIN BLDG 1ST FLR FACP ROOM",
-            address_line1="123 Darby Ave",
-            address_line2="Northridge, CA 91325",
+            address_line1="1500 Sycamore Lane",
+            address_line2="Riverton, CA 90000",
         ),
         splitters=[Splitter(
             id="710-LX500-1", splitter_type="LX",
@@ -158,7 +158,7 @@ def test_forward_compat_missing_and_extra_keys():
     restored = design_from_dict(d)
     assert restored.master_zones_source == ""
     assert restored.site_info.address_line2 is None
-    assert restored.site_info.school_name == "DARBY AVENUE ELEMENTARY SCHOOL"
+    assert restored.site_info.school_name == "MAPLEWOOD ELEMENTARY SCHOOL"
 
 
 def test_empty_design_round_trip():
@@ -170,14 +170,14 @@ def test_empty_design_round_trip():
 
 def test_save_load_session(tmp_sessions_dir):
     s = Session(design=_populated_design(), source_kind="pdf",
-                source_name="DARBY_INTRUSION_DESIGN.pdf")
+                source_name="MAPLEWOOD_DEMO_DESIGN.pdf")
     path = save_session(s)
     assert path.suffix == ".dmps"
     assert path.parent == tmp_sessions_dir
     loaded = load_session(path)
     assert loaded.design.site_info == s.design.site_info
     assert loaded.source_kind == "pdf"
-    assert loaded.source_name == "DARBY_INTRUSION_DESIGN.pdf"
+    assert loaded.source_name == "MAPLEWOOD_DEMO_DESIGN.pdf"
     assert loaded.saved_at is not None
     assert loaded.path == path
 
@@ -310,7 +310,7 @@ def test_atomic_save_leaves_no_tmp(tmp_sessions_dir):
 def test_list_recent_sessions_mtime_order(tmp_sessions_dir):
     d1 = _populated_design()
     d2 = _populated_design()
-    d2.site_info.school_name = "THE ACADEMY OF ENRICHED SCIENCES"
+    d2.site_info.school_name = "RIVERSTONE ACADEMY"
     p1 = save_session(Session(design=d1))
     p2 = save_session(Session(design=d2))
     # Make ordering deterministic without sleeping.
@@ -319,8 +319,8 @@ def test_list_recent_sessions_mtime_order(tmp_sessions_dir):
     os.utime(p2, (now, now))
     recents = list_recent_sessions()
     assert [r.school_name for r in recents] == [
-        "THE ACADEMY OF ENRICHED SCIENCES",
-        "DARBY AVENUE ELEMENTARY SCHOOL",
+        "RIVERSTONE ACADEMY",
+        "MAPLEWOOD ELEMENTARY SCHOOL",
     ]
     assert all(r.saved_at for r in recents)
 
@@ -329,12 +329,12 @@ def test_list_skips_unreadable_files(tmp_sessions_dir):
     save_session(Session(design=_populated_design()))
     (tmp_sessions_dir / "JUNK.dmps").write_text("{broken")
     recents = list_recent_sessions()
-    assert [r.school_name for r in recents] == ["DARBY AVENUE ELEMENTARY SCHOOL"]
+    assert [r.school_name for r in recents] == ["MAPLEWOOD ELEMENTARY SCHOOL"]
 
 
 def test_default_session_path_slug(tmp_sessions_dir):
     path = default_session_path(_populated_design())
-    assert path.name == "DARBY_AVENUE_ELEMENTARY_SCHOOL.dmps"
+    assert path.name == "MAPLEWOOD_ELEMENTARY_SCHOOL.dmps"
 
 
 # -------- crash recovery lifecycle --------
@@ -358,7 +358,7 @@ def test_pending_recovery_detected_when_newer(tmp_sessions_dir):
     assert pending_recovery(path) is not None
 
     recovered = load_recovery(path)
-    assert recovered.design.site_info.school_name == "DARBY AVENUE ELEMENTARY SCHOOL"
+    assert recovered.design.site_info.school_name == "MAPLEWOOD ELEMENTARY SCHOOL"
     assert recovered.path == path
 
 

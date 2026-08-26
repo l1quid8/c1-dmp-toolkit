@@ -875,8 +875,8 @@ if __name__ == "__main__":
             cable_str = f" [{e.cable}]" if e.cable else ""
             print(f"  {e.src.id} → {e.dst.id}{cable_str}")
 
-    # Validation against the O'Melveny ground-truth (from the DMP worksheet)
-    print("\n=== Validation against O'Melveny DMP worksheet (where applicable) ===")
+    # Validation against a local ground-truth corpus (from the DMP worksheet)
+    print("\n=== Validation against local DMP worksheet (where applicable) ===")
     ground_truth_devices = {
         "MSP":          "Admin Bldg AV Room",
         "RSP1":         "Admin Bldg AV Room",

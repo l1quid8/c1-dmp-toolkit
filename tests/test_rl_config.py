@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -34,6 +35,7 @@ from rl_injector.rl_config import (  # noqa: E402
     validate_config,
 )
 from editor_zones import rl_type_display, rl_type_from_label  # noqa: E402
+from editor_remotelink import RemoteLinkTab  # noqa: E402
 
 
 FIELD_MAPS = json.loads(
@@ -343,3 +345,55 @@ def test_unverified_enum_values_are_never_accepted_as_raw_programming():
         "remotelink.keypad_device_type_invalid",
         "remotelink.keypad_comm_type_invalid",
     }
+
+
+def test_remotelink_refresh_updates_site_derived_identity_and_default_users():
+    """SITE school-code edits must not leave the RemoteLink form stale."""
+    class Value:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    tab = object.__new__(RemoteLinkTab)
+    tab.session = SimpleNamespace(
+        design=_design("3141"), remotelink=RemoteLinkConfig(),
+    )
+    tab._building = False
+    tab._identity_vars = {
+        "account_num": Value("2250"),
+        "receiver_num": Value("1"),
+    }
+    rebuilt_users = []
+    tab._build_users = lambda _row: rebuilt_users.extend(tab._visible_users())
+    tab.refresh_receipt = lambda: None
+
+    tab.refresh()
+
+    assert tab._identity_vars["account_num"].get() == "3141"
+    assert [(user.number, user.code) for user in rebuilt_users] == [
+        (1, "3141"), (9999, "13141"),
+    ]
+
+
+def test_remotelink_account_edit_refreshes_unmodified_default_users():
+    """Default user codes follow the account until the operator customizes them."""
+    tab = object.__new__(RemoteLinkTab)
+    tab.session = SimpleNamespace(
+        design=_design("2250"), remotelink=RemoteLinkConfig(),
+    )
+    tab._building = False
+    rebuilt_users = []
+    tab._build_users = lambda _row: rebuilt_users.extend(tab._visible_users())
+    tab._changed = lambda: None
+
+    tab._set_top("account_num", "2718")
+
+    assert tab.session.remotelink.account_num == "2718"
+    assert [(user.number, user.code) for user in rebuilt_users] == [
+        (1, "2718"), (9999, "12718"),
+    ]

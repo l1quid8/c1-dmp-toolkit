@@ -6,10 +6,9 @@ tools/XML_FORMAT.md):
     file = HEX_UPPER( AES-128-ECB( xml_document, key = MD5(passphrase_ascii) ) )
 
 The plaintext is a <Panels><Panel>...</Panel></Panels> document. This module
-produces one the way the SQL path does — clone-and-rebadge from a golden
-DECRYPTED template account (the operator supplies it once, the XML analogue of
-templates/academy_full.sql), swapping in the design's account identity, zones,
-and keypads while keeping the template's valid comm/options config.
+produces one by cloning and rebadging the bundled, scrubbed demo account,
+swapping in the design's identity, zones, and keypads while keeping the
+template's valid comm/options structure.
 
 Field values carry a DataType attribute: "3"/"14" = integer text, "1" =
 Base64(text + trailing NUL), "11" = datetime. Zones live in <ZoneInfoList> as
@@ -19,6 +18,8 @@ keypads in <DeviceInfoList> as <DeviceInfo> blocks.
 from __future__ import annotations
 
 import hashlib
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -61,17 +62,26 @@ SENTINEL_BASE = 90000   # internal <ID> = SENTINEL_BASE + account number (matche
 # ------------------------------------------------------------------ crypto ---
 
 def _key(passphrase: str) -> bytes:
-    return hashlib.md5(passphrase.encode("ascii")).digest()
+    try:
+        encoded = passphrase.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise InjectorError(
+            "RemoteLink export passphrase must contain ASCII characters only"
+        ) from exc
+    return hashlib.md5(encoded).digest()
 
 
 def decode_account(data: bytes | str, passphrase: str) -> str:
     """Decrypt a RemoteLink `.xml` export (hex text or raw bytes) to its XML."""
-    if isinstance(data, str):
-        ct = bytes.fromhex(data.strip())
-    else:
-        stripped = bytes(b for b in data if b not in b" \t\r\n")
-        ct = bytes.fromhex(stripped.decode("ascii")) if stripped and \
-            all(c in b"0123456789abcdefABCDEF" for c in stripped) else bytes(data)
+    try:
+        if isinstance(data, str):
+            ct = bytes.fromhex(data.strip())
+        else:
+            stripped = bytes(b for b in data if b not in b" \t\r\n")
+            ct = bytes.fromhex(stripped.decode("ascii")) if stripped and \
+                all(c in b"0123456789abcdefABCDEF" for c in stripped) else bytes(data)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise InjectorError("RemoteLink ciphertext is not valid hexadecimal") from exc
     if len(ct) % BLOCK:
         raise InjectorError(f"ciphertext length {len(ct)} is not a multiple of {BLOCK}")
     text = AES.new(_key(passphrase), AES.MODE_ECB).decrypt(ct).decode("latin-1")
@@ -525,6 +535,35 @@ def build_configured_account_doc(
     return doc
 
 
+def _verify_final_account(doc: AccountDoc, design, config: RemoteLinkConfig) -> None:
+    """Verify a decrypted final artifact against the operator's configuration."""
+    resolved = resolve_config(config, design)
+    acct = build_staging_account(
+        design, resolved.account_num, receiver_num=resolved.receiver_num,
+    )
+    _verify_configured_account(doc, resolved, acct, design)
+    verify_account_doc(doc, _intent_for(resolved))
+
+
+def _atomic_write_text(path: Path, text: str, encoding: str) -> None:
+    """Replace one output only after its complete contents are on disk."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding=encoding, dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
+
+
 # ------------------------------------------------------------------- public ---
 
 def generate_account_xml(design, account_num, receiver_num: str = "", *,
@@ -538,35 +577,14 @@ def generate_account_xml(design, account_num, receiver_num: str = "", *,
     Returns the written `.xml` path. Raises InjectorError on bad input.
     """
     account_num = str(account_num).strip()
-    if not account_num.isdigit():
-        raise InjectorError(
-            f"Account number '{account_num}' must be numeric (the school LOC "
-            "CODE, e.g. 2250) — it is assigned as the panel user code.")
-    if not passphrase:
-        raise InjectorError("An export passphrase is required for the .xml.")
-    tmpl = Path(template_path)
-    if not tmpl.is_file():
-        raise InjectorError(
-            f"RemoteLink XML template not found: {tmpl}\n"
-            "Decode one real export once (tools/rl_xml.py decode) and point the "
-            "app at that decrypted .xml.")
-    template_xml = tmpl.read_text(encoding="latin-1")
-    if "<Panels>" not in template_xml:
-        raise InjectorError(
-            f"{tmpl} is not a decrypted RemoteLink account XML (no <Panels>). "
-            "It must be the DECRYPTED template, not an encrypted export.")
-
-    acct = build_staging_account(design, account_num, receiver_num=(receiver_num or "").strip())
-    if not acct.zones:
-        raise InjectorError("No zones to stage — the design has no zones on an installed RSP.")
-    xml = build_account_xml(acct, template_xml, sentinel=sentinel)
-    hexed = encode_account(xml, passphrase)
-
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{account_num}_remotelink.xml"
-    out_path.write_text(hexed, encoding="ascii")
-    return out_path
+    config = RemoteLinkConfig(
+        account_num=account_num,
+        receiver_num=(receiver_num or "1").strip(),
+    )
+    return generate_configured_account_xml(
+        design, config, template_path=template_path, passphrase=passphrase,
+        out_dir=out_dir, sentinel=sentinel, write_summary=False,
+    )
 
 
 def _read_template(template_path) -> str:
@@ -592,15 +610,18 @@ def generate_configured_account_xml(
     doc = build_configured_account_doc(
         design, config, template_xml, sentinel=sentinel,
     )
-    summary = summarize_account(doc)
+    encoded = encode_account(doc.serialize(), passphrase)
+    readback = parse_account_xml(decode_account(encoded, passphrase))
+    _verify_final_account(readback, design, config)
+    summary = summarize_account(readback)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{summary.account_num}_remotelink.xml"
-    out_path.write_text(encode_account(doc.serialize(), passphrase), encoding="ascii")
+    summary_path = out_dir / f"{summary.account_num}_remotelink_summary.txt"
+    summary_text = render_text(summary)
+    _atomic_write_text(out_path, encoded, "ascii")
     if write_summary:
-        (out_dir / f"{summary.account_num}_remotelink_summary.txt").write_text(
-            render_text(summary) + "\n", encoding="utf-8",
-        )
+        _atomic_write_text(summary_path, summary_text, "utf-8")
     return out_path
 
 
@@ -626,5 +647,9 @@ def inspect_account(path, passphrase: str):
     if not ascii_text or any(char not in "0123456789abcdefABCDEF"
                              for char in ascii_text):
         raise InjectorError(f"{path.name} is not a RemoteLink export (not hex)")
+    if len(ascii_text) % 2:
+        raise InjectorError(
+            f"{path.name} is not a RemoteLink export (odd-length hex)"
+        )
     doc = parse_account_xml(decode_account(ascii_text, passphrase))
     return summarize_account(doc)

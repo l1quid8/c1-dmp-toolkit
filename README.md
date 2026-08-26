@@ -102,6 +102,10 @@ export with its passphrase — no project required. The inspector never changes
 the source file; it displays the same readable receipt and can save a summary
 for review.
 
+> `.dmps` project files and RemoteLink summary `.txt` files are readable job
+> records and include configured panel user codes. Keep them in approved project
+> storage; only the generated RemoteLink `.xml` is passphrase-encrypted.
+
 ![Generate RemoteLink Account](docs/screenshots/remotelink.png)
 
 If validation issues are open you get a summary with "Go to" jumps — generate

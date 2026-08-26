@@ -1,15 +1,14 @@
 """Riser-topology extraction validation harness.
 
-Runs the riser edge extraction against a set of design PDFs, prints the derived
-wiring, and pass/fails any fixture that has a recorded ground-truth edge set.
+Runs the riser edge extraction against design PDFs supplied on the command line
+and prints the derived wiring for manual review.
 
 Usage:
     python validate_topology.py [extra_design.pdf ...]
 
-Built-in fixtures are the corpus risers (Academy / Darby / O'Melveny). Extra
-PDFs given on the command line are extracted and printed for manual review.
-As more samples arrive, add them to FIXTURES with their ground-truth edges so
-the harness keeps regression-checking them.
+Customer drawings and workstation paths are intentionally not stored in this
+public repository. Keep any local fixture list outside the checkout and pass
+its PDFs explicitly on the command line.
 """
 from __future__ import annotations
 
@@ -25,27 +24,13 @@ from extract_topology import (extract_spans, merge_multiline_locations,
     reconstruct_edges)
 from generate_dmp_ws import _detect_riser_page
 
-_UPLOADS = r"C:\Users\tcald\.claude\uploads\58f04bd6-7966-4d8d-bd8e-10965f773ebe"
-_INPUT = (r"C:\Users\tcald\OneDrive - ConvergeOne\Documents"
-          r"\DMP Installation Worksheets\Generated DMP Worksheets\input")
-
-
 def _norm(s: str) -> str:
     return s.replace(" ", "").upper()
 
 
-# Each fixture: (name, pdf_path, ground_truth_edges or None).
-# Ground-truth edges are (src, dst) device-id pairs read directly off the riser.
-FIXTURES = [
-    ("ACADEMY", _UPLOADS + r"\e02cb6f7-Academy_Enrichment_Science_20260506.pdf", {
-        ("710-KP-1", "KEYPAD2"), ("710-KP-1", "KEYPAD3"), ("710-KP-1", "710-KP-2"),
-        ("710-KP-2", "KEYPAD4"), ("710-KP-2", "KEYPAD5"),
-        ("710-LX500-1", "RSP1"), ("710-LX500-1", "710-LX500-2"),
-        ("710-LX500-2", "RSP2"), ("710-LX500-2", "RSP3"),
-    }),
-    ("DARBY", _UPLOADS + r"\daf52199-Darby_Ave_EL__3340_20260518_1779086462.pdf", None),
-    ("OMELVENY", _INPUT + r"\O'MELVENY ES INTRUSION DESIGN 5-04-26.pdf", None),
-]
+# Local-only fixtures may be added at runtime by a developer, but the checked-in
+# default stays empty so customer filenames and paths cannot leak into releases.
+FIXTURES: list[tuple[str, str, set | None]] = []
 
 
 def extract(pdf: str, page: int | None = None):

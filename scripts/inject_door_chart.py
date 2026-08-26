@@ -548,8 +548,8 @@ def _populate_splitter_topology(master, dmp_design: DMPDesign) -> tuple[list[int
     ID named no slot. The template spreads its LX slots over five buses
     (710-LX500-1..5, 710-LX600-1..5, ... 710-LX900-1..5), but hardware.next_splitter_id
     numbers every LX splitter on the 500 bus up to MAX_SPLITTERS_PER_TYPE, so a job
-    with six or more LX splitters lost the sixth onward with no error — HAYNES_CHARTER_ES
-    shipped without 710-LX500-6 and 710-LX500-7. Col A is an internal key: the
+    with six or more LX splitters lost the sixth onward with no error. The
+    high-count regression fixture has seven. Col A is an internal key: the
     LX-KP-710s tab reads only cols C-G, so overwriting it is safe.
 
     Returns (filled Master rows in ascending order, cells written) — the row list

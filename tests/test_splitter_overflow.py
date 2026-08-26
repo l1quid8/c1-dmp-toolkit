@@ -3,9 +3,9 @@
 hardware.next_splitter_id names every LX splitter '710-LX500-N' for N up to
 MAX_SPLITTERS_PER_TYPE, but the door chart template's pre-seeded slot IDs spread
 the LX rows across five buses (LX500-1..5, LX600-1..5, ... LX900-1..5). Population
-used to walk those slots and match by exact ID, so a sixth LX500 splitter matched
-nothing and vanished from the deliverable with no error — the HAYNES_CHARTER_ES
-job silently lost 710-LX500-6 and 710-LX500-7 (and RSP-5/RSP-6's feed with them).
+used to walk those slots and match by exact ID, so a sixth LX500 splitter would
+vanish from the deliverable with no error. The regression fixture proves that
+710-LX500-6 and 710-LX500-7 both reach the chart.
 
 Run: pytest tests/test_splitter_overflow.py
 """
@@ -49,8 +49,8 @@ def _inject(tmp_path, design):
     return out
 
 
-def _haynes():
-    """The real HAYNES_CHARTER_ES topology: 7 LX500 splitters and 3 KP."""
+def _large_splitter_site():
+    """Fabricated high-count topology: 7 LX500 splitters and 3 KP."""
     return _splitter_design(
         _lx(1, "ADMIN BUILDING MAIN OFFICE"),
         _lx(2, "ADMIN BUILDING MAIN OFFICE"),
@@ -65,15 +65,15 @@ def _haynes():
 
 def test_sixth_and_seventh_lx500_reach_the_chart(tmp_path):
     """The reported bug: LX500-6/-7 dropped out of the door chart entirely."""
-    found = _topology(_inject(tmp_path, _haynes()))
+    found = _topology(_inject(tmp_path, _large_splitter_site()))
     assert "710-LX500-6" in found, "710-LX500-6 missing from door chart topology"
     assert "710-LX500-7" in found, "710-LX500-7 missing from door chart topology"
     assert found["710-LX500-6"][0] == "BUILDING B CUSTODIAN"
     assert found["710-LX500-7"][0] == "KINDERGARTEN BUILDING 1 CLASSROOM 3"
 
 
-def test_all_haynes_splitters_present_and_ordered(tmp_path):
-    out = _inject(tmp_path, _haynes())
+def test_all_large_site_splitters_present_and_ordered(tmp_path):
+    out = _inject(tmp_path, _large_splitter_site())
     m = openpyxl.load_workbook(out)["Master"]
     ids = [str(m[f"A{r}"].value).strip() for r in TOPOLOGY_ROWS
            if m[f"A{r}"].value and m[f"C{r}"].value]
@@ -83,7 +83,7 @@ def test_all_haynes_splitters_present_and_ordered(tmp_path):
 
 def test_chart_tab_renders_every_splitter(tmp_path):
     """Master rows are useless if the LX-KP-710s tab doesn't point at them."""
-    out = _inject(tmp_path, _haynes())
+    out = _inject(tmp_path, _large_splitter_site())
     wb = openpyxl.load_workbook(out)
     m, lx = wb["Master"], wb["LX-KP-710s"]
     charted = {v for row in lx.iter_rows() for c in row

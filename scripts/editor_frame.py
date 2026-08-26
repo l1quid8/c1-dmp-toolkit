@@ -531,7 +531,7 @@ class EditorFrame(ctk.CTkFrame):
     def _refresh_remotelink_receipt(self):
         tab = getattr(self, "remotelink_tab", None)
         if tab is not None:
-            tab.refresh_receipt()
+            tab.refresh()
 
     def _on_structure_change(self):
         """Hardware was added or removed: every tab's choices and rows shift."""

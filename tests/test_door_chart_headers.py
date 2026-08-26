@@ -68,11 +68,11 @@ def test_all_header_refs_point_at_b3_b5(tmp_path):
 def test_titles_resolve_to_the_school_name(tmp_path):
     """B3/B4/B5 carry the real site info, so every fixed ref renders it."""
     design = _many_splitter_design()
-    design.site_info.school_name = "HAYNES CHARTER ES"
+    design.site_info.school_name = "MAPLEWOOD ELEMENTARY SCHOOL"
     out = _inject(tmp_path, design)
     wb = openpyxl.load_workbook(out)
     hdr = wb["Header"]
-    assert hdr["B3"].value == "HAYNES CHARTER ES"
+    assert hdr["B3"].value == "MAPLEWOOD ELEMENTARY SCHOOL"
     # Every title cell references a populated Header row (name at minimum).
     name_refs = [(tab, coord) for tab in PRESENTATION_SHEETS
                  for coord, n in _header_refs(wb[tab]) if n == 3]

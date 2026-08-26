@@ -5,6 +5,7 @@ every OS with no external template — a small synthetic template is built inlin
 
 Run: pytest tests/test_rl_account.py
 """
+import hashlib
 import sys
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from rl_injector.schema import (  # noqa: E402
 from rl_injector.errors import InjectorError  # noqa: E402
 from rl_injector.account_doc import (  # noqa: E402
     SafetyIntent,
+    parse_account_xml,
     render_text,
     summarize_account,
     verify_account_doc,
@@ -225,9 +227,10 @@ def test_identity_rebadge_leaves_unrelated_matching_number_untouched():
 
 
 def test_generate_account_xml_writes_file(tmp_path):
-    tmpl = tmp_path / "template.xml"
-    tmpl.write_text(_mini_template(), encoding="latin-1")
-    out = generate_account_xml(_rl_design(), "2250", template_path=tmpl,
+    # The compatibility API now delegates to the verified configured pipeline,
+    # which requires the complete production template rather than a partial
+    # parser-only fixture.
+    out = generate_account_xml(_rl_design(), "2250", template_path=BUNDLED_TEMPLATE,
                                passphrase="secret", out_dir=tmp_path)
     assert out.is_file() and out.name == "2250_remotelink.xml"
     # the file is uppercase hex that decodes back under the passphrase
@@ -290,31 +293,23 @@ def test_bundled_template_present_and_scrubbed():
     assert BUNDLED_TEMPLATE.is_file(), "bundled RemoteLink template is missing"
     xml = BUNDLED_TEMPLATE.read_text(encoding="latin-1")
     assert "<Panels>" in xml and xml.count("<ZoneInfo>") >= 3
-    # No real customer data may be baked into the public repo. Fields are
-    # base64, so decode each and assert none of the source account's identifiers
-    # survive.
-    import base64
     import re
-    # LAUSD (the district) is an intentional dealer-standard Customer value, not
-    # per-account identity — it's allowed. These are the source account's private
-    # identifiers, which must not survive the scrub into the public repo.
-    real = ("DARBY", "NORTHRIDGE", "10818", "360-1824", "0020D16D",
-            "000B94289066", "D8D4X0VG", "FACP", "PRINCIPAL", "TEXTBOOK")
-    # No private (10.x) IP may survive either.
-    for m in re.finditer(r'DataType="1"[^>]*>([A-Za-z0-9+/=]*)<', xml):
-        try:
-            dec = base64.b64decode(m.group(1)).decode("latin-1").rstrip("\x00")
-        except Exception:
-            continue
-        assert not re.fullmatch(r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}", dec), \
-            f"private IP leaked in template: {dec}"
-    for m in re.finditer(r'DataType="1"[^>]*>([A-Za-z0-9+/=]*)<', xml):
-        try:
-            dec = base64.b64decode(m.group(1)).decode("latin-1")
-        except Exception:
-            continue
-        for tok in real:
-            assert tok not in dec, f"real data leaked in template: {tok!r}"
+    doc = parse_account_xml(xml)
+    account = doc.row("Account")
+    assert account.text("NAME") == "DEMO TEMPLATE ACCOUNT"
+    assert account.text("ADDRESS") == "1 EXAMPLE ST"
+    assert account.text("CITY") == "ANYTOWN"
+    assert account.text("STATE") == "CA"
+    assert account.text("ZIP") == "00000"
+    assert account.text("PHONE") == "0000000000"
+    assert account.text("SERIAL_NUMBER") == "00000000"
+    assert account.text("MAC_ADDRESS") == "000000000000"
+    for row in doc.iter_rows():
+        for field in row.fields:
+            if field.data_type == "1":
+                assert not re.fullmatch(
+                    r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}", field.text,
+                ), f"private IP leaked in template field {row.name}.{field.name}"
 
 
 def test_generate_account_xml_with_bundled_template(tmp_path):
@@ -407,18 +402,21 @@ def _configured_account() -> RemoteLinkConfig:
     )
 
 
-def test_untouched_configuration_is_byte_identical_to_the_safe_legacy_path():
+def test_untouched_configuration_matches_v122_fabricated_golden_output():
     design = _rl_design()
     template = BUNDLED_TEMPLATE.read_text(encoding="latin-1")
-    legacy = build_account_doc(
-        build_staging_account(design, "2250", receiver_num="1"), template,
-    )
-
     configured = build_configured_account_doc(
         design, RemoteLinkConfig(), template,
     )
 
-    assert configured.serialize() == legacy.serialize()
+    payload = configured.serialize().encode("latin-1")
+    # SHA-256 of the exact v1.2.2 regex-path output for this fabricated design,
+    # captured from commit 9d70ef4. This does not share implementation with the
+    # structured writer, so a common regression cannot move both sides.
+    assert len(payload) == 64931
+    assert hashlib.sha256(payload).hexdigest() == (
+        "c2dcfca58c642b60c0acb411b5eee7f62eccdad816bbf6fce6c9ed7414e2b328"
+    )
 
 
 def test_configured_doc_applies_and_reads_back_every_ordinary_field():
@@ -563,7 +561,25 @@ def test_configured_generation_writes_receipt_and_inspector_reads_same_account(t
     assert summary.account_num == "3141"
     assert summary.receiver_num == "7"
     assert summary.zone_total == 7
-    assert "Account   3141" in receipt.read_text(encoding="utf-8")
+    assert receipt.read_text(encoding="utf-8") == render_text(summary)
+
+
+def test_configured_generation_rejects_xml_injection_before_writing(tmp_path):
+    """A numeric-looking field must never be able to add a dangerous XML block."""
+    config = _configured_account()
+    config.receiver_num = (
+        '7</RECVR_NUM></Account><SysRpts>'
+        '<AMBUSH DataType="5">True</AMBUSH></SysRpts><Account>'
+        '<RECVR_NUM DataType="3">7'
+    )
+
+    with pytest.raises(InjectorError, match="DataType"):
+        generate_configured_account_xml(
+            _rl_design(), config, template_path=BUNDLED_TEMPLATE,
+            passphrase="secret", out_dir=tmp_path,
+        )
+
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_preview_uses_same_configured_generation_path():
@@ -581,4 +597,37 @@ def test_inspector_rejects_non_hex_file_cleanly(tmp_path):
     path.write_text("not a RemoteLink export")
 
     with pytest.raises(InjectorError, match="not a RemoteLink export"):
+        inspect_account(path, "secret")
+
+
+def test_inspector_rejects_odd_length_hex_cleanly(tmp_path):
+    path = tmp_path / "odd.xml"
+    path.write_text("ABC", encoding="ascii")
+
+    with pytest.raises(InjectorError, match="not a RemoteLink export"):
+        inspect_account(path, "secret")
+
+
+def test_inspector_rejects_non_ascii_passphrase_cleanly(tmp_path):
+    path = generate_configured_account_xml(
+        _rl_design(), _configured_account(), template_path=BUNDLED_TEMPLATE,
+        passphrase="secret", out_dir=tmp_path,
+    )
+
+    with pytest.raises(InjectorError, match="passphrase"):
+        inspect_account(path, "sëcret")
+
+
+def test_inspector_rejects_malformed_base64_cleanly(tmp_path):
+    malformed = (
+        "<Panels><Panel><Account>"
+        '<ID DataType="14">90000</ID>'
+        '<ACCOUNT_NUM DataType="3">1</ACCOUNT_NUM>'
+        '<NAME DataType="1">!!!!</NAME>'
+        "</Account></Panel></Panels>"
+    )
+    path = tmp_path / "bad_string.xml"
+    path.write_text(encode_account(malformed, "secret"), encoding="ascii")
+
+    with pytest.raises(InjectorError, match="base64"):
         inspect_account(path, "secret")

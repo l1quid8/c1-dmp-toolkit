@@ -355,7 +355,7 @@ def resolve_original_pdf(pdf_path: Path) -> Path:
     """If pdf_path is `<name>_searchable.pdf`, return `<name>.pdf` if it exists.
 
     The riser-diagram page has vector text that PyMuPDF reads accurately, but
-    OCR can mangle splitter labels (e.g. Academy's '710-LX500-1' / '710-LX500-2'
+    OCR can mangle splitter labels (layout variant B's '710-LX500-1' / '710-LX500-2'
     don't survive ocrmypdf round-trip and become invisible to PyMuPDF on the
     searchable PDF). Topology extraction must run against the original PDF.
     """

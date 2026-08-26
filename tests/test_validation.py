@@ -35,11 +35,11 @@ def _valid_design() -> DMPDesign:
     """A design that passes every rule (the baseline each test perturbs)."""
     return DMPDesign(
         site_info=SiteInfo(
-            school_name="DARBY AVENUE ELEMENTARY SCHOOL",
-            ip_address="10.101.148.96",
-            default_gateway="10.101.148.1",
+            school_name="MAPLEWOOD ELEMENTARY SCHOOL",
+            ip_address="192.0.2.50",
+            default_gateway="192.0.2.1",
             install_date="2026-05-29",
-            install_tech="T. CALDWELL",
+            install_tech="CONVERGEONE",
         ),
         splitters=[Splitter(id="710-LX500-1", splitter_type="LX",
                             outputs=["RSP-1", "710-LX500-2", "SPARE"])],

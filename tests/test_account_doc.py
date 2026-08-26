@@ -141,6 +141,35 @@ def test_datatype_one_set_text_never_emits_base64_padding():
 
 
 @pytest.mark.parametrize(
+    ("data_type", "value"),
+    [
+        ("3", '1</RECVR_NUM></Account><SysRpts><AMBUSH DataType="5">True'),
+        ("5", "TRUE"),
+        ("11", "tomorrow"),
+        ("14", "9.5"),
+    ],
+)
+def test_set_text_rejects_values_outside_the_field_datatype(data_type, value):
+    """Editable values must not escape their leaf or change RemoteLink types."""
+    field = Field("VALUE", data_type, "0")
+
+    with pytest.raises(InjectorError, match="DataType"):
+        field.set_text(value)
+
+
+def test_datatype_one_rejects_text_outside_the_export_encoding():
+    """RemoteLink string fields are latin-1 and must fail cleanly, not crash."""
+    with pytest.raises(InjectorError, match="latin-1"):
+        Field("NAME", "1", "").set_text("EURO €")
+
+
+def test_datatype_one_decode_rejects_malformed_base64():
+    """The inspector must not silently decode a damaged string field."""
+    with pytest.raises(InjectorError, match="base64"):
+        _ = Field("NAME", "1", "!!!!").text
+
+
+@pytest.mark.parametrize(
     ("text", "message"),
     [
         ("<Panel></Panel>", "must start"),
