@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import re
-import uuid
 
 from riser_model import (
     DevicePortRef,
     TopologyConnection,
     default_riser_document,
     derive_legacy_connections,
+    stable_connection_id,
 )
 
 
@@ -120,7 +120,7 @@ def connect(design, source: DevicePortRef, target: DevicePortRef, *,
     if quantity < 1:
         raise TopologyError("Cable quantity must be at least 1")
     edge = TopologyConnection(
-        id=connection_id or str(uuid.uuid4()), source=source, target=target,
+        id=connection_id or stable_connection_id(source, target), source=source, target=target,
         cable_type=(cable_type or "").strip(), status=status, quantity=quantity,
         custom_label=(custom_label or "").strip() or None,
     )
