@@ -60,6 +60,14 @@ KEYPAD_DEVICE_TYPES = MappingProxyType({
 # offered by the generator until a controlled export proves it.
 KEYPAD_COMM_TYPES = MappingProxyType({"keypad_bus": "K"})
 
+KEYPAD_DEFAULT_DISPLAY_AREAS = MappingProxyType({
+    "door": "FFFFFFFF",
+    "fire": "FFFFFFFF",
+    "keypad": "FFFFFFFF",
+    "zone_expander": "00",
+    "vplex_pl500": "00",
+})
+
 # The operator also supplied controlled Communication Path exports.  They are
 # retained as verified evidence for a future communication-path editor; v1.3's
 # approved UI does not write CommPath rows.
@@ -307,6 +315,31 @@ def resolve_config(config: RemoteLinkConfig, design) -> ResolvedRemoteLinkConfig
     )
 
 
+def effective_keypad(config: RemoteLinkConfig, keypad) -> RLKeypad:
+    """Resolve one design keypad without materializing defaults in the session."""
+    number = int(getattr(keypad, "number", keypad))
+    saved = config.keypads.get(number)
+    if saved is None:
+        return RLKeypad(name=f"KEYPAD {number}")
+    return RLKeypad(
+        name=saved.name.strip() or f"KEYPAD {number}",
+        device_type=saved.device_type,
+        comm_type=saved.comm_type,
+        disp_areas=(saved.disp_areas.strip() or
+                    KEYPAD_DEFAULT_DISPLAY_AREAS.get(
+                        saved.device_type, "FFFFFFFF")).upper(),
+    )
+
+
+def reconcile_keypads(config: RemoteLinkConfig, design) -> bool:
+    """Drop saved programming for hardware numbers no longer in the design."""
+    present = {int(keypad.number) for keypad in design.keypads if keypad.number}
+    stale = [number for number in config.keypads if number not in present]
+    for number in stale:
+        del config.keypads[number]
+    return bool(stale)
+
+
 def _duplicates(values: list) -> set:
     seen = set()
     duplicates = set()
@@ -372,11 +405,16 @@ def validate_config(config: RemoteLinkConfig, design) -> list[RLConfigIssue]:
                 ))
 
     for number, keypad in resolved.keypads.items():
-        if not re.fullmatch(r"[0-9A-Fa-f]{8}", keypad.disp_areas.strip()):
+        expected_width = 2 if keypad.device_type in (
+            "zone_expander", "vplex_pl500",
+        ) else 8
+        if not re.fullmatch(
+                rf"[0-9A-Fa-f]{{{expected_width}}}", keypad.disp_areas.strip()):
             issues.append(RLConfigIssue(
                 code="remotelink.display_areas_invalid",
                 ref=f"keypad:{number}",
-                message=f"Keypad {number} displayed areas must be 8 hexadecimal digits",
+                message=f"Keypad {number} displayed areas must be "
+                        f"{expected_width} hexadecimal digits",
             ))
 
     return issues

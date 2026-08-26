@@ -49,6 +49,13 @@
   "keypad_comm_types": {
     "keypad_bus": "K"
   },
+  "keypad_default_display_areas": {
+    "door": "FFFFFFFF",
+    "fire": "FFFFFFFF",
+    "keypad": "FFFFFFFF",
+    "zone_expander": "00",
+    "vplex_pl500": "00"
+  },
   "communication_path_types": {
     "none": "-",
     "digital_dialer": "D",

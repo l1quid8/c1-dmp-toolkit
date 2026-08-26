@@ -43,6 +43,12 @@ from hardware import (
     renumber_splitter,
 )
 from session import Session
+from rl_injector.rl_config import (
+    KEYPAD_DEFAULT_DISPLAY_AREAS,
+    KEYPAD_DEVICE_TYPES,
+    effective_keypad,
+    reconcile_keypads,
+)
 from ui_widgets import (
     AutocompleteEntry,
     Card,
@@ -1036,6 +1042,7 @@ class KeypadsTab(ctk.CTkFrame):
         self.refresh()
 
     def refresh(self):
+        reconcile_keypads(self.session.remotelink, self.session.design)
         for w in self.body.winfo_children():
             w.destroy()
 
@@ -1121,7 +1128,92 @@ class KeypadsTab(ctk.CTkFrame):
                          text_color=theme.TEXT_SECOND).grid(
             row=1, column=1, columnspan=2, sticky="e", padx=(0, 12),
             pady=(0, 11))
+
+        rl = effective_keypad(self.session.remotelink, kp)
+        rl_row = ctk.CTkFrame(card, fg_color=theme.SURFACE_SUBTLE,
+                              corner_radius=theme.RADIUS["control"])
+        rl_row.grid(row=2, column=0, columnspan=3, sticky="ew",
+                    padx=12, pady=(0, 11))
+        for column in range(4):
+            rl_row.columnconfigure(column, weight=1)
+
+        ctk.CTkLabel(
+            rl_row, text="REMOTELINK", text_color=theme.TEXT_TERTIARY,
+            font=theme.ui_font(theme.SIZE["badge"], "bold"),
+        ).grid(row=0, column=0, columnspan=4, sticky="w", padx=10,
+               pady=(8, 3))
+
+        def label(parent, text, column):
+            ctk.CTkLabel(
+                parent, text=text, anchor="w", text_color=theme.TEXT_TERTIARY,
+                font=theme.ui_font(theme.SIZE["label"]),
+            ).grid(row=1, column=column, sticky="w", padx=(10, 4))
+
+        label(rl_row, "Display name", 0)
+        label(rl_row, "Device type", 1)
+        label(rl_row, "Communication", 2)
+        label(rl_row, "Displayed areas", 3)
+
+        name_var = tk.StringVar(value=rl.name)
+        name_var.trace_add(
+            "write", lambda *_a, k=kp, v=name_var:
+            self._set_rl_field(k, "name", v.get()))
+        _styled_entry(rl_row, textvariable=name_var).grid(
+            row=2, column=0, sticky="ew", padx=(10, 4), pady=(0, 9))
+
+        device_labels = {
+            "Door": "door",
+            "Fire": "fire",
+            "Keypad": "keypad",
+            "Zone expander": "zone_expander",
+            "V-Plex / PL500": "vplex_pl500",
+        }
+        key_to_label = {value: text for text, value in device_labels.items()}
+        holder, menu = _bordered_menu(
+            rl_row, list(device_labels),
+            lambda value, k=kp: self._set_rl_field(
+                k, "device_type", device_labels[value]),
+            tone="connected", width=145,
+        )
+        menu.set(key_to_label.get(rl.device_type, "Keypad"))
+        holder.grid(row=2, column=1, sticky="ew", padx=4, pady=(0, 9))
+
+        # Calibration proved only keypad-bus communication for every device
+        # type. Show that fact, but don't pretend there are editable choices.
+        comm = Chip(
+            rl_row, "Keypad bus", variant="neutral", pill=False,
+            size=theme.SIZE["chip"], padx=8, pady=4,
+        )
+        comm.grid(row=2, column=2, sticky="w", padx=4, pady=(0, 9))
+        attach_tooltip(
+            comm,
+            "Every calibrated RemoteLink device used keypad-bus communication. "
+            "Unverified raw choices are intentionally unavailable.",
+        )
+
+        areas_var = tk.StringVar(value=rl.disp_areas)
+        areas_var.trace_add(
+            "write", lambda *_a, k=kp, v=areas_var:
+            self._set_rl_field(k, "disp_areas", v.get()))
+        _styled_entry(rl_row, textvariable=areas_var).grid(
+            row=2, column=3, sticky="ew", padx=(4, 10), pady=(0, 9))
         return card
+
+    def _set_rl_field(self, kp, field: str, value: str):
+        number = int(kp.number)
+        configured = self.session.remotelink.keypads.get(number)
+        if configured is None:
+            configured = effective_keypad(self.session.remotelink, kp)
+            self.session.remotelink.keypads[number] = configured
+        if field == "device_type" and value not in KEYPAD_DEVICE_TYPES:
+            return
+        setattr(configured, field, value.strip())
+        if field == "device_type":
+            configured.disp_areas = KEYPAD_DEFAULT_DISPLAY_AREAS[value]
+            # The default displayed-area shape changes with device type.
+            # Rebuild after the menu callback returns so its entry reflects it.
+            self.after_idle(self.refresh)
+        self.on_change()
 
     def _set_source(self, kp, value: str):
         kp.source = value

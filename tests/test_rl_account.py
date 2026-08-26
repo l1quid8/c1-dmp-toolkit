@@ -402,7 +402,7 @@ def _configured_account() -> RemoteLinkConfig:
         ),
         keypads={
             1: RLKeypad("LOBBY", "door", "keypad_bus", "00000001"),
-            2: RLKeypad("OFFICE", "zone_expander", "keypad_bus", "00000002"),
+            2: RLKeypad("OFFICE", "zone_expander", "keypad_bus", "00"),
         },
     )
 
@@ -463,7 +463,7 @@ def test_configured_doc_applies_and_reads_back_every_ordinary_field():
         for row in doc.table("DeviceInfoList").rows
     ] == [
         ("1", "LOBBY", "1", "K", "00000001"),
-        ("2", "OFFICE", "4", "K", "00000002"),
+        ("2", "OFFICE", "4", "K", "00"),
     ]
     assert {
         row.text("NUMBER"): row.text("TYPE")

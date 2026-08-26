@@ -10,12 +10,13 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from parse_dmp_worksheet import DMPDesign, SiteInfo  # noqa: E402
+from parse_dmp_worksheet import DMPDesign, Keypad, SiteInfo  # noqa: E402
 from rl_injector.rl_config import (  # noqa: E402
     ARM_MODES,
     COMM_PATH_TYPES,
     CONNECT_TYPES,
     KEYPAD_COMM_TYPES,
+    KEYPAD_DEFAULT_DISPLAY_AREAS,
     KEYPAD_DEVICE_TYPES,
     SCHEDULE_FIELD_MAP,
     RLAdvanced,
@@ -27,6 +28,8 @@ from rl_injector.rl_config import (  # noqa: E402
     RemoteLinkConfig,
     config_from_dict,
     config_to_dict,
+    effective_keypad,
+    reconcile_keypads,
     resolve_config,
     validate_config,
 )
@@ -63,6 +66,8 @@ def test_verified_arm_modes_include_their_required_system_area_layouts():
 def test_verified_keypad_type_and_bus_mappings_match_fake_exports():
     assert dict(KEYPAD_DEVICE_TYPES) == FIELD_MAPS["keypad_device_types"]
     assert dict(KEYPAD_COMM_TYPES) == FIELD_MAPS["keypad_comm_types"]
+    assert dict(KEYPAD_DEFAULT_DISPLAY_AREAS) == \
+        FIELD_MAPS["keypad_default_display_areas"]
 
 
 def test_extra_communication_path_exports_are_preserved_as_evidence():
@@ -94,6 +99,46 @@ def test_zone_type_label_parser_stores_auto_as_blank_code():
     assert rl_type_from_label("Night") == "NT"
     assert rl_type_from_label("Exit") == "EX"
     assert rl_type_from_label("Supervisory") == "SV"
+
+
+def test_effective_keypad_derives_safe_defaults_without_persisting_them():
+    config = RemoteLinkConfig()
+    keypad = Keypad(number=7, location="LIBRARY")
+
+    effective = effective_keypad(config, keypad)
+
+    assert effective == RLKeypad(
+        "KEYPAD 7", "keypad", "keypad_bus", "FFFFFFFF"
+    )
+    assert config.keypads == {}
+
+
+def test_effective_keypad_uses_saved_values_but_fills_blank_name():
+    config = RemoteLinkConfig(keypads={
+        2: RLKeypad("", "door", "keypad_bus", "00000001"),
+    })
+
+    assert effective_keypad(config, Keypad(number=2)) == RLKeypad(
+        "KEYPAD 2", "door", "keypad_bus", "00000001"
+    )
+
+
+def test_reconcile_keypads_removes_stale_numbers_and_keeps_survivors():
+    config = RemoteLinkConfig(keypads={
+        1: RLKeypad("LOBBY"),
+        2: RLKeypad("OFFICE"),
+        9: RLKeypad("REMOVED"),
+    })
+    design = _design()
+    design.keypads = [Keypad(1), Keypad(2), Keypad(3)]
+
+    changed = reconcile_keypads(config, design)
+
+    assert changed is True
+    assert config.keypads == {
+        1: RLKeypad("LOBBY"),
+        2: RLKeypad("OFFICE"),
+    }
 
 
 def test_untouched_config_resolves_account_and_users_from_school_code():
@@ -264,3 +309,11 @@ def test_invalid_keypad_display_area_mask_is_reported():
     assert {issue.code for issue in validate_config(config, _design())} == {
         "remotelink.display_areas_invalid"
     }
+
+
+def test_non_display_device_uses_verified_two_digit_area_value():
+    config = RemoteLinkConfig(keypads={
+        1: RLKeypad("EXPANDER", "zone_expander", "keypad_bus", "00"),
+    })
+
+    assert validate_config(config, _design()) == []

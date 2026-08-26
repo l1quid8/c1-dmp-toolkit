@@ -31,6 +31,7 @@ from editor_tabs import (
     auto_hide_scrollbar,
     prompt_add_expander,
 )
+from rl_injector.rl_config import CONNECT_TYPES
 from ui_widgets import (
     Card,
     Chip,
@@ -306,6 +307,7 @@ class EditorFrame(ctk.CTkFrame):
         self.on_status_change = on_status_change or (lambda text, dirty: None)
         self.on_validation_change = on_validation_change or (lambda text, ok: None)
         self._site_vars: dict[str, ctk.StringVar] = {}
+        self._rl_comm_vars: dict[str, ctk.StringVar] = {}
         self._suspend_traces = False
         # The pre-generate sheet lives inside this frame now, so nothing stops
         # a second one opening on top of the first — this is the interlock.
@@ -860,7 +862,95 @@ class EditorFrame(ctk.CTkFrame):
             entry.grid(row=1, column=0, sticky="ew")
             add_hover(entry, border_color=theme.ACCENT)
             self._site_vars[attr] = var
+
+        panel = Card(holder)
+        panel.grid(row=4, column=0, columnspan=2, sticky="ew",
+                   pady=(theme.PAD["md"], 0))
+        panel.columnconfigure(0, weight=1)
+        panel.columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            panel, text="PANEL CONNECTION", anchor="w",
+            font=theme.ui_font(theme.SIZE["label"], "bold"),
+            text_color=theme.TEXT_TERTIARY,
+        ).grid(row=0, column=0, columnspan=2, sticky="w",
+               padx=theme.PAD["md"], pady=(theme.PAD["md"], 4))
+
+        comm = self.session.remotelink.comm
+        labels = {
+            "SCS-1 / SCS-105": "scs1_scs105",
+            "Network": "network",
+            "Direct": "direct",
+            "Modem": "modem",
+            "Modem Special": "modem_special",
+            "Cellular": "cellular",
+        }
+        by_key = {value: label for label, value in labels.items()}
+        type_cell = ctk.CTkFrame(panel, fg_color="transparent")
+        type_cell.grid(row=1, column=0, sticky="ew",
+                       padx=(theme.PAD["md"], theme.PAD["xs"]),
+                       pady=(0, theme.PAD["md"]))
+        type_cell.columnconfigure(0, weight=1)
+        ctk.CTkLabel(type_cell, text="Connection type", anchor="w",
+                     font=theme.ui_font(theme.SIZE["label"]),
+                     text_color=theme.TEXT_TERTIARY).grid(
+                         row=0, column=0, sticky="w", pady=(0, 2))
+        type_var = ctk.StringVar(value=by_key.get(comm.connect_type, "Network"))
+        type_menu = ctk.CTkOptionMenu(
+            type_cell, values=list(labels), variable=type_var,
+            command=lambda label: self._on_rl_comm_edit(
+                "connect_type", labels[label]),
+            height=theme.HEIGHT["input"], fg_color=theme.SURFACE,
+            button_color=theme.SURFACE_CHIP,
+            button_hover_color=theme.HOVER_SUBTLE,
+            text_color=theme.TEXT, dropdown_fg_color=theme.SURFACE,
+            dropdown_text_color=theme.TEXT,
+            dropdown_hover_color=theme.HOVER_SUBTLE,
+            font=theme.ui_font(theme.SIZE["body"]),
+            dropdown_font=theme.ui_font(theme.SIZE["body"]),
+            corner_radius=theme.RADIUS["button"],
+        )
+        type_menu.grid(row=1, column=0, sticky="ew")
+        self._rl_comm_vars["connect_type"] = type_var
+
+        for column, (label, attr, value) in enumerate((
+            ("Panel port", "port", comm.port),
+            ("Serial number (optional)", "serial", comm.serial),
+        ), start=1):
+            # Port and serial share the right half vertically, keeping the
+            # panel connection group compact on field laptops.
+            row = column
+            cell = ctk.CTkFrame(panel, fg_color="transparent")
+            cell.grid(row=row, column=1, sticky="ew",
+                      padx=(theme.PAD["xs"], theme.PAD["md"]),
+                      pady=(0, theme.PAD["xs"] if row == 1 else theme.PAD["md"]))
+            cell.columnconfigure(0, weight=1)
+            ctk.CTkLabel(cell, text=label, anchor="w",
+                         font=theme.ui_font(theme.SIZE["label"]),
+                         text_color=theme.TEXT_TERTIARY).grid(
+                             row=0, column=0, sticky="w", pady=(0, 2))
+            var = ctk.StringVar(value=value)
+            var.trace_add(
+                "write", lambda *_a, a=attr, v=var:
+                self._on_rl_comm_edit(a, v.get()))
+            entry = ctk.CTkEntry(
+                cell, textvariable=var, height=theme.HEIGHT["input"],
+                fg_color=theme.SURFACE, border_color=theme.BORDER_STRONG,
+                border_width=1, corner_radius=theme.RADIUS["button"],
+                text_color=theme.TEXT, font=theme.ui_font(theme.SIZE["body"]),
+            )
+            entry.grid(row=1, column=0, sticky="ew")
+            add_hover(entry, border_color=theme.ACCENT)
+            self._rl_comm_vars[attr] = var
         self._suspend_traces = False
+
+    def _on_rl_comm_edit(self, attr: str, value: str):
+        if self._suspend_traces:
+            return
+        if attr == "connect_type" and value not in CONNECT_TYPES:
+            return
+        setattr(self.session.remotelink.comm, attr, value.strip())
+        self.mark_dirty()
+        self.refresh_validation()
 
     def _on_site_edit(self, attr: str, var: ctk.StringVar):
         if self._suspend_traces:

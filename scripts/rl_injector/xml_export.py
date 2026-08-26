@@ -49,6 +49,7 @@ from .rl_config import (
     RLKeypad,
     RemoteLinkConfig,
     ResolvedRemoteLinkConfig,
+    effective_keypad as resolve_keypad,
     resolve_config,
 )
 from .schema import build_staging_account
@@ -242,15 +243,7 @@ def _rebuild_users(doc: AccountDoc, resolved: ResolvedRemoteLinkConfig) -> None:
 
 
 def _effective_keypad(resolved: ResolvedRemoteLinkConfig, number: int) -> RLKeypad:
-    configured = resolved.keypads.get(number)
-    if configured is None:
-        return RLKeypad(name=f"KEYPAD {number}")
-    return RLKeypad(
-        name=configured.name.strip() or f"KEYPAD {number}",
-        device_type=configured.device_type,
-        comm_type=configured.comm_type,
-        disp_areas=configured.disp_areas.upper(),
-    )
+    return resolve_keypad(resolved, number)
 
 
 def _rebuild_keypads(doc: AccountDoc, resolved: ResolvedRemoteLinkConfig,
