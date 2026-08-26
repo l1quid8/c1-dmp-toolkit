@@ -1876,7 +1876,7 @@ class App:
                 filetypes=[("Text file", "*.txt")],
             )
             if selected:
-                Path(selected).write_text(state["text"] + "\n", encoding="utf-8")
+                Path(selected).write_text(state["text"], encoding="utf-8")
 
         save_btn.configure(command=save_summary)
 
