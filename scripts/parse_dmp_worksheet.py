@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from riser_model import RiserDocument, TopologyConnection
+
 import re
 
 import openpyxl
@@ -112,6 +114,8 @@ class DMPDesign:
     topology_source: str = ""                                # "riser" | "auto-derived"
     master_zones_source: str = ""                            # "master" | "point_info"
     dmp_status: str = ""                                     # "DRAFT" | "FINAL" | "" (DMPStatus doc prop)
+    connections: list[TopologyConnection] = field(default_factory=list)
+    riser_document: Optional[RiserDocument] = None
 
 
 # -------- parsing helpers --------

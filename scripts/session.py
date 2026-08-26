@@ -35,8 +35,19 @@ from parse_dmp_worksheet import (
     ZoneInfo,
     _master_zones_from_point_info,
 )
+from riser_model import (
+    DevicePortRef,
+    RiserAnnotation,
+    RiserDocument,
+    RiserElement,
+    RiserRoute,
+    RiserTitleBlock,
+    TopologyConnection,
+    default_riser_document,
+    derive_legacy_connections,
+)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SESSION_EXT = ".dmps"
 RECOVERY_SUFFIX = ".recovery"
 
@@ -191,6 +202,55 @@ def _conflict_from_dict(d: dict) -> Any:
     )
 
 
+def _connection_from_dict(d: dict) -> TopologyConnection:
+    return TopologyConnection(
+        id=d.get("id", ""),
+        source=DevicePortRef(**(d.get("source") or {})),
+        target=DevicePortRef(**(d.get("target") or {})),
+        cable_type=d.get("cable_type", "WP240R"),
+        status=d.get("status", "new"),
+        quantity=max(1, int(d.get("quantity", 1))),
+        custom_label=d.get("custom_label"),
+    )
+
+
+def _riser_document_from_dict(d: dict | None) -> RiserDocument | None:
+    if not d:
+        return None
+    title = RiserTitleBlock(**{
+        k: v for k, v in (d.get("title_block") or {}).items()
+        if k in {f.name for f in dataclasses.fields(RiserTitleBlock)}
+    })
+    elements = {
+        key: RiserElement(
+            **{**value, "label_offset": tuple(value.get("label_offset", (0.0, 0.0)))})
+        for key, value in (d.get("elements") or {}).items()
+    }
+    routes = {
+        key: RiserRoute(
+            connection_id=value.get("connection_id", key),
+            points=[tuple(p) for p in value.get("points", [])],
+            label_offset=tuple(value.get("label_offset", (0.0, 0.0))),
+            manual=bool(value.get("manual", False)),
+        )
+        for key, value in (d.get("routes") or {}).items()
+    }
+    annotations = [RiserAnnotation(
+        **{**value, "points": [tuple(p) for p in value.get("points", [])]})
+        for value in d.get("annotations") or []
+    ]
+    return RiserDocument(
+        title_block=title,
+        elements=elements,
+        routes=routes,
+        annotations=annotations,
+        z_order=list(d.get("z_order") or []),
+        unplaced=list(d.get("unplaced") or []),
+        page_width=float(d.get("page_width", 36 * 72)),
+        page_height=float(d.get("page_height", 24 * 72)),
+    )
+
+
 def design_from_dict(d: dict) -> DMPDesign:
     return DMPDesign(
         site_info=_site_info_from_dict(d.get("site_info") or {}),
@@ -204,6 +264,8 @@ def design_from_dict(d: dict) -> DMPDesign:
         topology_source=d.get("topology_source", ""),
         master_zones_source=d.get("master_zones_source", ""),
         dmp_status=d.get("dmp_status", ""),
+        connections=[_connection_from_dict(x) for x in d.get("connections") or []],
+        riser_document=_riser_document_from_dict(d.get("riser_document")),
     )
 
 
@@ -321,8 +383,13 @@ def _session_from_dict(d: dict, path: Path) -> Session:
             "Update the app to open it."
         )
     source = d.get("source") or {}
+    design = design_from_dict(d.get("design") or {})
+    if not design.connections:
+        design.connections = derive_legacy_connections(design)
+    if design.riser_document is None:
+        design.riser_document = default_riser_document(design)
     return Session(
-        design=design_from_dict(d.get("design") or {}),
+        design=design,
         source_kind=source.get("kind", ""),
         source_name=source.get("name", ""),
         topology_confirmed=bool(d.get("topology_confirmed", False)),
