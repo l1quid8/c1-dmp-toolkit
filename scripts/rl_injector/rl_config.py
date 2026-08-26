@@ -5,10 +5,99 @@ from __future__ import annotations
 import dataclasses
 import re
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 
 SCHEDULE_DAYS = ("sun", "mon", "tue", "wed", "thu", "fri", "sat")
+
+
+@dataclass(frozen=True)
+class ArmModeEncoding:
+    """RemoteLink's raw mode value and the system areas that mode creates."""
+
+    raw: str
+    inst_arm: bool
+    areas: tuple[str, ...]
+
+
+# Verified on 2026-08-26 from fabricated account 9999.  Keep these closed maps:
+# production code must never accept an unverified raw RemoteLink enum value.
+CONNECT_TYPES = MappingProxyType({
+    "scs1_scs105": "1",
+    "network": "2",
+    "direct": "3",
+    "modem": "4",
+    "modem_special": "5",
+    "cellular": "6",
+})
+
+ARM_MODES = MappingProxyType({
+    "area": ArmModeEncoding("N", False, ()),
+    "all_perimeter": ArmModeEncoding("A", True, (
+        "PERIMETER", "INTERIOR",
+    )),
+    "home_sleep_away": ArmModeEncoding("H", True, (
+        "PERIMETER", "INTERIOR", "BEDROOMS",
+    )),
+    "hsa_with_guest": ArmModeEncoding("G", True, (
+        "PERIMETER", "INTERIOR", "BEDROOMS",
+        "GUEST 1 PERIMETER", "GUEST 1 INTERIOR", "GUEST 1 BEDROOMS",
+        "GUEST 2 PERIMETER", "GUEST 2 INTERIOR", "GUEST 2 BEDROOMS",
+    )),
+})
+
+# V-Plex/PL500 is represented by an absent TYPE field, not a fifth enum value.
+KEYPAD_DEVICE_TYPES = MappingProxyType({
+    "door": "1",
+    "fire": "2",
+    "keypad": "3",
+    "zone_expander": "4",
+    "vplex_pl500": None,
+})
+
+# Every calibrated device used keypad-bus communication.  No other value is
+# offered by the generator until a controlled export proves it.
+KEYPAD_COMM_TYPES = MappingProxyType({"keypad_bus": "K"})
+
+# The operator also supplied controlled Communication Path exports.  They are
+# retained as verified evidence for a future communication-path editor; v1.3's
+# approved UI does not write CommPath rows.
+COMM_PATH_TYPES = MappingProxyType({
+    "none": "-",
+    "digital_dialer": "D",
+    "network": "N",
+    "contact_id": "C",
+    "cellular_network": "L",
+    "wifi": "W",
+})
+
+_SCHEDULE_DAY_FIELDS = MappingProxyType({
+    "sun": ("SUN_OPEN", "SUN_CLOSE", "1899-12-31"),
+    "mon": ("MON_OPEN", "MON_CLOSE", "1900-01-01"),
+    "tue": ("TUE_OPEN", "TUE_CLOSE", "1900-01-02"),
+    "wed": ("WED_OPEN", "WED_CLOSE", "1900-01-03"),
+    "thu": ("THU_OPEN", "THU_CLOSE", "1900-01-04"),
+    "fri": ("FRI_OPEN", "FRI_CLOSE", "1900-01-05"),
+    "sat": ("SAT_OPEN", "SAT_CLOSE", "1900-01-06"),
+})
+
+_SCHEDULE_STATIC_FIELDS = (
+    ("TEMP_SCHED", "5", "False"),
+    ("OP_SS_SS", "1", "1"),
+    ("OP_SS_BA", "1", "A"),
+    *((f"OP_SS_{day.upper()}", "5", "False") for day in SCHEDULE_DAYS),
+    ("CL_SS_SS", "1", "2"),
+    ("CL_SS_BA", "1", "A"),
+    *((f"CL_SS_{day.upper()}", "5", "False") for day in SCHEDULE_DAYS),
+)
+
+SCHEDULE_FIELD_MAP = MappingProxyType({
+    "day_fields": _SCHEDULE_DAY_FIELDS,
+    "static_fields": _SCHEDULE_STATIC_FIELDS,
+    "area_link_field": "SCHED_1",
+    "schedule_number": "1",
+})
 
 
 @dataclass

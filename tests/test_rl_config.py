@@ -12,6 +12,12 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from parse_dmp_worksheet import DMPDesign, SiteInfo  # noqa: E402
 from rl_injector.rl_config import (  # noqa: E402
+    ARM_MODES,
+    COMM_PATH_TYPES,
+    CONNECT_TYPES,
+    KEYPAD_COMM_TYPES,
+    KEYPAD_DEVICE_TYPES,
+    SCHEDULE_FIELD_MAP,
     RLAdvanced,
     RLArming,
     RLComm,
@@ -26,11 +32,52 @@ from rl_injector.rl_config import (  # noqa: E402
 )
 
 
+FIELD_MAPS = json.loads(
+    (REPO_ROOT / "tests" / "fixtures" / "rl_field_maps.json").read_text()
+)
+
+
 def _design(code: str = "2250") -> DMPDesign:
     return DMPDesign(site_info=SiteInfo(
         school_name="TEST ELEMENTARY SCHOOL",
         school_code=code,
     ))
+
+
+def test_verified_connect_type_mappings_match_fake_account_exports():
+    assert dict(CONNECT_TYPES) == FIELD_MAPS["connect_types"]
+
+
+def test_verified_arm_modes_include_their_required_system_area_layouts():
+    assert {
+        key: {
+            "arm_mode": value.raw,
+            "inst_arm": value.inst_arm,
+            "areas": list(value.areas),
+        }
+        for key, value in ARM_MODES.items()
+    } == FIELD_MAPS["arm_modes"]
+
+
+def test_verified_keypad_type_and_bus_mappings_match_fake_exports():
+    assert dict(KEYPAD_DEVICE_TYPES) == FIELD_MAPS["keypad_device_types"]
+    assert dict(KEYPAD_COMM_TYPES) == FIELD_MAPS["keypad_comm_types"]
+
+
+def test_extra_communication_path_exports_are_preserved_as_evidence():
+    assert dict(COMM_PATH_TYPES) == FIELD_MAPS["communication_path_types"]
+
+
+def test_schedule_field_map_matches_calibrated_monday_and_known_weekday_dates():
+    expected = FIELD_MAPS["schedule"]
+    assert {
+        day: list(fields)
+        for day, fields in SCHEDULE_FIELD_MAP["day_fields"].items()
+    } == expected["day_fields"]
+    assert [list(field) for field in SCHEDULE_FIELD_MAP["static_fields"]] == \
+        expected["static_fields"]
+    assert SCHEDULE_FIELD_MAP["area_link_field"] == expected["area_link_field"]
+    assert SCHEDULE_FIELD_MAP["schedule_number"] == expected["schedule_number"]
 
 
 def test_untouched_config_resolves_account_and_users_from_school_code():

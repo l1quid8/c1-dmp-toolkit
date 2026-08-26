@@ -1,0 +1,94 @@
+{
+  "connect_types": {
+    "scs1_scs105": "1",
+    "network": "2",
+    "direct": "3",
+    "modem": "4",
+    "modem_special": "5",
+    "cellular": "6"
+  },
+  "arm_modes": {
+    "area": {
+      "arm_mode": "N",
+      "inst_arm": false,
+      "areas": []
+    },
+    "all_perimeter": {
+      "arm_mode": "A",
+      "inst_arm": true,
+      "areas": ["PERIMETER", "INTERIOR"]
+    },
+    "home_sleep_away": {
+      "arm_mode": "H",
+      "inst_arm": true,
+      "areas": ["PERIMETER", "INTERIOR", "BEDROOMS"]
+    },
+    "hsa_with_guest": {
+      "arm_mode": "G",
+      "inst_arm": true,
+      "areas": [
+        "PERIMETER",
+        "INTERIOR",
+        "BEDROOMS",
+        "GUEST 1 PERIMETER",
+        "GUEST 1 INTERIOR",
+        "GUEST 1 BEDROOMS",
+        "GUEST 2 PERIMETER",
+        "GUEST 2 INTERIOR",
+        "GUEST 2 BEDROOMS"
+      ]
+    }
+  },
+  "keypad_device_types": {
+    "door": "1",
+    "fire": "2",
+    "keypad": "3",
+    "zone_expander": "4",
+    "vplex_pl500": null
+  },
+  "keypad_comm_types": {
+    "keypad_bus": "K"
+  },
+  "communication_path_types": {
+    "none": "-",
+    "digital_dialer": "D",
+    "network": "N",
+    "contact_id": "C",
+    "cellular_network": "L",
+    "wifi": "W"
+  },
+  "schedule": {
+    "day_fields": {
+      "sun": ["SUN_OPEN", "SUN_CLOSE", "1899-12-31"],
+      "mon": ["MON_OPEN", "MON_CLOSE", "1900-01-01"],
+      "tue": ["TUE_OPEN", "TUE_CLOSE", "1900-01-02"],
+      "wed": ["WED_OPEN", "WED_CLOSE", "1900-01-03"],
+      "thu": ["THU_OPEN", "THU_CLOSE", "1900-01-04"],
+      "fri": ["FRI_OPEN", "FRI_CLOSE", "1900-01-05"],
+      "sat": ["SAT_OPEN", "SAT_CLOSE", "1900-01-06"]
+    },
+    "static_fields": [
+      ["TEMP_SCHED", "5", "False"],
+      ["OP_SS_SS", "1", "1"],
+      ["OP_SS_BA", "1", "A"],
+      ["OP_SS_SUN", "5", "False"],
+      ["OP_SS_MON", "5", "False"],
+      ["OP_SS_TUE", "5", "False"],
+      ["OP_SS_WED", "5", "False"],
+      ["OP_SS_THU", "5", "False"],
+      ["OP_SS_FRI", "5", "False"],
+      ["OP_SS_SAT", "5", "False"],
+      ["CL_SS_SS", "1", "2"],
+      ["CL_SS_BA", "1", "A"],
+      ["CL_SS_SUN", "5", "False"],
+      ["CL_SS_MON", "5", "False"],
+      ["CL_SS_TUE", "5", "False"],
+      ["CL_SS_WED", "5", "False"],
+      ["CL_SS_THU", "5", "False"],
+      ["CL_SS_FRI", "5", "False"],
+      ["CL_SS_SAT", "5", "False"]
+    ],
+    "area_link_field": "SCHED_1",
+    "schedule_number": "1"
+  }
+}
