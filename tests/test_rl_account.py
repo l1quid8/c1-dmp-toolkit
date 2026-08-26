@@ -24,13 +24,32 @@ from rl_injector.schema import (  # noqa: E402
     build_staging_account,
 )
 from rl_injector.errors import InjectorError  # noqa: E402
+from rl_injector.account_doc import (  # noqa: E402
+    SafetyIntent,
+    render_text,
+    summarize_account,
+    verify_account_doc,
+)
+from rl_injector.rl_config import (  # noqa: E402
+    RLAdvanced,
+    RLArming,
+    RLComm,
+    RLKeypad,
+    RLScheduleDay,
+    RLUser,
+    RemoteLinkConfig,
+)
 from rl_injector.xml_export import (  # noqa: E402
     _b64,
     build_account_doc,
     build_account_xml,
     decode_account,
     encode_account,
+    generate_configured_account_xml,
     generate_account_xml,
+    inspect_account,
+    preview_account_summary,
+    build_configured_account_doc,
 )
 
 
@@ -362,3 +381,204 @@ def test_no_base64_padding_in_generated_account():
     xml = build_account_xml(build_staging_account(d, "2250", receiver_num=""),
                             BUNDLED_TEMPLATE.read_text(encoding="latin-1"))
     assert _padded_dt1_fields(xml) == []
+
+
+# --- complete configurable account path -----------------------------------
+
+def _configured_account() -> RemoteLinkConfig:
+    return RemoteLinkConfig(
+        account_num="3141",
+        receiver_num="7",
+        users=[
+            RLUser(1, "ADMIN", "3141", "1"),
+            RLUser(88, "CUSTODIAN", "8811", "2"),
+        ],
+        users_customized=True,
+        comm=RLComm(connect_type="direct", port="2201", serial="FAKE0001"),
+        arming=RLArming(
+            entry_delays=(15, 30, 45, 60),
+            exit_delay=90,
+            arm_mode="all_perimeter",
+        ),
+        keypads={
+            1: RLKeypad("LOBBY", "door", "keypad_bus", "00000001"),
+            2: RLKeypad("OFFICE", "zone_expander", "keypad_bus", "00000002"),
+        },
+    )
+
+
+def test_untouched_configuration_is_byte_identical_to_the_safe_legacy_path():
+    design = _rl_design()
+    template = BUNDLED_TEMPLATE.read_text(encoding="latin-1")
+    legacy = build_account_doc(
+        build_staging_account(design, "2250", receiver_num="1"), template,
+    )
+
+    configured = build_configured_account_doc(
+        design, RemoteLinkConfig(), template,
+    )
+
+    assert configured.serialize() == legacy.serialize()
+
+
+def test_configured_doc_applies_and_reads_back_every_ordinary_field():
+    design = _rl_design("2250")
+    design.site_info.ip_address = "192.0.2.10"
+    design.zones = [ZoneInfo(number=501, rl_type="EX")]
+
+    doc = build_configured_account_doc(
+        design, _configured_account(),
+        BUNDLED_TEMPLATE.read_text(encoding="latin-1"),
+    )
+
+    account = doc.row("Account")
+    assert account.text("ACCOUNT_NUM") == "3141"
+    assert account.text("RECVR_NUM") == "7"
+    assert account.text("CONNECT_TYPE") == "3"
+    assert account.text("PANEL_IP") == "192.0.2.10"
+    assert account.text("PANEL_IP_PRT") == "2201"
+    assert account.text("SERIAL_NUMBER") == "FAKE0001"
+
+    sysopts = doc.row("SysOpts")
+    assert tuple(sysopts.text(f"ENT_DLY_{i}") for i in range(1, 5)) == \
+        ("15", "30", "45", "60")
+    assert sysopts.text("ARM_MODE") == "A"
+    assert sysopts.text("INST_ARM") == "True"
+    assert doc.table("PartInfoList").rows[0].text("EXIT_DELAY") == "90"
+    assert [row.text("NAME") for row in doc.table("AreaInfoList").rows] == [
+        "PERIMETER", "INTERIOR",
+    ]
+
+    assert [
+        (row.text("USER_NUM"), row.text("NAME"), row.text("CODE"),
+         row.text("PROFILE1"))
+        for row in doc.table("UsersList").rows
+    ] == [
+        ("1", "ADMIN", "3141", "1"),
+        ("88", "CUSTODIAN", "8811", "2"),
+    ]
+    assert [
+        (row.text("NUMBER"), row.text("NAME"), row.text("TYPE"),
+         row.text("COMM_TYPE"), row.text("DISP_AREAS"))
+        for row in doc.table("DeviceInfoList").rows
+    ] == [
+        ("1", "LOBBY", "1", "K", "00000001"),
+        ("2", "OFFICE", "4", "K", "00000002"),
+    ]
+    assert {
+        row.text("NUMBER"): row.text("TYPE")
+        for row in doc.table("ZoneInfoList").rows
+    }["501"] == "EX"
+    assert summarize_account(doc).warnings == []
+
+
+def test_configured_users_clone_unmodeled_template_fields():
+    doc = build_configured_account_doc(
+        _rl_design(), _configured_account(),
+        BUNDLED_TEMPLATE.read_text(encoding="latin-1"),
+    )
+
+    rows = doc.table("UsersList").rows
+    assert [row.text("ACTIVE") for row in rows] == ["True", "True"]
+    assert [row.text("SND_TO_LKS") for row in rows] == ["False", "False"]
+
+
+def test_enabled_schedule_uses_calibrated_fields_and_is_intentionally_allowed():
+    config = _configured_account()
+    config.arming.advanced = RLAdvanced(
+        schedule_enabled=True,
+        schedule={"mon": RLScheduleDay("08:11", "22:22")},
+    )
+
+    doc = build_configured_account_doc(
+        _rl_design(), config,
+        BUNDLED_TEMPLATE.read_text(encoding="latin-1"),
+    )
+
+    schedule = doc.table("TimeSchedsList").rows[0]
+    assert schedule.text("MON_OPEN") == "1900-01-01 08:11:00.000"
+    assert schedule.text("MON_CLOSE") == "1900-01-01 22:22:00.000"
+    assert schedule.text("OP_SS_SS") == "1"
+    assert schedule.text("CL_SS_SS") == "2"
+    area_one = doc.table("AreaTimeSchedsList").rows[0]
+    assert area_one.text("SCHED_1") == "1"
+    assert {finding.kind.value for finding in summarize_account(doc).warnings} == {
+        "schedule", "area_schedule_link",
+    }
+    with pytest.raises(InjectorError):
+        verify_account_doc(doc, SafetyIntent())
+
+
+def test_explicit_dangerous_settings_generate_but_stay_visible_as_warnings():
+    config = _configured_account()
+    config.arming.advanced = RLAdvanced(
+        ambush_reports=True,
+        ambush_output="7",
+        morn_ambush_min="5",
+        auto_arm=True,
+        auto_disarm=True,
+    )
+
+    doc = build_configured_account_doc(
+        _rl_design(), config,
+        BUNDLED_TEMPLATE.read_text(encoding="latin-1"),
+    )
+
+    assert doc.row("SysRpts").text("AMBUSH") == "True"
+    assert doc.row("OutOpts").text("AMBUSH") == "7"
+    assert doc.table("PartInfoList").rows[0].text("MORN_AMBSH") == "5"
+    assert all(row.text("AUTO_ARM") == "True"
+               for row in doc.table("AreaInfoList").rows)
+    text = render_text(summarize_account(doc))
+    assert "⚠" in text and "MORN_AMBSH=5" in text and "AMBUSH=7" in text
+
+
+def test_vplex_device_type_is_encoded_by_omitting_type_field():
+    config = _configured_account()
+    config.keypads = {
+        1: RLKeypad("VPLEX", "vplex_pl500", "keypad_bus", "00000000"),
+    }
+
+    doc = build_configured_account_doc(
+        _rl_design(), config,
+        BUNDLED_TEMPLATE.read_text(encoding="latin-1"),
+    )
+
+    device = doc.table("DeviceInfoList").rows[0]
+    assert device.find("TYPE") is None
+    assert device.text("COMM_TYPE") == "K"
+
+
+def test_configured_generation_writes_receipt_and_inspector_reads_same_account(tmp_path):
+    config = _configured_account()
+
+    out = generate_configured_account_xml(
+        _rl_design(), config, template_path=BUNDLED_TEMPLATE,
+        passphrase="secret", out_dir=tmp_path,
+    )
+
+    receipt = tmp_path / "3141_remotelink_summary.txt"
+    assert out.is_file() and receipt.is_file()
+    summary = inspect_account(out, "secret")
+    assert summary.account_num == "3141"
+    assert summary.receiver_num == "7"
+    assert summary.zone_total == 7
+    assert "Account   3141" in receipt.read_text(encoding="utf-8")
+
+
+def test_preview_uses_same_configured_generation_path():
+    text = preview_account_summary(
+        _rl_design(), _configured_account(), BUNDLED_TEMPLATE,
+    )
+
+    assert "Account   3141" in text
+    assert "TEST ELEMENTARY SCHOOL" in text
+    assert "7 total" in text
+
+
+def test_inspector_rejects_non_hex_file_cleanly(tmp_path):
+    path = tmp_path / "not_export.xml"
+    path.write_text("not a RemoteLink export")
+
+    with pytest.raises(InjectorError, match="not a RemoteLink export"):
+        inspect_account(path, "secret")
