@@ -44,7 +44,14 @@ from session import (
 )
 from editor_frame import EditorFrame
 from editor_tabs import auto_hide_scrollbar
-from rl_injector.xml_export import generate_account_xml
+from rl_injector.account_doc import render_text
+from rl_injector.errors import InjectorError
+from rl_injector.rl_config import resolve_config
+from rl_injector.xml_export import (
+    generate_configured_account_xml,
+    inspect_account,
+    preview_account_summary,
+)
 import theme
 from ui_widgets import (
     Card,
@@ -390,6 +397,9 @@ class App:
         help_menu.add_command(label="Keyboard Shortcuts…",
                               command=self._show_shortcuts_help)
         help_menu.add_command(label="Open README", command=self._open_readme)
+        help_menu.add_separator()
+        help_menu.add_command(label="Inspect RemoteLink Account…",
+                              command=self._show_inspect_remotelink_dialog)
         # On macOS "Check for Updates…" already lives in the app menu above.
         if not is_mac:
             help_menu.add_separator()
@@ -1487,17 +1497,14 @@ class App:
         self._show_remotelink_dialog()
 
     def _show_remotelink_dialog(self):
-        """Prompt for the account number, receiver number, and export passphrase.
-
-        Account prefills from the school code (LOC CODE). The account is stamped
-        from a bundled demo template (no real data), so there's nothing to pick —
-        just choose a passphrase, which you'll re-type when importing."""
+        """Review the saved configuration and prompt only for encryption."""
         design = self.session.design
-        default_account = (design.site_info.school_code or "").strip()
+        sync_master_zones(design)
+        resolved = resolve_config(self.session.remotelink, design)
 
         dlg = ctk.CTkToplevel(self.root)
         dlg.title("Generate RemoteLink Account")
-        dlg.geometry("520x240")
+        dlg.geometry("680x620")
         dlg.configure(fg_color=theme.APP_BG)
         dlg.transient(self.root)
         dlg.grab_set()
@@ -1507,46 +1514,69 @@ class App:
                      text_color=theme.TEXT).pack(
             anchor="w", padx=20, pady=(18, 2))
         ctk.CTkLabel(
-            dlg, text="Builds an encrypted .xml you import into RemoteLink.",
+            dlg, text="Review the programmed account, then choose its import passphrase.",
             font=theme.ui_font(theme.SIZE["chip"]),
             text_color=theme.TEXT_SECOND).pack(anchor="w", padx=20, pady=(0, 10))
 
         form = ctk.CTkFrame(dlg, fg_color="transparent")
         form.pack(fill="x", padx=20)
+        form.columnconfigure(0, weight=1)
         form.columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(form, text="Account number", text_color=theme.TEXT,
-                     font=theme.ui_font(theme.SIZE["body"])).grid(
-            row=0, column=0, sticky="w", pady=6)
-        acct_var = ctk.StringVar(value=default_account)
-        ctk.CTkEntry(form, textvariable=acct_var, fg_color=theme.SURFACE,
-                     border_color=theme.BORDER_STRONG, text_color=theme.TEXT,
-                     corner_radius=theme.RADIUS["button"]).grid(
-            row=0, column=1, sticky="ew", pady=6)
+        for column, (label, value) in enumerate((
+            ("Account number", resolved.account_num),
+            ("Receiver number", resolved.receiver_num),
+        )):
+            ctk.CTkLabel(form, text=label, text_color=theme.TEXT_TERTIARY,
+                         font=theme.ui_font(theme.SIZE["label"])).grid(
+                row=0, column=column, sticky="w",
+                padx=(0 if column == 0 else 6, 0))
+            ctk.CTkEntry(
+                form, fg_color=theme.SURFACE_SUBTLE,
+                border_color=theme.BORDER, text_color=theme.TEXT_SECOND,
+                corner_radius=theme.RADIUS["button"],
+                state="disabled",
+            ).grid(row=1, column=column, sticky="ew",
+                   padx=(0 if column == 0 else 6, 6 if column == 0 else 0),
+                   pady=(2, 8))
+            entry = form.grid_slaves(row=1, column=column)[0]
+            entry.configure(state="normal")
+            entry.insert(0, value)
+            entry.configure(state="disabled")
 
         ctk.CTkLabel(form, text="Passphrase", text_color=theme.TEXT,
                      font=theme.ui_font(theme.SIZE["body"])).grid(
-            row=1, column=0, sticky="w", pady=6)
+            row=2, column=0, columnspan=2, sticky="w", pady=(4, 2))
         pass_var = ctk.StringVar(value="")
         ctk.CTkEntry(form, textvariable=pass_var, show="•",
                      fg_color=theme.SURFACE, border_color=theme.BORDER_STRONG,
                      text_color=theme.TEXT,
                      corner_radius=theme.RADIUS["button"]).grid(
-            row=1, column=1, sticky="ew", pady=6)
+            row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+
+        try:
+            receipt_text = preview_account_summary(
+                design, self.session.remotelink,
+                resource_path("remotelink_account_template.xml"),
+            )
+        except Exception as exc:
+            receipt_text = f"Receipt unavailable\n===================\n{exc}"
+        receipt = ctk.CTkTextbox(
+            dlg, wrap="word", fg_color=theme.SURFACE,
+            text_color=theme.TEXT, border_width=1, border_color=theme.BORDER,
+            corner_radius=theme.RADIUS["card"],
+            font=theme.mono_font(theme.SIZE["chip"]),
+        )
+        receipt.pack(fill="both", expand=True, padx=20, pady=(8, 0))
+        receipt.insert("1.0", receipt_text)
+        receipt.configure(state="disabled")
 
         btns = ctk.CTkFrame(dlg, fg_color="transparent")
         btns.pack(fill="x", padx=20, pady=16)
         secondary_button(btns, "Cancel", dlg.destroy, width=90).pack(side="left")
 
         def submit():
-            account_num = acct_var.get().strip()
             passphrase = pass_var.get()
-            if not account_num.isdigit():
-                messagebox.showerror(
-                    "Invalid account number",
-                    "The account number must be numeric (the school LOC CODE, "
-                    "e.g. 2250) — it becomes the panel user code.", parent=dlg)
-                return
             if not passphrase:
                 messagebox.showerror(
                     "Passphrase needed",
@@ -1554,11 +1584,11 @@ class App:
                     "importing into RemoteLink.", parent=dlg)
                 return
             dlg.destroy()
-            self._run_generate_remotelink(account_num, passphrase)
+            self._run_generate_remotelink(passphrase)
 
         primary_button(btns, "Generate", submit, width=120).pack(side="right")
 
-    def _run_generate_remotelink(self, account_num, passphrase):
+    def _run_generate_remotelink(self, passphrase):
         design = self.session.design
         sync_master_zones(design)
         out_dir = self.output_dir
@@ -1569,19 +1599,19 @@ class App:
             out_dir.mkdir(parents=True, exist_ok=True)
             with contextlib.redirect_stdout(self._redirector), \
                  contextlib.redirect_stderr(self._redirector):
-                return generate_account_xml(
-                    design, account_num,
+                return generate_configured_account_xml(
+                    design, self.session.remotelink,
                     template_path=template_path, passphrase=passphrase,
                     out_dir=out_dir)
 
         def on_done(path):
             self._set_generating(None)
-            # A generated account still needs its per-site comm / IP / panel
-            # settings entered in Remote Link. Generating ≠ commissioning.
+            account_num = resolve_config(
+                self.session.remotelink, design).account_num
             self._show_toast(
                 f"RemoteLink account {account_num} ready",
                 action=("Open", lambda: open_file(path)),
-                meta=f"{Path(path).name} · import it into RemoteLink",
+                meta=f"{Path(path).name} · summary .txt beside it",
                 folder=Path(path))
 
         def on_error(exc):
@@ -1749,6 +1779,121 @@ class App:
     # ------------------------------------------------------------------ #
     # In-app help                                                          #
     # ------------------------------------------------------------------ #
+
+    def _show_inspect_remotelink_dialog(self):
+        """Inspect any encrypted account export without requiring a project."""
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title("Inspect RemoteLink Account")
+        dlg.geometry("700x620")
+        dlg.configure(fg_color=theme.APP_BG)
+        dlg.transient(self.root)
+        # Deliberately no grab_set: this window opens native file dialogs.
+
+        ctk.CTkLabel(
+            dlg, text="Inspect RemoteLink Account",
+            font=theme.ui_font(16, "bold"), text_color=theme.TEXT,
+        ).pack(anchor="w", padx=20, pady=(18, 2))
+        ctk.CTkLabel(
+            dlg,
+            text="Decrypts a local export for review. The account file is never changed.",
+            font=theme.ui_font(theme.SIZE["chip"]),
+            text_color=theme.TEXT_SECOND,
+        ).pack(anchor="w", padx=20, pady=(0, 10))
+
+        form = ctk.CTkFrame(dlg, fg_color="transparent")
+        form.pack(fill="x", padx=20)
+        form.columnconfigure(0, weight=1)
+        path_var = ctk.StringVar(value="")
+        pass_var = ctk.StringVar(value="")
+
+        ctk.CTkLabel(form, text="Encrypted account export",
+                     text_color=theme.TEXT_TERTIARY,
+                     font=theme.ui_font(theme.SIZE["label"])).grid(
+                         row=0, column=0, sticky="w")
+        path_entry = ctk.CTkEntry(
+            form, textvariable=path_var, fg_color=theme.SURFACE,
+            border_color=theme.BORDER_STRONG, text_color=theme.TEXT,
+            corner_radius=theme.RADIUS["button"],
+        )
+        path_entry.grid(row=1, column=0, sticky="ew", pady=(2, 8))
+
+        def browse():
+            selected = filedialog.askopenfilename(
+                parent=dlg, title="Choose a RemoteLink account export",
+                filetypes=[("RemoteLink export", "*.xml"),
+                           ("All files", "*.*")],
+            )
+            if selected:
+                path_var.set(selected)
+
+        secondary_button(form, "Browse…", browse, width=90).grid(
+            row=1, column=1, padx=(8, 0), pady=(2, 8))
+        ctk.CTkLabel(form, text="Passphrase", text_color=theme.TEXT_TERTIARY,
+                     font=theme.ui_font(theme.SIZE["label"])).grid(
+                         row=2, column=0, sticky="w")
+        ctk.CTkEntry(
+            form, textvariable=pass_var, show="•", fg_color=theme.SURFACE,
+            border_color=theme.BORDER_STRONG, text_color=theme.TEXT,
+            corner_radius=theme.RADIUS["button"],
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(2, 8))
+
+        result = ctk.CTkTextbox(
+            dlg, wrap="word", fg_color=theme.SURFACE,
+            text_color=theme.TEXT, border_width=1, border_color=theme.BORDER,
+            corner_radius=theme.RADIUS["card"],
+            font=theme.mono_font(theme.SIZE["chip"]),
+        )
+        result.pack(fill="both", expand=True, padx=20, pady=(4, 8))
+        result.insert("1.0", "Choose an encrypted RemoteLink .xml export to inspect.")
+        result.configure(state="disabled")
+        state = {"text": "", "account": ""}
+
+        btns = ctk.CTkFrame(dlg, fg_color="transparent")
+        btns.pack(fill="x", padx=20, pady=(0, 16))
+        close_btn = ghost_button(btns, "Close", dlg.destroy, width=80)
+        close_btn.pack(side="left")
+        save_btn = secondary_button(btns, "Save Summary…", width=125)
+        save_btn.configure(state="disabled")
+        save_btn.pack(side="right", padx=(8, 0))
+
+        def save_summary():
+            if not state["text"]:
+                return
+            selected = filedialog.asksaveasfilename(
+                parent=dlg, title="Save RemoteLink account summary",
+                defaultextension=".txt",
+                initialfile=f"{state['account'] or 'remotelink'}_remotelink_summary.txt",
+                filetypes=[("Text file", "*.txt")],
+            )
+            if selected:
+                Path(selected).write_text(state["text"] + "\n", encoding="utf-8")
+
+        save_btn.configure(command=save_summary)
+
+        def inspect():
+            path = Path(path_var.get().strip())
+            if not path.is_file():
+                messagebox.showerror(
+                    "Couldn't inspect account", "Choose an existing account export.",
+                    parent=dlg,
+                )
+                return
+            try:
+                summary = inspect_account(path, pass_var.get())
+            except (InjectorError, OSError) as exc:
+                messagebox.showerror(
+                    "Couldn't inspect account", str(exc), parent=dlg,
+                )
+                return
+            text = render_text(summary)
+            result.configure(state="normal")
+            result.delete("1.0", "end")
+            result.insert("1.0", text)
+            result.configure(state="disabled")
+            state.update(text=text, account=summary.account_num)
+            save_btn.configure(state="normal")
+
+        primary_button(btns, "Inspect", inspect, width=90).pack(side="right")
 
     def _show_help_text(self, title: str, body: str):
         """Read-only help window — same shell as the update dialog."""
