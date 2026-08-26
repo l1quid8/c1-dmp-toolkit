@@ -38,11 +38,14 @@ recent projects for one-click reopening across days and site visits.
 ### 2. Edit
 
 Parsing lands in a tabbed editor — **SITE / ZONES / SPLITTERS / KEYPADS /
-POWER** — which is the working document; the Excel files are artifacts
-generated from it and are never re-imported.
+POWER / REMOTELINK** — which is the working document; generated files are
+artifacts and are never re-imported.
 
+- **SITE** — school details plus RemoteLink panel connection, IP, port, and
+  serial-number settings.
 - **ZONES** — searchable grid with inline editing and filter chips (All /
-  Needs attention / Spares / Errors).
+  Needs attention / Spares / Errors), including the RemoteLink zone type that
+  will be programmed for each zone.
 - **SPLITTERS** — the wiring topology, CAD-print conflict resolution, and a
   "Wiring reviewed against the riser diagram" checkbox. A read-only **topology
   tree** sits beside the cards so you can verify the derived 710-bus wiring at a
@@ -54,6 +57,12 @@ generated from it and are never re-imported.
   affected connections. Location fields autocomplete from locations already in
   the project. Template capacities are enforced: 15 expanders, 12 splitters
   per type, 28 keypads.
+- **KEYPADS** — keypad name, device type, displayed areas, and derived bus
+  communication settings.
+- **REMOTELINK** — account and receiver numbers, users, arming model, and a
+  live read-back receipt of exactly what the generated account will contain.
+  Advanced settings that can make a panel act on its own stay collapsed behind
+  an explicit warning.
 - **Validation** runs live (status-bar chips per tab: required IP/gateway/
   tech/date, no blank or placeholder zone descriptions, `RSP-N`/`SPARE`
   naming, conflicts resolved, wiring reviewed). It warns — it never blocks.
@@ -68,21 +77,30 @@ Buttons at the bottom of the editor (also Worksheet menu / keyboard):
 - **Generate Door Chart** (`Cmd/Ctrl+D`) — builds the chart from the newest
   worksheet, warning if the design has changed since that worksheet was
   generated.
-- **Generate RemoteLink Account** — builds an encrypted RemoteLink `.xml` account
-  export for the design (author on any OS). Prompts only for the account number
-  (prefilled from the School Code / LOC CODE), receiver number, and the export
-  **passphrase** (you type the same one when importing). Produces
-  `<code>_remotelink.xml`, which you **import** into RemoteLink on the Windows box
-  — no ODBC driver or direct database access needed.
+- **Generate RemoteLink Account** — builds an encrypted RemoteLink `.xml`
+  account export from the settings reviewed across **SITE, ZONES, KEYPADS, and
+  REMOTELINK**. The final dialog is deliberately read-only: it shows the
+  account/receiver numbers and the same live receipt, then asks only for the
+  export **passphrase**. Generation writes both `<code>_remotelink.xml` and a
+  matching `<code>_remotelink_summary.txt`; import the `.xml` into RemoteLink
+  on Windows — no ODBC driver or direct database access needed.
 
 > **A generated account is not a commissioned panel.** It carries the correct
-> zones and keypads, but still needs its per-site comm / IP / panel settings (and
-> the panel arming user code) entered in Remote Link afterward.
+> zones, keypads, users, connection settings, and selected arming model, but a
+> qualified technician must review the receipt and the imported account before
+> sending programming to a panel.
 >
 > The account is stamped from a bundled **demo** template
 > (`remotelink_account_template.xml`) that contains no real data — nothing to
-> supply. The `.xml` scheme is documented in the injector repo's
-> `tools/XML_FORMAT.md`.
+> supply. Safe defaults contain no arming schedule, automatic arm/disarm, or
+> ambush/duress behavior. If any of those are intentionally enabled under
+> **Advanced**, the receipt calls them out and generation verifies the encrypted
+> account against the operator's selections before writing it.
+
+Use **Help → Inspect RemoteLink Account…** to open any encrypted RemoteLink
+export with its passphrase — no project required. The inspector never changes
+the source file; it displays the same readable receipt and can save a summary
+for review.
 
 ![Generate RemoteLink Account](docs/screenshots/remotelink.png)
 
@@ -112,7 +130,7 @@ remembers your choice for next launch.
 | Path | Purpose |
 |---|---|
 | `scripts/` | All Python source (one cross-platform copy) |
-| `scripts/rl_injector/` | RemoteLink account encoder — staging model + encrypted `.xml` export |
+| `scripts/rl_injector/` | RemoteLink document model, safety verification, inspector, and encrypted `.xml` export |
 | `dmp_doorchart.spec` | PyInstaller build spec (OS-branched internally) |
 | `requirements.txt` | Pinned dependencies — build with **Python 3.13** |
 | `VERSION` | App version, shown in the title bar |

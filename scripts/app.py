@@ -79,14 +79,18 @@ make changes.
    Drop a design PDF, an existing DMP worksheet (.xlsx), or a saved project (.dmps) onto \
 the home screen. The app parses it and detects the school name.
 
-2. EDIT  (five tabs)
-   • SITE — school, address, contact, tech, install date, IP / gateway, XR-550 location.
+2. EDIT  (six tabs)
+   • SITE — school, address, contact, tech, install date, IP / gateway, XR-550 location, \
+and RemoteLink panel connection settings.
    • ZONES — searchable grid of every zone. Filter chips: All / Needs attention (blank or \
-"NEW" description) / Spares / Errors. Double-click a cell to edit.
+"NEW" description) / Spares / Errors. Double-click a cell to edit, including its \
+RemoteLink zone type.
    • SPLITTERS — splitter wiring and CAD conflicts. Tick "Wiring reviewed" once you've \
 checked it against the riser diagram (required before FINAL).
-   • KEYPADS — each keypad's location and source (MSP or a KP splitter).
+   • KEYPADS — location, source, RemoteLink device type, name, and displayed areas.
    • POWER — RSP / power-supply locations; add or remove expanders here.
+   • REMOTELINK — account, users, arming model, optional advanced settings, and a live \
+read-back receipt of the account that will be generated.
 
    Naming rules the checks enforce: SPARE must be uppercase, and RSP references \
 must be hyphenated (RSP-3, not RSP 3).
@@ -97,12 +101,18 @@ mean you have edits that aren't on disk yet. A background recovery file guards a
 crashes between saves.
 
 4. GENERATE  (repeat as needed)
-   Two buttons at the bottom of the editor: "Generate Worksheet" and "Generate Door \
-Chart" (the chart is built from the newest worksheet). Each run writes the next revision \
+   The footer generates the worksheet, door chart, or encrypted RemoteLink account. \
+The chart is built from the newest worksheet. Each worksheet/chart run writes the next revision \
 — school_dmp_rev1.xlsx, rev2, … — keeping earlier revisions, so the normal loop is: \
 generate, print, review with the superintendent, edit, regenerate. If checks are failing \
 you'll see a summary first, but generation is never blocked. You stay in the editor the \
 whole time; a notification offers to open the finished file.
+
+   RemoteLink generation uses the settings reviewed across SITE, ZONES, KEYPADS, and \
+REMOTELINK. Its final dialog is read-only and asks only for the encryption passphrase. \
+Review the receipt before importing; after import, a qualified technician must verify the \
+account before sending programming to a panel. Help → Inspect RemoteLink Account opens \
+an existing encrypted export without changing it.
 
 Hardware changes (post-CAD): you can add or remove expanders, splitters, and keypads. \
 Removing hardware re-points anything that fed it to "Spare" and unsources affected \
