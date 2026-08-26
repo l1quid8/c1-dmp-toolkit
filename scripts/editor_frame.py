@@ -25,6 +25,7 @@ from hardware import snapshot_refs, diff_refs
 from session import Session, save_session, sync_master_zones, write_recovery, clear_recovery
 from validation import validate_design, badge_counts, badge_counts_by_severity
 from editor_zones import ZonesTab
+from riser_editor import RiserTab
 from editor_tabs import (
     KeypadsTab,
     PowerTab,
@@ -66,7 +67,7 @@ def _format_install_date(d) -> str:
     suffix = "th" if 11 <= n % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
     return f"{d.strftime('%B').upper()} {n}{suffix} {d.year}"
 
-TAB_TITLES = ["SITE", "ZONES", "SPLITTERS", "KEYPADS", "POWER"]
+TAB_TITLES = ["SITE", "ZONES", "SPLITTERS", "KEYPADS", "POWER", "RISER"]
 
 
 def _bind_click_tree(widget, command):
@@ -291,7 +292,7 @@ class EditorFrame(ctk.CTkFrame):
 
     def __init__(self, master, root, session: Session, *,
                  on_generate_worksheet=None, on_generate_chart=None,
-                 on_generate_remotelink=None,
+                 on_generate_remotelink=None, on_generate_riser=None,
                  on_status_change=None, on_validation_change=None):
         super().__init__(master, fg_color="transparent")
         self.root = root
@@ -304,6 +305,7 @@ class EditorFrame(ctk.CTkFrame):
         self._on_generate_worksheet = on_generate_worksheet or (lambda: None)
         self._on_generate_chart = on_generate_chart or (lambda: None)
         self._on_generate_remotelink = on_generate_remotelink or (lambda: None)
+        self._on_generate_riser = on_generate_riser or (lambda: None)
         self.on_status_change = on_status_change or (lambda text, dirty: None)
         self.on_validation_change = on_validation_change or (lambda text, ok: None)
         self._site_vars: dict[str, ctk.StringVar] = {}
@@ -437,11 +439,16 @@ class EditorFrame(ctk.CTkFrame):
             widget.grid(row=0, column=0, sticky="nsew")
             setattr(self, attr, widget)
 
+        self.riser_tab = RiserTab(
+            self.tabs.tab("RISER"), self.session, self._on_riser_edit,
+            on_generate=self._on_generate_riser)
+        self.riser_tab.grid(row=0, column=0, sticky="nsew")
+
         self._build_footer()
 
     def _build_footer(self):
-        """Footer bar: save state and open-issue chips left, the three generate
-        actions right. Generation runs in the background and never replaces the
+        """Footer bar: save state and open-issue chips left, generation actions
+        right. Generation runs in the background and never replaces the
         editor — outputs are revision-numbered artifacts you refresh at will."""
         # A 1px top rule, drawn as a border-coloured backing strip: CTkFrame
         # borders are all four sides or none.
@@ -482,6 +489,9 @@ class EditorFrame(ctk.CTkFrame):
         self._gen_rl_btn = secondary_button(
             right, "RemoteLink Account", self._on_generate_remotelink)
         self._gen_rl_btn.pack(side="left", padx=(0, theme.PAD["sm"]))
+        self._gen_riser_btn = secondary_button(
+            right, "Generate Riser", self._on_generate_riser)
+        self._gen_riser_btn.pack(side="left", padx=(0, theme.PAD["sm"]))
         self._gen_ws_btn = _PrimaryAction(
             right, "Generate Worksheet", "E", self._on_generate_worksheet)
         self._gen_ws_btn.pack(side="left")
@@ -490,7 +500,7 @@ class EditorFrame(ctk.CTkFrame):
 
     def set_generating(self, which: str | None):
         """Reflect a running generation on the buttons: `which` is
-        'worksheet', 'chart', 'remotelink', or None when idle. All disable while
+        'worksheet', 'chart', 'remotelink', 'riser', or None when idle. All disable while
         one runs (they share the design and the output pipeline)."""
         running = which is not None
         self._gen_ws_btn.configure(
@@ -503,6 +513,9 @@ class EditorFrame(ctk.CTkFrame):
             text="Generating…" if which == "remotelink"
                  else "RemoteLink Account",
             state="disabled" if running else "normal")
+        self._gen_riser_btn.configure(
+            text="Generating…" if which == "riser" else "Generate Riser",
+            state="disabled" if running else "normal")
 
     def _on_zones_edit(self):
         sync_master_zones(self.session.design)
@@ -514,6 +527,16 @@ class EditorFrame(ctk.CTkFrame):
         sync_master_zones(self.session.design)
         self.mark_dirty()
         self.refresh_validation()
+        if hasattr(self, "riser_tab"):
+            self.riser_tab.refresh()
+
+    def _on_riser_edit(self):
+        """Canvas topology edits must be visible in the legacy cards at once."""
+        sync_master_zones(self.session.design)
+        self.mark_dirty()
+        self.refresh_validation()
+        self.splitters_tab.refresh()
+        self.keypads_tab.refresh()
 
     def _on_structure_change(self):
         """Hardware was added or removed: every tab's choices and rows shift."""
@@ -606,6 +629,7 @@ class EditorFrame(ctk.CTkFrame):
         self.splitters_tab.refresh()
         self.keypads_tab.refresh()
         self.power_tab.refresh()
+        self.riser_tab.refresh()
 
     # ------------------------------------------------------------------ #
     # Pre-generate issue summary (warn, never block)                        #

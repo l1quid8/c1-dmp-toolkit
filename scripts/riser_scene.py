@@ -11,6 +11,7 @@ from riser_model import (
     RiserRoute,
     default_riser_document,
 )
+from topology_service import TopologyError, validate_connection_endpoints
 
 
 TITLE_BLOCK_WIDTH = 270.0
@@ -216,12 +217,40 @@ def route_connection(start: tuple[float, float], end: tuple[float, float],
     for obstacle in blockers:
         if _segment_hits_rect((sx, mid_y), (tx, mid_y), obstacle):
             mid_y = _snap(max(mid_y, obstacle.y + obstacle.height + 30.0))
-    points = [(sx, sy), (sx, mid_y), (tx, mid_y), (tx, ty)]
-    compact: list[tuple[float, float]] = []
-    for point in points:
-        if not compact or point != compact[-1]:
-            compact.append(point)
-    return compact
+    candidates = [
+        [(sx, sy), (sx, mid_y), (tx, mid_y), (tx, ty)],
+        [(sx, sy), (tx, sy), (tx, ty)],
+        [(sx, sy), (sx, ty), (tx, ty)],
+    ]
+    for obstacle in blockers:
+        left = _snap(obstacle.x - 18.0)
+        right = _snap(obstacle.x + obstacle.width + 18.0)
+        top = _snap(obstacle.y - 18.0)
+        bottom = _snap(obstacle.y + obstacle.height + 18.0)
+        candidates.extend([
+            [(sx, sy), (left, sy), (left, ty), (tx, ty)],
+            [(sx, sy), (right, sy), (right, ty), (tx, ty)],
+            [(sx, sy), (sx, top), (tx, top), (tx, ty)],
+            [(sx, sy), (sx, bottom), (tx, bottom), (tx, ty)],
+        ])
+
+    def compact(points):
+        result = []
+        for point in points:
+            if not result or point != result[-1]:
+                result.append(point)
+        return result
+
+    def clear(points):
+        return not any(_segment_hits_rect(a, b, obstacle)
+                       for a, b in zip(points, points[1:]) for obstacle in blockers)
+
+    viable = [compact(points) for points in candidates if clear(compact(points))]
+    if viable:
+        return min(viable, key=lambda points: (
+            sum(abs(b[0] - a[0]) + abs(b[1] - a[1])
+                for a, b in zip(points, points[1:])), points))
+    return compact(candidates[0])
 
 
 def _segments(points):
@@ -260,11 +289,44 @@ def sync_riser_document(design, document: RiserDocument) -> None:
         if device_id not in document.unplaced:
             document.unplaced.append(device_id)
     document.unplaced = [d for d in document.unplaced if d in live and d not in existing]
+    obstacles = [e for e in document.elements.values()
+                 if e.kind == "device" and not e.stale]
+    for edge in design.connections:
+        if edge.id in document.routes:
+            continue
+        source = document.elements.get(f"device:{edge.source.device_id}")
+        target = document.elements.get(f"device:{edge.target.device_id}")
+        if source is None or target is None:
+            continue
+        start = port_point(source, edge.source.port_id, output=True)
+        end = port_point(target, edge.target.port_id, output=False)
+        document.routes[edge.id] = RiserRoute(
+            edge.id, route_connection(start, end, obstacles,
+                                      source_ref=source.ref, target_ref=target.ref))
 
 
 def _overlap(a: RiserElement, b: RiserElement) -> bool:
     return (a.x < b.x + b.width and a.x + a.width > b.x and
             a.y < b.y + b.height and a.y + a.height > b.y)
+
+
+def _boxes_overlap(first, second) -> bool:
+    return (first[0] < second[2] and first[2] > second[0] and
+            first[1] < second[3] and first[3] > second[1])
+
+
+def _route_label_box(edge, route):
+    segments = list(_segments(route.points))
+    if not segments:
+        return None
+    horizontals = [(abs(b[0] - a[0]), a, b) for a, b in segments
+                   if a[1] == b[1]]
+    _length, first, second = max(
+        horizontals or [(0.0, *segments[0])], key=lambda item: item[0])
+    x = (first[0] + second[0]) / 2 + route.label_offset[0]
+    y = (first[1] + second[1]) / 2 - 9 + route.label_offset[1]
+    width = max(42.0, len(edge.label) * 7.5)
+    return (x - width / 2, y - 14, x + width / 2, y + 3)
 
 
 def _graph_cycle(design) -> bool:
@@ -302,8 +364,27 @@ def validate_riser(design, document: RiserDocument) -> list[RiserIssue]:
             (edge.source.device_id, edge.source.port_id), 0) + 1
         if not edge.cable_type.strip() or edge.quantity < 1 or edge.status not in {"new", "existing"}:
             issues.append(RiserIssue("cable.metadata", "Cable metadata is incomplete", edge.id))
+        try:
+            validate_connection_endpoints(design, edge.source, edge.target)
+        except TopologyError as exc:
+            issues.append(RiserIssue("topology.incompatible", str(exc), edge.id))
     if any(count > 1 for count in incoming.values()) or any(count > 1 for count in outgoing.values()):
         issues.append(RiserIssue("topology.occupied", "A topology port has multiple connections"))
+    incoming_devices = {device_id for device_id, _port in incoming}
+    for device_id in _device_ids(design):
+        if device_id != "MSP" and device_id not in incoming_devices:
+            issues.append(RiserIssue(
+                "topology.orphan", f"{device_id} is not connected to the topology",
+                f"device:{device_id}"))
+    connection_ids = {edge.id for edge in design.connections}
+    for route_id in document.routes:
+        if route_id not in connection_ids:
+            issues.append(RiserIssue(
+                "scene.stale_route", "Drawing contains a route for a removed cable", route_id))
+    for edge in design.connections:
+        if edge.id not in document.routes:
+            issues.append(RiserIssue(
+                "scene.missing_route", "Connected cable has no drawing route", edge.id))
     if document.unplaced:
         issues.append(RiserIssue("scene.unplaced", "Drawing has unplaced devices", document.unplaced[0]))
     for element in document.elements.values():
@@ -318,11 +399,49 @@ def validate_riser(design, document: RiserDocument) -> list[RiserIssue]:
         for second in devices[index + 1:]:
             if _overlap(first, second):
                 issues.append(RiserIssue("scene.overlap", "Device symbols overlap", first.id))
-    for name in ("school_name", "drawing_title", "system", "sheet_number"):
+    edges = {edge.id: edge for edge in design.connections}
+    label_boxes = []
+    for route_id, route in document.routes.items():
+        edge = edges.get(route_id)
+        if edge is None:
+            continue
+        label_box = _route_label_box(edge, route)
+        if label_box:
+            label_boxes.append((route_id, label_box))
+            for device in devices:
+                device_box = (device.x, device.y,
+                              device.x + device.width, device.y + device.height)
+                if _boxes_overlap(label_box, device_box):
+                    issues.append(RiserIssue(
+                        "scene.label_overlap",
+                        f"Cable label overlaps {device.ref}", route_id))
+                    break
+        for obstacle in devices:
+            if obstacle.ref in {edge.source.device_id, edge.target.device_id}:
+                continue
+            if any(_segment_hits_rect(a, b, obstacle, clearance=0.0)
+                   for a, b in _segments(route.points)):
+                issues.append(RiserIssue(
+                    "scene.cable_through_device",
+                    f"Cable crosses the {obstacle.ref} footprint", route_id))
+                break
+    for index, (first_id, first_box) in enumerate(label_boxes):
+        for _second_id, second_box in label_boxes[index + 1:]:
+            if _boxes_overlap(first_box, second_box):
+                issues.append(RiserIssue(
+                    "scene.label_overlap", "Cable labels overlap", first_id))
+                break
+    for name in ("school_name", "local_code", "address", "project_title",
+                 "drawing_title", "system", "sheet_number", "drawn_by",
+                 "checked_by", "issue_date"):
         if not getattr(document.title_block, name).strip():
             issues.append(RiserIssue("title.required", f"Title block field is required: {name}", name))
     for annotation in document.annotations:
-        if annotation.kind == "text" and annotation.font_size * 17 / 36 < 6:
+        if any(x < 0 or y < 0 or x > document.page_width - TITLE_BLOCK_WIDTH
+               or y > document.page_height for x, y in annotation.points):
+            issues.append(RiserIssue(
+                "scene.off_page", "Markup is outside the printable drawing area",
+                annotation.id))
+        if annotation.kind == "text" and annotation.font_size * 11 / 24 < 6:
             issues.append(RiserIssue("print.legibility", "Annotation is below the 11x17 minimum text size", annotation.id))
     return issues
-

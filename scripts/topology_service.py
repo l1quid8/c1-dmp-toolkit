@@ -85,6 +85,12 @@ def _validate_ports(design, source: DevicePortRef, target: DevicePortRef) -> Non
             raise TopologyError("LX splitters on different buses cannot be chained")
 
 
+def validate_connection_endpoints(design, source: DevicePortRef,
+                                  target: DevicePortRef) -> None:
+    """Validate one endpoint pair without mutating or checking occupancy."""
+    _validate_ports(design, source, target)
+
+
 def _has_path(design, start: str, goal: str, *, excluding: str | None = None) -> bool:
     adjacency: dict[str, list[str]] = {}
     for edge in design.connections:

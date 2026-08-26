@@ -88,7 +88,10 @@ def _device_detail(design, ref: str) -> str:
 
 
 def _svg_bytes(design, document, *, width, height, physical_width: str,
-               physical_height: str) -> bytes:
+               physical_height: str, profile: str = "24x36") -> bytes:
+    small = profile == "11x17"
+    secondary_size = 13.2 if small else 11
+    cable_size = 15.3 if small else 14
     bridges = find_bridges({key: route.points for key, route in document.routes.items()})
     connections = _connection_map(design)
     lines = [
@@ -96,6 +99,9 @@ def _svg_bytes(design, document, *, width, height, physical_width: str,
         (f'<svg xmlns="http://www.w3.org/2000/svg" '
          f'xmlns:xlink="http://www.w3.org/1999/xlink" width="{physical_width}" '
          f'height="{physical_height}" viewBox="0 0 {document.page_width:.0f} {document.page_height:.0f}">'),
+        ('<defs><marker id="arrowhead" markerWidth="10" markerHeight="7" '
+         'refX="9" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" '
+         ' fill="context-stroke"/></marker></defs>'),
         '<rect width="100%" height="100%" fill="white"/>',
         '<g id="drawing" font-family="Arial, Helvetica, sans-serif" fill="#111111">',
     ]
@@ -110,8 +116,9 @@ def _svg_bytes(design, document, *, width, height, physical_width: str,
                 f'y="{element.y:.2f}" width="{element.width:.2f}" height="{element.height:.2f}" '
                 'rx="8" fill="none" stroke="#8b949e" stroke-width="1" '
                 'stroke-dasharray="8 5"/><text x="{:.2f}" y="{:.2f}" '
-                'font-size="13" font-weight="bold">{}</text></g>'.format(
-                    element.x + 12, element.y + 18, _esc(element.ref)))
+                'font-size="{:.1f}" font-weight="bold">{}</text></g>'.format(
+                    element.x + 12, element.y + 18,
+                    13.2 if small else 13, _esc(element.ref)))
             continue
         if element.kind != "device":
             continue
@@ -128,13 +135,13 @@ def _svg_bytes(design, document, *, width, height, physical_width: str,
         detail = _device_detail(design, element.ref)
         if detail:
             lines.append(f'<text x="{x + w/2:.2f}" y="{y + h/2 + 17:.2f}" text-anchor="middle" '
-                         f'font-size="13">{_esc(detail)}</text>')
+                         f'font-size="{13.2 if small else 13}">{_esc(detail)}</text>')
         if element.ref.startswith("710-"):
-            lines.append(f'<text x="{x + w/2:.2f}" y="{y + 12:.2f}" text-anchor="middle" font-size="11">IN</text>')
+            lines.append(f'<text x="{x + w/2:.2f}" y="{y + 12:.2f}" text-anchor="middle" font-size="{secondary_size}">IN</text>')
             for index in range(1, 4):
                 px = x + w * index / 4
                 lines.append(f'<text x="{px:.2f}" y="{y + h - 7:.2f}" text-anchor="middle" '
-                             f'font-size="11">OUT {index}</text>')
+                             f'font-size="{secondary_size}">OUT {index}</text>')
         lines.append('</g>')
 
     lines.append('<g id="topology" fill="none" stroke="#111" stroke-width="1.2">')
@@ -142,7 +149,7 @@ def _svg_bytes(design, document, *, width, height, physical_width: str,
         path_d = _route_path(connection_id, route.points, bridges)
         lines.append(f'<path id="route-{_esc(connection_id)}" d="{path_d}"/>')
     lines.append('</g>')
-    lines.append('<g id="cable-labels" font-size="14" font-weight="bold">')
+    lines.append(f'<g id="cable-labels" font-size="{cable_size}" font-weight="bold">')
     for connection_id, route in document.routes.items():
         edge = connections.get(connection_id)
         if edge is None or not route.points:
@@ -156,13 +163,18 @@ def _svg_bytes(design, document, *, width, height, physical_width: str,
     lines.append('<g id="markup">')
     for annotation in document.annotations:
         points = " ".join(f"{x:.2f},{y:.2f}" for x, y in annotation.points)
-        common = (f'stroke="{_esc(annotation.stroke)}" stroke-width="{annotation.stroke_width:.2f}" '
+        stroke_width = max(annotation.stroke_width, 0.77 if small else 0.0)
+        common = (f'stroke="{_esc(annotation.stroke)}" stroke-width="{stroke_width:.2f}" '
                   f'fill="{_esc(annotation.fill or "none")}"')
         if annotation.kind == "text" and annotation.points:
             x, y = annotation.points[0]
+            anchor = {"left": "start", "center": "middle", "right": "end"}.get(
+                annotation.alignment, "start")
+            font_size = max(annotation.font_size, 13.2 if small else 0.0)
             lines.append(f'<text id="{_esc(annotation.id)}" x="{x:.2f}" y="{y:.2f}" '
-                         f'font-size="{annotation.font_size:.2f}" font-weight="{_esc(annotation.font_weight)}" '
-                         f'fill="{_esc(annotation.stroke)}">{_esc(annotation.text)}</text>')
+                         f'font-size="{font_size:.2f}" font-weight="{_esc(annotation.font_weight)}" '
+                         f'text-anchor="{anchor}" fill="{_esc(annotation.stroke)}">'
+                         f'{_esc(annotation.text)}</text>')
         elif annotation.kind in {"rectangle", "ellipse"} and len(annotation.points) >= 2:
             (x1, y1), (x2, y2) = annotation.points[:2]
             if annotation.kind == "rectangle":
@@ -172,7 +184,9 @@ def _svg_bytes(design, document, *, width, height, physical_width: str,
                 lines.append(f'<ellipse id="{_esc(annotation.id)}" cx="{(x1+x2)/2:.2f}" cy="{(y1+y2)/2:.2f}" '
                              f'rx="{abs(x2-x1)/2:.2f}" ry="{abs(y2-y1)/2:.2f}" {common}/>')
         elif len(annotation.points) >= 2:
-            lines.append(f'<polyline id="{_esc(annotation.id)}" points="{points}" {common}/>')
+            marker = ' marker-end="url(#arrowhead)"' if annotation.kind == "arrow" else ""
+            lines.append(f'<polyline id="{_esc(annotation.id)}" points="{points}" '
+                         f'{common}{marker}/>')
     lines.append('</g>')
 
     tb = document.title_block
@@ -196,7 +210,10 @@ def _svg_bytes(design, document, *, width, height, physical_width: str,
         (530, f"DATE: {tb.issue_date}", 11, "normal"),
         (document.page_height - 115, f"SHEET {tb.sheet_number}", 20, "bold"),
     ]
+    for index, revision in enumerate(tb.revisions[-6:]):
+        text_rows.append((590 + index * 25, f"REV: {revision}", 11, "normal"))
     for y, text, size, weight in text_rows:
+        size = max(size, secondary_size)
         lines.append(f'<text x="{tx + (TITLE_BLOCK_WIDTH - 36)/2:.2f}" y="{y:.2f}" '
                      f'text-anchor="middle" stroke="none" fill="#111" font-size="{size}" '
                      f'font-weight="{weight}">{_esc(text)}</text>')
@@ -209,7 +226,7 @@ def render_svg(design, document, output_path: str | Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(_svg_bytes(
         design, document, width=MASTER_WIDTH, height=MASTER_HEIGHT,
-        physical_width="36in", physical_height="24in"))
+        physical_width="36in", physical_height="24in", profile="24x36"))
     return output_path
 
 
@@ -219,7 +236,8 @@ def render_pdf(design, document, output_path: str | Path, *, profile: str = "24x
     width, height = ((MASTER_WIDTH, MASTER_HEIGHT) if profile == "24x36"
                      else (SMALL_WIDTH, SMALL_HEIGHT))
     svg = _svg_bytes(design, document, width=width, height=height,
-                     physical_width=str(width), physical_height=str(height))
+                     physical_width=str(width), physical_height=str(height),
+                     profile=profile)
     source = fitz.open(stream=svg, filetype="svg")
     pdf_bytes = source.convert_to_pdf()
     source.close()
@@ -250,4 +268,3 @@ def generate_riser_bundle(design, document, output_dir: str | Path) -> list[Path
     small = render_pdf(design, document, Path(f"{base}_11x17.pdf"), profile="11x17")
     svg = render_svg(design, document, Path(f"{base}.svg"))
     return [master, small, svg]
-

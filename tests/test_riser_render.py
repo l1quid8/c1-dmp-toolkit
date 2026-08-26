@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from riser_render import generate_riser_bundle, render_pdf, render_svg  # noqa: E402
 from riser_scene import layout_riser  # noqa: E402
+from riser_model import RiserAnnotation  # noqa: E402
 from test_riser_scene import branched_design  # noqa: E402
 
 
@@ -50,6 +51,11 @@ def test_pdf_profiles_have_exact_pages_and_searchable_text(tmp_path):
     with fitz.open(small) as doc:
         assert (round(doc[0].rect.width), round(doc[0].rect.height)) == (1224, 792)
         assert "INT-5.0" in doc[0].get_text()
+        spans = [span for block in doc[0].get_text("dict")["blocks"]
+                 if "lines" in block for line in block["lines"] for span in line["spans"]]
+        cable_spans = [span for span in spans if "WP240R" in span["text"]]
+        assert cable_spans and min(span["size"] for span in cable_spans) >= 7
+        assert min(span["size"] for span in spans if span["text"].strip()) >= 6
 
 
 def test_bundle_uses_one_revision_number_for_all_outputs(tmp_path):
@@ -79,3 +85,19 @@ def test_svg_uses_curved_bridge_geometry_at_crossings(tmp_path):
     render_svg(design, scene, path)
 
     assert " Q 300.00 190.00 " in path.read_text()
+
+
+def test_svg_keeps_arrow_markup_and_text_alignment_editable(tmp_path):
+    design = branched_design()
+    scene = layout_riser(design)
+    scene.annotations.extend([
+        RiserAnnotation("arrow-1", "arrow", [(10, 10), (80, 80)]),
+        RiserAnnotation("note-1", "text", [(100, 100)], text="NOTE", alignment="right"),
+    ])
+    path = tmp_path / "markup.svg"
+
+    render_svg(design, scene, path)
+
+    text = path.read_text()
+    assert 'id="arrow-1"' in text and 'marker-end="url(#arrowhead)"' in text
+    assert 'id="note-1"' in text and 'text-anchor="end"' in text
