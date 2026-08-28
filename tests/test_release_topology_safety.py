@@ -62,15 +62,26 @@ def test_save_initializes_only_missing_drawing_not_existing_connections(tmp_path
     assert restored.design.keypads[0].source == "MSP"
 
 
-def test_disconnected_graph_stays_empty_when_saved_before_editor_open(tmp_path):
+@pytest.mark.parametrize("supplied", [False, True])
+@pytest.mark.parametrize("recovery", [False, True])
+def test_disconnected_graph_stays_empty_when_saved_before_editor_open(tmp_path, supplied, recovery):
     design = DMPDesign(keypads=[Keypad(1, "MSP")])
-    edge = connect(design, DevicePortRef("MSP", "KP BUS"), DevicePortRef("KEYPAD-1", "IN"))
+    if supplied:
+        edge = TopologyConnection("imported-edge", DevicePortRef("MSP", "KP BUS"),
+                                  DevicePortRef("KEYPAD-1", "IN"))
+        design.connections = [edge]
+    else:
+        edge = connect(design, DevicePortRef("MSP", "KP BUS"), DevicePortRef("KEYPAD-1", "IN"))
     disconnect(design, edge.id)
     session = Session(design=design, path=tmp_path / "disconnected.dmps")
 
-    save_session(session)
+    if recovery:
+        write_recovery(session)
+        restored = load_recovery(session.path)
+    else:
+        save_session(session)
+        restored = load_session(session.path)
 
-    restored = load_session(session.path)
     assert restored.design.connections == []
     assert restored.design.keypads[0].source is None
 

@@ -185,6 +185,10 @@ def connect(design, source: DevicePortRef, target: DevicePortRef, *,
 def disconnect(design, connection_id: str) -> TopologyConnection:
     for index, edge in enumerate(design.connections):
         if edge.id == connection_id:
+            # Imported graphs can be edited before any drawing exists too.
+            # Mark ownership before deleting the last evidence of that graph.
+            if getattr(design, "riser_document", None) is None:
+                design.riser_document = default_riser_document(design)
             return design.connections.pop(index)
     raise TopologyError(f"Unknown connection: {connection_id}")
 
