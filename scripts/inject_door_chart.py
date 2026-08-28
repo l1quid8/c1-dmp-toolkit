@@ -34,6 +34,7 @@ import re
 import shutil
 from datetime import date
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 import openpyxl
 from openpyxl.workbook.properties import CalcProperties
@@ -119,13 +120,27 @@ def _set_cell_master_row(xml: str, ref: str, new_row: int) -> str:
     return xml[:m.start()] + cell + xml[m.end():]
 
 
+def _set_cell_inline_text(xml: str, ref: str, text: str) -> str:
+    """Replace cell REF's value with inline text while preserving its style."""
+    m = _find_cell(xml, ref)
+    if not m:
+        return xml
+    sm = re.search(r'\bs="(\d+)"', m.group(0))
+    style = f' s="{sm.group(1)}"' if sm else ""
+    cell = (f'<c r="{ref}"{style} t="inlineStr"><is><t>'
+            f'{escape(text)}</t></is></c>')
+    return xml[:m.start()] + cell + xml[m.end():]
+
+
 def _retarget_zone_tab(xml: str, kind: str, dmp_design: DMPDesign) -> str:
     """Retarget every block in Terminal Cans ('tc') or RSPs ('rsps') to its RSP's real
     contiguous Master rows; reshape 8-port blocks; blank unused blocks.
 
-    Blocks are matched by VISUAL ORDER (the i-th block top-to-bottom, left-before-right, is
-    RSP i+1) and each block's own header formula gives its current anchor — the RSPs tab's
-    template uses an irregular anchor sequence, so anchor-based matching is not reliable.
+    RSP blocks stay in visual order. Terminal Can blocks are assigned in print order:
+    left/top, left/bottom, right/top, right/bottom. That lets Excel print two larger,
+    vertically stacked charts per page without moving the template's cells or drawings.
+    Each block's own header formula gives its current anchor — the RSPs tab's template
+    uses an irregular anchor sequence, so anchor-based matching is not reliable.
 
     Geometry: header at R, then data rows starting R+data_off (16 slots), and (Terminal
     Cans only) an AUX POWER row at R+18.
@@ -141,10 +156,19 @@ def _retarget_zone_tab(xml: str, kind: str, dmp_design: DMPDesign) -> str:
     blocks.sort(key=lambda b: (b[0], 0 if b[1] == "B" else 1))
     rsps = sorted(dmp_design.rsps, key=lambda r: r.number)
 
-    for i, (R, col_letter, anchor) in enumerate(blocks):
+    for physical_slot, (R, col_letter, anchor) in enumerate(blocks):
         cols = ("B", "C", "D") if col_letter == "B" else ("F", "G", "H")
 
-        if i >= len(rsps):
+        rsp_index = physical_slot
+        if kind == "tc":
+            group, side = divmod(physical_slot, 2)
+            rsp_index = (group // 2) * 4 + (group % 2) + side * 2
+            # Thirty charts consume every template slot. The final physical row cannot
+            # stack its last pair, so use its right slot for chart 30 rather than drop it.
+            if len(rsps) == len(blocks) and physical_slot == len(blocks) - 1:
+                rsp_index = len(rsps) - 1
+
+        if rsp_index >= len(rsps):
             # Unused module slot — blank the summary title (R), data rows and the static
             # AUX/PS footer, leaving an empty table. R+1 is the block's Excel Table HEADER
             # row ("Pin 1/Pin 2/Description" …); blanking it empties a header cell the
@@ -156,7 +180,7 @@ def _retarget_zone_tab(xml: str, kind: str, dmp_design: DMPDesign) -> str:
                     xml = _blank_cell(xml, f"{col}{r}")
             continue
 
-        zs = sorted(rsps[i].zones)
+        zs = sorted(rsps[rsp_index].zones)
         n = len(zs)
 
         # Header row R → the RSP's first zone row; each data position k → the row of that
@@ -169,13 +193,22 @@ def _retarget_zone_tab(xml: str, kind: str, dmp_design: DMPDesign) -> str:
             for col in cols:
                 xml = _set_cell_master_row(xml, f"{col}{R + data_off + k}", target)
 
+        if has_aux:
+            aux_dst = R + 18
+            # 8-port: only n real rows. Lift AUX POWER to just below them.
+            if n < 16:
+                aux_dst = R + data_off + n
+                for col in cols:
+                    xml = _move_cell(xml, f"{col}{R + 18}", f"{col}{aux_dst}")
+            rsp_number = rsps[rsp_index].number
+            for col, text in zip(cols, (
+                    "AUX POWER", f"PS{rsp_number}",
+                    f"POWER FROM POWER SUPPLY {rsp_number}")):
+                xml = _set_cell_inline_text(xml, f"{col}{aux_dst}", text)
+
         if n >= 16:
             continue
-        # 8-port: only n real rows. Terminal Cans lifts AUX POWER to just below them.
         if has_aux:
-            aux_dst = R + data_off + n
-            for col in cols:
-                xml = _move_cell(xml, f"{col}{R + 18}", f"{col}{aux_dst}")
             blank_from = aux_dst + 1
         else:
             blank_from = R + data_off + n
@@ -339,10 +372,23 @@ _SHEET_LAYOUT = {
 }
 _N_GROUPS = 15
 
+# Each block group is one row of two side-by-side charts. Terminal Cans print one
+# column at a time, two rows per page; the other presentation tabs print both
+# columns and two rows (four charts) per page.
+# Print columns intentionally stop at the right edge of the chart blocks, ignoring
+# stray template formatting outside the handoff area.
+_PRINT_LAYOUT = {
+    # part -> (worksheet title, last print column, block groups per page, scale)
+    "xl/worksheets/sheet3.xml": ("Terminal Cans", "H", 2, 75),
+    "xl/worksheets/sheet4.xml": ("RSPs", "H", 2, 55),
+    "xl/worksheets/sheet5.xml": ("Power Supplies", "F", 2, 55),
+    "xl/worksheets/sheet6.xml": ("LX-KP-710s", "F", 2, 55),
+}
+
 
 def _sheet_group_starts(xml: str, part: str) -> list[int]:
-    """Return all chart-group start rows, including extrapolated template groups."""
-    pitch, last_off = _SHEET_LAYOUT[part]
+    """Return all 15 two-chart group starts, reading/extrapolating the template."""
+    pitch, _last_off = _SHEET_LAYOUT[part]
     starts = sorted({int(m.group(1)) for m in re.finditer(
         r'<c r="[A-Z]+(\d+)"[^>]*?><f>Header!B3</f>', xml)})
     if not starts or starts[0] != 2:
@@ -362,236 +408,104 @@ def _sheet_cutoff(xml: str, part: str, n_charts: int) -> int:
     Supplies / LX tabs stop carrying Header!B3 on later groups, but their chart
     slots stay on the regular pitch — extrapolate.
     """
-    _, last_off = _SHEET_LAYOUT[part]
+    _pitch, last_off = _SHEET_LAYOUT[part]
     starts = _sheet_group_starts(xml, part)
-    g = min(max(1, (n_charts + 1) // 2), _N_GROUPS)  # two charts per group, keep >= 1
+    if part == "xl/worksheets/sheet3.xml":
+        full_pages, remainder = divmod(max(0, n_charts), 4)
+        # A partial page uses one physical row for one chart and two rows for two or
+        # three charts. Cap at the template's 15 rows; chart 30 uses the final right slot.
+        g = min(max(1, full_pages * 2 + min(remainder, 2)), _N_GROUPS)
+    else:
+        g = min(max(1, (n_charts + 1) // 2), _N_GROUPS)  # two charts/group, keep >= 1
     cutoff = starts[g - 1] + last_off
     assert g == _N_GROUPS or cutoff < starts[g], \
         f"{part}: cutoff {cutoff} overlaps group {g + 1} (row {starts[g]})"
     return cutoff
 
 
-def _sheet_print_breaks(xml: str, part: str, n_charts: int) -> list[int]:
-    """Manual row breaks that preserve the intended number of charts per page.
+def _terminal_print_areas(starts: list[int], n_charts: int, cutoff: int) -> list[str]:
+    """Return ordered Terminal Can print sections, each holding at most two charts.
 
-    The compact RSP, Power Supplies, and LX/KP sheets use two groups (four
-    charts) per page. Terminal Cans is flattened separately into one full-width
-    vertical chart stack by ``_stack_terminal_charts``.
+    Full four-chart chunks occupy a two-row, two-column rectangle that Excel splits
+    at the manual column break. A final one/two-chart chunk prints only the left
+    column, preventing an empty right-column page.
     """
-    starts = _sheet_group_starts(xml, part)
-    groups = min(max(1, (n_charts + 1) // 2), _N_GROUPS)
-    groups_per_page = 2
-    return [starts[next_group] - 1
-            for next_group in range(groups_per_page, groups, groups_per_page)]
+    if n_charts <= 0:
+        return [f"$B$2:$D${cutoff}"]
+
+    full_pages, remainder = divmod(n_charts, 4)
+    physical_groups = full_pages * 2 + min(remainder, 2)
+    if physical_groups > _N_GROUPS:
+        return [f"$B$2:$H${cutoff}"]
+
+    areas: list[str] = []
+    full_groups = full_pages * 2 + (2 if remainder >= 3 else 0)
+    if full_groups:
+        full_end = starts[full_groups - 1] + _SHEET_LAYOUT["xl/worksheets/sheet3.xml"][1]
+        areas.append(f"$B$2:$H${full_end}")
+    if remainder in (1, 2):
+        partial_start = starts[full_pages * 2]
+        areas.append(f"$B${partial_start}:$D${cutoff}")
+    return areas
 
 
-def _terminal_stack_cutoff(n_charts: int) -> int:
-    """Last row in a one-chart-wide Terminal Cans stack (25 rows per chart)."""
-    return 25 * max(1, n_charts) + 1
+def _apply_print_layout(xml: str, part: str, cutoff: int) -> str:
+    """Set Letter-landscape scaling and manual breaks between whole chart groups."""
+    _sheet_name, _last_col, groups_per_page, scale = _PRINT_LAYOUT[part]
+    starts = [row for row in _sheet_group_starts(xml, part) if row <= cutoff]
+    breaks = [starts[i] - 1 for i in range(groups_per_page, len(starts), groups_per_page)]
 
+    is_terminal = part == "xl/worksheets/sheet3.xml"
+    page_order = ' pageOrder="overThenDown"' if is_terminal else ""
 
-def _terminal_stack_breaks(n_charts: int) -> list[int]:
-    """Terminal stacking uses fixed scale; manual breaks create separator pages."""
-    return []
+    # Terminal Cans print one chart column at 75%; two rows fit with compact margins.
+    # The other presentation sheets retain their two-column 55% layout. Width-only
+    # auto-fit is too large and can split final chart rows before a manual break.
+    xml = re.sub(
+        r'<pageSetup\b[^>]*/>',
+        f'<pageSetup paperSize="1" scale="{scale}" orientation="landscape"{page_order}/>',
+        xml,
+        count=1,
+    )
+    xml = re.sub(
+        r'<pageSetUpPr\b[^>]*/>',
+        '<pageSetUpPr autoPageBreaks="0" fitToPage="0"/>',
+        xml,
+        count=1,
+    )
+    if is_terminal:
+        xml = re.sub(r'<printOptions\b[^>]*/>', '', xml, count=1)
+        xml = re.sub(
+            r'<pageMargins\b[^>]*/>',
+            '<printOptions horizontalCentered="1" verticalCentered="0"/>'
+            '<pageMargins left="0.25" right="0.25" top="0.25" bottom="0.25" '
+            'header="0.15" footer="0.15"/>',
+            xml,
+            count=1,
+        )
 
-
-def _stack_terminal_charts(xml: str, n_charts: int) -> str:
-    """Flatten Terminal Cans' left/right chart pairs into a full-width stack.
-
-    The template stores charts in reading order as B:D then F:H, with each pair
-    sharing a 25-row group.  Printing that geometry puts the two charts beside
-    each other.  This rewrite copies those same styled/formula cells into B:D at
-    25-row intervals, so the printed page holds one chart on top and one below.
-    """
-    kept = max(1, n_charts)
-    sheet_data = re.search(r'<sheetData>(.*?)</sheetData>', xml, re.S)
-    assert sheet_data, "Terminal Cans has no sheetData"
-    rows = {int(m.group(1)): (m.group(2), "") for m in re.finditer(
-        r'<row r="(\d+)"([^>]*)/>', sheet_data.group(1))}
-    expanded_rows = re.sub(r'<row r="\d+"[^>]*/>', "", sheet_data.group(1))
-    for m in re.finditer(r'<row r="(\d+)"([^>]*)>(.*?)</row>',
-                         expanded_rows, re.S):
-        rows[int(m.group(1))] = (m.group(2), m.group(3))
-
-    def map_col(col: str, right: bool) -> str:
-        return chr(ord(col) - 4) if right else col
-
-    new_rows = []
-    for chart in range(kept):
-        group = chart // 2
-        right = chart % 2 == 1
-        src_start = 2 + 25 * group
-        dst_start = 2 + 25 * chart
-        allowed = set("FGH" if right else "BCD")
-        for off in range(25):
-            src_row, dst_row = src_start + off, dst_start + off
-            attrs, inner = rows.get(src_row, ("", ""))
-            attrs = re.sub(r'\bspans="[^"]*"', 'spans="2:4"', attrs)
-            cells = []
-            # The 25th row is spacing between charts. Some right-hand template
-            # blocks put bordered empty cells there; carrying those styles into
-            # the vertical stack prints a stray table strip on the next page.
-            if off == 24:
-                # Keep one unstyled cell so spreadsheet readers retain the
-                # declared final spacer row without drawing any border.
-                new_rows.append(
-                    f'<row r="{dst_row}"{attrs}><c r="B{dst_row}"/></row>')
-                continue
-            for cm in re.finditer(
-                    r'<c r="([A-Z]+)(\d+)"(?:[^>]*?/>|[^>]*?>.*?</c>)',
-                    inner, re.S):
-                col = cm.group(1)
-                if col not in allowed:
-                    continue
-                dst_col = map_col(col, right)
-                cell = re.sub(
-                    r'^<c r="[A-Z]+\d+"', f'<c r="{dst_col}{dst_row}"',
-                    cm.group(0), count=1)
-                cells.append(cell)
-            new_rows.append(
-                f'<row r="{dst_row}"{attrs}>' + "".join(cells) + '</row>')
-
-    xml = (xml[:sheet_data.start(1)] + "".join(new_rows)
-           + xml[sheet_data.end(1):])
-
-    merges = re.search(r'<mergeCells count="\d+">(.*?)</mergeCells>', xml, re.S)
-    if merges:
-        source_merges = re.findall(
-            r'<mergeCell ref="([A-Z]+)(\d+):([A-Z]+)(\d+)"/>',
-            merges.group(1))
-        mapped = []
-        for chart in range(kept):
-            group = chart // 2
-            right = chart % 2 == 1
-            src_start = 2 + 25 * group
-            dst_start = 2 + 25 * chart
-            allowed = set("FGH" if right else "BCD")
-            for c1, r1, c2, r2 in source_merges:
-                lo, hi = int(r1), int(r2)
-                if c1 not in allowed or c2 not in allowed:
-                    continue
-                if not (src_start <= lo <= hi <= src_start + 24):
-                    continue
-                mapped.append(
-                    f'<mergeCell ref="{map_col(c1, right)}{dst_start + lo - src_start}:'
-                    f'{map_col(c2, right)}{dst_start + hi - src_start}"/>')
-        xml = (xml[:merges.start()] + f'<mergeCells count="{len(mapped)}">'
-               + "".join(mapped) + '</mergeCells>' + xml[merges.end():])
-
-    cutoff = _terminal_stack_cutoff(n_charts)
-    xml = re.sub(r'<dimension ref="[^"]+"/>',
-                 f'<dimension ref="B1:D{cutoff}"/>', xml, count=1)
-    return xml
-
-
-def _terminal_table_index(ref: str) -> int | None:
-    """Return a template Terminal Cans table's chart index in reading order."""
-    m = re.fullmatch(r'([BF])(\d+):([DH])(\d+)', ref)
-    if not m:
-        return None
-    start = int(m.group(2)) - 6
-    if start < 2 or (start - 2) % 25:
-        return None
-    return 2 * ((start - 2) // 25) + (1 if m.group(1) == "F" else 0)
-
-
-def _stacked_terminal_table_ref(ref: str) -> str:
-    """Move a retained Terminal Cans table to its chart's stacked B:D block."""
-    chart = _terminal_table_index(ref)
-    assert chart is not None, f"unrecognized Terminal Cans table range: {ref}"
-    top = 8 + 25 * chart
-    return f"B{top}:D{top + 17}"
-
-
-def _stack_terminal_drawing(xml: str, n_charts: int) -> str:
-    """Move Terminal Cans logo anchors with their charts into the B:D stack."""
-    kept = max(1, n_charts)
-
-    def move(anchor: re.Match) -> str:
-        block = anchor.group(0)
-        col_m = re.search(r'<xdr:from>.*?<xdr:col>(\d+)</xdr:col>', block, re.S)
-        row_m = re.search(r'<xdr:from>.*?<xdr:row>(\d+)</xdr:row>', block, re.S)
-        if not col_m or not row_m:
-            return block
-        col, row = int(col_m.group(1)), int(row_m.group(1))
-        if col not in (1, 3, 5, 7) or row < 1 or (row - 1) % 25:
-            return ""
-        group = (row - 1) // 25
-        right = col >= 5
-        chart = 2 * group + (1 if right else 0)
-        if chart >= kept:
-            return ""
-        col_delta = -4 if right else 0
-        row_delta = 25 * (chart - group)
-        block = re.sub(
-            r'(<xdr:col>)(\d+)(</xdr:col>)',
-            lambda m: f'{m.group(1)}{int(m.group(2)) + col_delta}{m.group(3)}',
-            block)
-        block = re.sub(
-            r'(<xdr:row>)(\d+)(</xdr:row>)',
-            lambda m: f'{m.group(1)}{int(m.group(2)) + row_delta}{m.group(3)}',
-            block)
-        return block
-
-    return re.sub(r'<xdr:(twoCellAnchor|oneCellAnchor)\b.*?</xdr:\1>',
-                  move, xml, flags=re.S)
-
-
-def _set_print_layout(xml: str, breaks: list[int]) -> str:
-    """Fit one page wide while explicit breaks control vertical chart grouping."""
-    xml, n = re.subn(
-        r'(<pageSetUpPr\b[^>]*\bfitToPage=")[^"]*"', r'\g<1>1"', xml, count=1)
-    assert n == 1, "presentation sheet has no pageSetUpPr fitToPage setting"
-
-    page_setup = re.search(r'<pageSetup\b([^>]*)/>', xml)
-    assert page_setup, "presentation sheet has no pageSetup"
-    attrs = re.sub(r'\s+(?:scale|fitToWidth|fitToHeight)="[^"]*"', "",
-                   page_setup.group(1))
-    replacement = f'<pageSetup{attrs} fitToWidth="1" fitToHeight="0"/>'
-    xml = xml[:page_setup.start()] + replacement + xml[page_setup.end():]
-
-    xml = re.sub(r'<rowBreaks\b.*?</rowBreaks>', "", xml, flags=re.S)
+    # Replace any template breaks, then insert ours in worksheet-schema order directly
+    # after pageSetup (and before drawing/tableParts). Terminal Cans split before spacer
+    # column E, so the left page ends at the chart edge instead of clipping a sliver of
+    # the populated right-hand chart boundary onto the preceding page.
+    xml = re.sub(r'<rowBreaks\b.*?</rowBreaks>', '', xml, flags=re.S)
+    xml = re.sub(r'<colBreaks\b.*?</colBreaks>', '', xml, flags=re.S)
+    break_sections: list[str] = []
     if breaks:
-        items = "".join(
+        break_xml = ''.join(
             f'<brk id="{row}" min="0" max="16383" man="1"/>' for row in breaks)
         row_breaks = (f'<rowBreaks count="{len(breaks)}" '
-                      f'manualBreakCount="{len(breaks)}">{items}</rowBreaks>')
-        # pageSetup is self-closing in the C1 template. Re-find it after replacement
-        # so insertion does not depend on the old element's length.
-        new_setup = re.search(r'<pageSetup\b[^>]*/>', xml)
-        insert_at = new_setup.end()
-        xml = xml[:insert_at] + row_breaks + xml[insert_at:]
-    return xml
-
-
-def _set_terminal_print_layout(xml: str) -> str:
-    """Print two full Terminal Cans charts, top/bottom, on each landscape page.
-
-    At fit-to-width Excel enlarges the now single-column chart until only one
-    block fits vertically. A fixed 68% scale keeps the chart readable and lets
-    the uniform 25-row blocks paginate naturally in pairs. Manual row breaks are
-    deliberately removed because Excel otherwise isolates the boundary row on a
-    separator page.
-    """
-    xml, n = re.subn(
-        r'(<pageSetUpPr\b[^>]*\bfitToPage=")[^"]*"', r'\g<1>0"', xml, count=1)
-    assert n == 1, "Terminal Cans has no pageSetUpPr setting"
-
-    page_setup = re.search(r'<pageSetup\b([^>]*)/>', xml)
-    assert page_setup, "Terminal Cans has no pageSetup"
-    attrs = re.sub(r'\s+(?:scale|fitToWidth|fitToHeight)="[^"]*"', "",
-                   page_setup.group(1))
-    replacement = f'<pageSetup{attrs} scale="68"/>'
-    xml = xml[:page_setup.start()] + replacement + xml[page_setup.end():]
-    xml = re.sub(r'<rowBreaks\b.*?</rowBreaks>', "", xml, flags=re.S)
-
-    centered = '<printOptions horizontalCentered="1" verticalCentered="0"/>'
-    if re.search(r'<printOptions\b[^>]*/>', xml):
-        xml = re.sub(r'<printOptions\b[^>]*/>', centered, xml, count=1)
-    else:
-        margins = re.search(r'<pageMargins\b', xml)
-        assert margins, "Terminal Cans has no pageMargins"
-        xml = xml[:margins.start()] + centered + xml[margins.start():]
+                      f'manualBreakCount="{len(breaks)}">{break_xml}</rowBreaks>')
+        break_sections.append(row_breaks)
+    if is_terminal:
+        break_sections.append(
+            '<colBreaks count="1" manualBreakCount="1">'
+            '<brk id="4" min="0" max="1048575" man="1"/>'
+            '</colBreaks>'
+        )
+    if break_sections:
+        break_xml = ''.join(break_sections)
+        xml = re.sub(r'(<pageSetup\b[^>]*/>)', rf'\1{break_xml}', xml, count=1)
     return xml
 
 
@@ -954,11 +868,8 @@ def inject(template_path: Path, dmp_design: DMPDesign, output_path: Path) -> Non
     #   sheet3 = Terminal Cans, sheet4 = RSPs, sheet5 = Power Supplies, sheet6 = LX-KP-710s
     # Each presentation sheet is retargeted/consolidated, then its drifted
     # =Header! title references are repaired (see _normalize_header_refs).
-    terminal_chart_count = len(dmp_design.rsps)
     PRESENTATION_REWRITERS = {
-        "xl/worksheets/sheet3.xml": lambda x: _normalize_header_refs(
-            _stack_terminal_charts(
-                _retarget_zone_tab(x, "tc", dmp_design), terminal_chart_count)),
+        "xl/worksheets/sheet3.xml": lambda x: _normalize_header_refs(_retarget_zone_tab(x, "tc", dmp_design)),
         "xl/worksheets/sheet4.xml": lambda x: _normalize_header_refs(_retarget_zone_tab(x, "rsps", dmp_design)),
         "xl/worksheets/sheet5.xml": lambda x: _normalize_header_refs(_retarget_power_supplies(x, dmp_design)),
         "xl/worksheets/sheet6.xml": lambda x: _normalize_header_refs(_consolidate_lx(x, lx_filled_rows)),
@@ -970,7 +881,7 @@ def inject(template_path: Path, dmp_design: DMPDesign, output_path: Path) -> Non
     # part, the sheet's rels, its <tablePart> element, and [Content_Types].xml — or
     # Excel flags the file for repair.
     chart_counts = {
-        # TC/RSPs blocks fill in visual order (block i = RSP i+1); PS charts sit at
+        # TC blocks fill in print order; RSPs retain visual order. PS charts sit at
         # their module NUMBER's slot; LX slots were compacted to the filled count.
         "xl/worksheets/sheet3.xml": len(dmp_design.rsps),
         "xl/worksheets/sheet4.xml": len(dmp_design.rsps),
@@ -978,24 +889,17 @@ def inject(template_path: Path, dmp_design: DMPDesign, output_path: Path) -> Non
         "xl/worksheets/sheet6.xml": n_splitters,
     }
     cutoffs: dict[str, int] = {}                  # sheet part -> last row to keep
-    print_breaks: dict[str, list[int]] = {}       # sheet part -> manual row breaks
     drop_parts: set[str] = set()                  # xl/tables/tableNN.xml parts to omit
     sheet_drop_rids: dict[str, set[str]] = {}     # sheet part -> tablePart rIds to remove
     rels_drop_names: dict[str, set[str]] = {}     # rels part -> table basenames to remove
     drawing_cutoffs: dict[str, int] = {}          # drawing part -> its sheet's cutoff
-    terminal_drawing_parts: set[str] = set()      # drawings moved into the TC stack
-    table_rewrites: dict[str, str] = {}            # table part -> stacked TC range
+    group_starts: dict[str, list[int]] = {}       # sheet part -> physical chart-row starts
     with zipfile.ZipFile(template_path) as ztpl:
         for sheet_part, n_charts in chart_counts.items():
-            template_xml = ztpl.read(sheet_part).decode("utf-8")
-            if sheet_part == "xl/worksheets/sheet3.xml":
-                cutoff = _terminal_stack_cutoff(n_charts)
-                breaks = _terminal_stack_breaks(n_charts)
-            else:
-                cutoff = _sheet_cutoff(template_xml, sheet_part, n_charts)
-                breaks = _sheet_print_breaks(template_xml, sheet_part, n_charts)
+            sheet_xml = ztpl.read(sheet_part).decode("utf-8")
+            group_starts[sheet_part] = _sheet_group_starts(sheet_xml, sheet_part)
+            cutoff = _sheet_cutoff(sheet_xml, sheet_part, n_charts)
             cutoffs[sheet_part] = cutoff
-            print_breaks[sheet_part] = breaks
             rels_part = sheet_part.replace("worksheets/", "worksheets/_rels/") + ".rels"
             for rm in _re.finditer(r"<Relationship\b[^>]*?/>",
                                    ztpl.read(rels_part).decode("utf-8")):
@@ -1003,48 +907,29 @@ def inject(template_path: Path, dmp_design: DMPDesign, output_path: Path) -> Non
                 target = _re.search(r'Target="([^"]+)"', rm.group(0)).group(1)
                 name = target.rsplit("/", 1)[-1]
                 if "/tables/" in target:
-                    table_xml = ztpl.read("xl/tables/" + name).decode("utf-8")
-                    ref_match = _re.search(r'<table [^>]*?\bref="([A-Z]+\d+:[A-Z]+\d+)"',
-                                           table_xml)
-                    full_ref = ref_match.group(1)
-                    rows = _re.search(r'[A-Z]+(\d+):[A-Z]+(\d+)', full_ref)
-                    lo, hi = sorted((int(rows.group(1)), int(rows.group(2))))
-                    terminal_index = (_terminal_table_index(full_ref)
-                                      if sheet_part == "xl/worksheets/sheet3.xml"
-                                      else None)
-                    should_drop = (terminal_index is not None and
-                                   terminal_index >= max(1, n_charts)) \
-                        if sheet_part == "xl/worksheets/sheet3.xml" else lo > cutoff
-                    if should_drop:
+                    ref = _re.search(r'<table [^>]*?\bref="[A-Z]+(\d+):[A-Z]+(\d+)"',
+                                     ztpl.read("xl/tables/" + name).decode("utf-8"))
+                    lo, hi = sorted((int(ref.group(1)), int(ref.group(2))))
+                    if lo > cutoff:
                         drop_parts.add("xl/tables/" + name)
                         sheet_drop_rids.setdefault(sheet_part, set()).add(rid)
                         rels_drop_names.setdefault(rels_part, set()).add(name)
                     else:
-                        if sheet_part == "xl/worksheets/sheet3.xml":
-                            assert terminal_index is not None, \
-                                f"unrecognized Terminal Cans table range {full_ref}"
-                            table_rewrites["xl/tables/" + name] = \
-                                _stacked_terminal_table_ref(full_ref)
-                        else:
-                            assert hi <= cutoff, \
-                                f"table {name} ({lo}:{hi}) straddles cutoff {cutoff} on {sheet_part}"
+                        assert hi <= cutoff, \
+                            f"table {name} ({lo}:{hi}) straddles cutoff {cutoff} on {sheet_part}"
                 elif "/drawings/" in target:
-                    drawing_part = "xl/drawings/" + name
-                    drawing_cutoffs[drawing_part] = cutoff
-                    if sheet_part == "xl/worksheets/sheet3.xml":
-                        terminal_drawing_parts.add(drawing_part)
+                    drawing_cutoffs["xl/drawings/" + name] = cutoff
 
-    # Print only the real chart columns and retained rows. Without these areas,
-    # Excel includes stale blank columns from the original template (Terminal
-    # Cans extended to P although its charts end at H), shrinking print output.
-    print_columns = {
-        "xl/worksheets/sheet3.xml": ("Terminal Cans", "D"),
-        "xl/worksheets/sheet4.xml": ("RSPs", "H"),
-        "xl/worksheets/sheet5.xml": ("Power Supplies", "F"),
-        "xl/worksheets/sheet6.xml": ("LX-KP-710s", "F"),
-    }
-    for sheet_part, (tab, last_col) in print_columns.items():
-        wb[tab].print_area = f"B1:{last_col}{cutoffs[sheet_part]}"
+    # Print areas live in workbook.xml (which is overlaid from openpyxl's save), while
+    # page setup and manual breaks live in each presentation sheet's preserved XML.
+    # Keep both halves driven by the same consolidation cutoffs.
+    for sheet_part, cutoff in cutoffs.items():
+        sheet_name, last_col, _groups_per_page, _scale = _PRINT_LAYOUT[sheet_part]
+        if sheet_part == "xl/worksheets/sheet3.xml":
+            wb[sheet_name].print_area = _terminal_print_areas(
+                group_starts[sheet_part], chart_counts[sheet_part], cutoff)
+        else:
+            wb[sheet_name].print_area = f"$B$2:${last_col}${cutoff}"
 
     with NamedTemporaryFile(delete=False, suffix=".xlsx") as tmpf:
         openpyxl_tmp_path = Path(tmpf.name)
@@ -1064,15 +949,6 @@ def inject(template_path: Path, dmp_design: DMPDesign, output_path: Path) -> Non
              zipfile.ZipFile(rebuild_path, "w", zipfile.ZIP_DEFLATED) as zout:
             for item in zin.namelist():
                 if item in DROP_FILES or item in drop_parts:
-                    continue
-                if item in table_rewrites:
-                    table_xml = zin.read(item).decode("utf-8")
-                    new_ref = table_rewrites[item]
-                    table_xml = _re.sub(r'(<table\b[^>]*?\bref=")[^"]+"',
-                                        rf'\g<1>{new_ref}"', table_xml, count=1)
-                    table_xml = _re.sub(r'(<autoFilter\b[^>]*?\bref=")[^"]+"',
-                                        rf'\g<1>{new_ref}"', table_xml, count=1)
-                    zout.writestr(item, table_xml.encode("utf-8"))
                     continue
                 if item == "[Content_Types].xml":
                     # Drop the calcChain Override declaration (otherwise Excel
@@ -1100,10 +976,7 @@ def inject(template_path: Path, dmp_design: DMPDesign, output_path: Path) -> Non
                     continue
                 if item in drawing_cutoffs:
                     xml = zin.read(item).decode("utf-8")
-                    if item in terminal_drawing_parts:
-                        xml = _stack_terminal_drawing(xml, terminal_chart_count)
-                    else:
-                        xml = _strip_drawing_anchors(xml, drawing_cutoffs[item])
+                    xml = _strip_drawing_anchors(xml, drawing_cutoffs[item])
                     zout.writestr(item, xml.encode("utf-8"))
                     continue
                 if item == "xl/_rels/workbook.xml.rels":
@@ -1121,10 +994,7 @@ def inject(template_path: Path, dmp_design: DMPDesign, output_path: Path) -> Non
                     xml = PRESENTATION_REWRITERS[item](xml)
                     xml = _drop_table_parts(xml, sheet_drop_rids.get(item, set()))
                     xml = _truncate_rows(xml, cutoffs[item])
-                    if item == "xl/worksheets/sheet3.xml":
-                        xml = _set_terminal_print_layout(xml)
-                    else:
-                        xml = _set_print_layout(xml, print_breaks[item])
+                    xml = _apply_print_layout(xml, item, cutoffs[item])
                     zout.writestr(item, xml.encode("utf-8"))
                     continue
                 data = overlays.get(item, zin.read(item))

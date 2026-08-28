@@ -20,9 +20,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from parse_dmp_worksheet import DMPDesign, RSP, Splitter  # noqa: E402
-from inject_door_chart import inject, zone_to_master_row  # noqa: E402
-from hardware import zone_block_for  # noqa: E402
+from parse_dmp_worksheet import DMPDesign, RSP, Splitter, Zone  # noqa: E402
+from inject_door_chart import inject  # noqa: E402
 from test_door_chart_eight_port import _mixed_design  # noqa: E402
 
 DOOR_CHART_TEMPLATE = REPO_ROOT / "door_chart_template_blank.xlsx"
@@ -44,6 +43,34 @@ def _kp(num, loc="ADMIN BUILDING"):
 def _splitter_design(*splitters):
     design = _mixed_design()
     design.splitters = list(splitters)
+    return design
+
+
+def _five_chart_design():
+    """Five charts exercise a full page plus a partial final page on every tab."""
+    design = _mixed_design()
+    for num, first_zone in ((4, 541), (5, 557)):
+        zones = list(range(first_zone, first_zone + 16))
+        design.rsps.append(RSP(number=num, location=f"BLDG {num}", zones=zones,
+                               model="714-16"))
+        for offset, zone_num in enumerate(zones):
+            design.master_zones.append(Zone(
+                number=zone_num,
+                description=(f"PS-{num}: A/C LOSS" if offset == 14 else
+                             f"PS-{num}: BATT. TRBL" if offset == 15 else
+                             f"ROOM {zone_num}"),
+                rsp_number=num,
+                is_ps_ac=offset == 14,
+                is_ps_batt=offset == 15,
+            ))
+    design.splitters = [_lx(num) for num in range(1, 6)]
+    return design
+
+
+def _two_chart_design():
+    """Two charts must occupy two stacked rows on one Terminal Can print page."""
+    design = _mixed_design()
+    design.rsps = design.rsps[:2]
     return design
 
 
@@ -74,10 +101,10 @@ def test_msp_tab_absent_and_master_intact(tmp_path):
 # -------- truncation --------
 
 def test_truncation_bounds_mixed_design(tmp_path):
-    """3 RSPs become 3 stacked TC charts; compact sheets retain paired groups."""
+    """3 RSPs (max module 3) and no splitters -> 2 groups on TC/RSPs/PS, 1 on LX."""
     out = _inject(tmp_path, _mixed_design())
     zf = zipfile.ZipFile(out)
-    assert _max_sheet_row(zf, 3) == 76   # Terminal Cans: chart 3 ends at 52+24
+    assert _max_sheet_row(zf, 3) == 51   # Terminal Cans: group 2 ends at 27+24
     assert _max_sheet_row(zf, 4) == 51   # RSPs: 28+23
     assert _max_sheet_row(zf, 5) == 24   # Power Supplies: 14+10
     assert _max_sheet_row(zf, 6) == 12   # LX: no splitters, one blanked group kept
@@ -94,65 +121,91 @@ def test_truncation_bounds_mixed_design(tmp_path):
 def test_no_formulas_or_headers_below_cutoff(tmp_path):
     out = _inject(tmp_path, _mixed_design())
     zf = zipfile.ZipFile(out)
-    for sheet_num, cutoff in ((3, 76), (4, 51), (5, 24), (6, 12)):
+    for sheet_num, cutoff in ((3, 51), (4, 51), (5, 24), (6, 12)):
         xml = zf.read(f"xl/worksheets/sheet{sheet_num}.xml").decode()
         for m in re.finditer(r'<c r="[A-Z]+(\d+)"[^>]*?><f>(Master|Header)!', xml):
             assert int(m.group(1)) <= cutoff, \
                 f"sheet{sheet_num}: formula cell on row {m.group(1)} survived truncation"
 
 
-def test_print_layout_uses_chart_group_page_breaks(tmp_path):
-    """Terminal Cans stacks two full-width charts per landscape page."""
-    design = _mixed_design()
-    for number in range(4, 8):
-        design.rsps.append(RSP(
-            number=number,
-            location=f"BUILDING {number}",
-            zones=list(zone_block_for(number)),
-        ))
-    design.splitters = [_lx(i) for i in range(1, 12)]
+# -------- print layout --------
 
-    wb = openpyxl.load_workbook(_inject(tmp_path, design))
+def test_generated_workbook_has_type_appropriate_print_layout(tmp_path):
+    """Generated charts print without selecting a range or splitting a chart block."""
+    out = _inject(tmp_path, _five_chart_design())
+    wb = openpyxl.load_workbook(out)
+
+    terminal = wb["Terminal Cans"]
+    assert terminal.print_area == (
+        "'Terminal Cans'!$B$2:$H$51,'Terminal Cans'!$B$52:$D$76"
+    )
+    assert terminal.page_setup.orientation == "landscape"
+    assert terminal.page_setup.paperSize == 1  # US Letter
+    assert terminal.page_setup.scale == 75
+    assert terminal.page_setup.pageOrder == "overThenDown"
+    assert terminal.page_margins.left == terminal.page_margins.right == 0.25
+    assert terminal.page_margins.top == terminal.page_margins.bottom == 0.25
+    assert terminal.print_options.horizontalCentered
+    assert [brk.id for brk in terminal.row_breaks.brk] == [51]
+    # End the left-hand page at the chart edge (column D), not after spacer E.
+    # A break after E lets Excel paint a thin sliver of the populated F-column
+    # chart boundary on the preceding page.
+    assert [brk.id for brk in terminal.col_breaks.brk] == [4]
+
     expected = {
-        "Terminal Cans": ("$B$1:$D$176", []),
-        "RSPs": ("$B$1:$H$103", [53]),
-        "Power Supplies": ("$B$1:$F$48", [25]),
-        "LX-KP-710s": ("$B$1:$F$72", [25, 49]),
+        # Medium/small charts: two groups (four charts) per page.
+        "RSPs": ("$B$2:$H$77", [53], 55),
+        "Power Supplies": ("$B$2:$F$36", [25], 55),
+        "LX-KP-710s": ("$B$2:$F$36", [25], 55),
     }
-    for tab, (print_area, breaks) in expected.items():
-        ws = wb[tab]
-        assert str(ws.print_area).rsplit("!", 1)[-1] == print_area
+    for sheet_name, (area, breaks, scale) in expected.items():
+        ws = wb[sheet_name]
+        assert ws.print_area == f"'{sheet_name}'!{area}"
+        assert ws.page_setup.orientation == "landscape"
+        assert ws.page_setup.paperSize == 1  # US Letter
+        # Excel splits the Terminal Can Description column onto a second horizontal
+        # page at 55%; the narrower chart types can retain the larger scale.
+        assert ws.page_setup.scale == scale
+        assert ws.page_setup.fitToWidth is None
+        assert ws.page_setup.fitToHeight is None
         assert [brk.id for brk in ws.row_breaks.brk] == breaks
-        if tab == "Terminal Cans":
-            assert ws.page_setup.fitToWidth is None
-            assert ws.page_setup.fitToHeight is None
-            assert ws.page_setup.scale == 68
-            assert ws.sheet_properties.pageSetUpPr.fitToPage is False
-            assert ws.print_options.horizontalCentered is True
-        else:
-            assert ws.page_setup.fitToWidth == 1
-            assert ws.page_setup.fitToHeight == 0
-            assert ws.page_setup.scale is None
-            assert ws.sheet_properties.pageSetUpPr.fitToPage is True
+        assert all(brk.man for brk in ws.row_breaks.brk)
 
-    tc = wb["Terminal Cans"]
-    # Reading order is flattened from the template's left/right pairs into one
-    # full-width vertical stack.  Two 25-row chart blocks make each printed page.
-    expected_headers = [
-        f"=Master!D{zone_to_master_row(min(rsp.zones))}"
-        for rsp in sorted(design.rsps, key=lambda rsp: rsp.number)
+
+def test_terminal_can_print_order_stacks_consecutive_charts(tmp_path):
+    """Print pages contain charts 1-2, 3-4, then 5 instead of odd/even pairs."""
+    out = _inject(tmp_path, _five_chart_design())
+    terminal = openpyxl.load_workbook(out)["Terminal Cans"]
+
+    page_order_cells = ["B7", "B32", "F7", "F32", "B57"]
+    assert [terminal[ref].value for ref in page_order_cells] == [
+        "=Master!D67",   # RSP 1
+        "=Master!D83",   # RSP 2
+        "=Master!D91",   # RSP 3
+        "=Master!D107",  # RSP 4
+        "=Master!D123",  # RSP 5
     ]
-    assert [tc[f"B{row}"].value for row in (7, 32, 57, 82, 107, 132, 157)] == \
-        expected_headers
-    assert all(tc[f"F{row}"].value is None for row in range(1, tc.max_row + 1))
-    assert tc.max_row == 176
-    # Template right-hand charts carry a styled trailing row. In the vertical
-    # stack it must become a plain spacer or Excel prints its border at the top
-    # of the following page, making adjacent charts look clipped/merged.
-    for spacer_row in range(26, tc.max_row + 1, 25):
-        assert all(tc.cell(spacer_row, col).value is None and
-                   not tc.cell(spacer_row, col).has_style
-                   for col in range(2, 5))
+    assert [terminal[ref].value for ref in ("C25", "C42", "G25", "G50", "C75")] == [
+        "PS1",
+        "PS2",
+        "PS3",
+        "PS4",
+        "PS5",
+    ]
+
+
+def test_two_terminal_can_charts_share_one_stacked_print_page(tmp_path):
+    """A two-chart job retains two physical rows and excludes the empty right column."""
+    out = _inject(tmp_path, _two_chart_design())
+    terminal = openpyxl.load_workbook(out)["Terminal Cans"]
+
+    assert terminal.max_row == 51
+    assert terminal.print_area == "'Terminal Cans'!$B$2:$D$51"
+    assert [terminal[ref].value for ref in ("B7", "B32")] == [
+        "=Master!D67",
+        "=Master!D83",
+    ]
+    assert terminal["F7"].value is None
 
 
 # -------- LX-KP-710s compaction --------
