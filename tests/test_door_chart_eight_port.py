@@ -105,9 +105,10 @@ def test_inject_contiguous_master_and_mapping(tmp_path):
     assert m["A106"].value == "Z540"
     assert m["A107"].value is None and m["B107"].value is None  # nothing past the real zones
 
-    # Terminal Cans + RSPs: each block points to its RSP's real contiguous first row.
-    # RSP1→67 (Z501), RSP2→83 (Z517), RSP3→91 (Z525) — RSP3 did NOT get pushed to 99.
-    assert _block_first_zones(wb["Terminal Cans"], "D", 2, False)[:3] == [67, 83, 91]
+    # Each block points to its RSP's real contiguous first row. Terminal Cans use
+    # physical print order (top-left, top-right, bottom-left) so pages stack RSP1/RSP2;
+    # RSPs retain visual reading order. RSP3 did NOT get pushed to row 99.
+    assert _block_first_zones(wb["Terminal Cans"], "D", 2, False)[:3] == [67, 91, 83]
     assert _block_first_zones(wb["RSPs"], "C", 3, True)[:3] == [67, 83, 91]
 
     # Only the 3 real blocks remain populated; unused module blocks are blanked.
@@ -160,10 +161,12 @@ def test_inject_eight_port_reshape_and_power_supplies(tmp_path):
     wb = openpyxl.load_workbook(out, data_only=False)
     tc = wb["Terminal Cans"]
 
-    # RSP2 (8-port) is the right block of group 1 (header F7): 8 data rows then AUX POWER.
-    assert str(tc["F16"].value).startswith("=Master!A")   # 8th (last) real data row
-    assert tc["F17"].value == "AUX POWER"                  # AUX lifted up
-    assert tc["F18"].value is None                         # blanks below
+    # RSP2 (8-port) is the lower-left stacked chart (header B32): eight data rows,
+    # then its correctly renumbered AUX POWER footer and blank rows below.
+    assert str(tc["B41"].value).startswith("=Master!A")   # 8th (last) real data row
+    assert tc["B42"].value == "AUX POWER"                 # AUX lifted up
+    assert tc["C42"].value == "PS2"
+    assert tc["B43"].value is None                         # blanks below
 
     # Power Supplies reads RSP2's real supervisory rows (Z523/Z524 → Master rows 89/90),
     # not the 16-port slot positions.

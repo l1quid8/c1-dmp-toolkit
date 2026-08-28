@@ -34,6 +34,7 @@ import re
 import shutil
 from datetime import date
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 import openpyxl
 from openpyxl.workbook.properties import CalcProperties
@@ -119,13 +120,27 @@ def _set_cell_master_row(xml: str, ref: str, new_row: int) -> str:
     return xml[:m.start()] + cell + xml[m.end():]
 
 
+def _set_cell_inline_text(xml: str, ref: str, text: str) -> str:
+    """Replace cell REF's value with inline text while preserving its style."""
+    m = _find_cell(xml, ref)
+    if not m:
+        return xml
+    sm = re.search(r'\bs="(\d+)"', m.group(0))
+    style = f' s="{sm.group(1)}"' if sm else ""
+    cell = (f'<c r="{ref}"{style} t="inlineStr"><is><t>'
+            f'{escape(text)}</t></is></c>')
+    return xml[:m.start()] + cell + xml[m.end():]
+
+
 def _retarget_zone_tab(xml: str, kind: str, dmp_design: DMPDesign) -> str:
     """Retarget every block in Terminal Cans ('tc') or RSPs ('rsps') to its RSP's real
     contiguous Master rows; reshape 8-port blocks; blank unused blocks.
 
-    Blocks are matched by VISUAL ORDER (the i-th block top-to-bottom, left-before-right, is
-    RSP i+1) and each block's own header formula gives its current anchor — the RSPs tab's
-    template uses an irregular anchor sequence, so anchor-based matching is not reliable.
+    RSP blocks stay in visual order. Terminal Can blocks are assigned in print order:
+    left/top, left/bottom, right/top, right/bottom. That lets Excel print two larger,
+    vertically stacked charts per page without moving the template's cells or drawings.
+    Each block's own header formula gives its current anchor — the RSPs tab's template
+    uses an irregular anchor sequence, so anchor-based matching is not reliable.
 
     Geometry: header at R, then data rows starting R+data_off (16 slots), and (Terminal
     Cans only) an AUX POWER row at R+18.
@@ -141,10 +156,19 @@ def _retarget_zone_tab(xml: str, kind: str, dmp_design: DMPDesign) -> str:
     blocks.sort(key=lambda b: (b[0], 0 if b[1] == "B" else 1))
     rsps = sorted(dmp_design.rsps, key=lambda r: r.number)
 
-    for i, (R, col_letter, anchor) in enumerate(blocks):
+    for physical_slot, (R, col_letter, anchor) in enumerate(blocks):
         cols = ("B", "C", "D") if col_letter == "B" else ("F", "G", "H")
 
-        if i >= len(rsps):
+        rsp_index = physical_slot
+        if kind == "tc":
+            group, side = divmod(physical_slot, 2)
+            rsp_index = (group // 2) * 4 + (group % 2) + side * 2
+            # Thirty charts consume every template slot. The final physical row cannot
+            # stack its last pair, so use its right slot for chart 30 rather than drop it.
+            if len(rsps) == len(blocks) and physical_slot == len(blocks) - 1:
+                rsp_index = len(rsps) - 1
+
+        if rsp_index >= len(rsps):
             # Unused module slot — blank the summary title (R), data rows and the static
             # AUX/PS footer, leaving an empty table. R+1 is the block's Excel Table HEADER
             # row ("Pin 1/Pin 2/Description" …); blanking it empties a header cell the
@@ -156,7 +180,7 @@ def _retarget_zone_tab(xml: str, kind: str, dmp_design: DMPDesign) -> str:
                     xml = _blank_cell(xml, f"{col}{r}")
             continue
 
-        zs = sorted(rsps[i].zones)
+        zs = sorted(rsps[rsp_index].zones)
         n = len(zs)
 
         # Header row R → the RSP's first zone row; each data position k → the row of that
@@ -169,13 +193,22 @@ def _retarget_zone_tab(xml: str, kind: str, dmp_design: DMPDesign) -> str:
             for col in cols:
                 xml = _set_cell_master_row(xml, f"{col}{R + data_off + k}", target)
 
+        if has_aux:
+            aux_dst = R + 18
+            # 8-port: only n real rows. Lift AUX POWER to just below them.
+            if n < 16:
+                aux_dst = R + data_off + n
+                for col in cols:
+                    xml = _move_cell(xml, f"{col}{R + 18}", f"{col}{aux_dst}")
+            rsp_number = rsps[rsp_index].number
+            for col, text in zip(cols, (
+                    "AUX POWER", f"PS{rsp_number}",
+                    f"POWER FROM POWER SUPPLY {rsp_number}")):
+                xml = _set_cell_inline_text(xml, f"{col}{aux_dst}", text)
+
         if n >= 16:
             continue
-        # 8-port: only n real rows. Terminal Cans lifts AUX POWER to just below them.
         if has_aux:
-            aux_dst = R + data_off + n
-            for col in cols:
-                xml = _move_cell(xml, f"{col}{R + 18}", f"{col}{aux_dst}")
             blank_from = aux_dst + 1
         else:
             blank_from = R + data_off + n
@@ -339,6 +372,33 @@ _SHEET_LAYOUT = {
 }
 _N_GROUPS = 15
 
+# Each block group is one row of two side-by-side charts. Terminal Cans print one
+# column at a time, two rows per page; the other presentation tabs print both
+# columns and two rows (four charts) per page.
+# Print columns intentionally stop at the right edge of the chart blocks, ignoring
+# stray template formatting outside the handoff area.
+_PRINT_LAYOUT = {
+    # part -> (worksheet title, last print column, block groups per page, scale)
+    "xl/worksheets/sheet3.xml": ("Terminal Cans", "H", 2, 75),
+    "xl/worksheets/sheet4.xml": ("RSPs", "H", 2, 55),
+    "xl/worksheets/sheet5.xml": ("Power Supplies", "F", 2, 55),
+    "xl/worksheets/sheet6.xml": ("LX-KP-710s", "F", 2, 55),
+}
+
+
+def _sheet_group_starts(xml: str, part: str) -> list[int]:
+    """Return all 15 two-chart group starts, reading/extrapolating the template."""
+    pitch, _last_off = _SHEET_LAYOUT[part]
+    starts = sorted({int(m.group(1)) for m in re.finditer(
+        r'<c r="[A-Z]+(\d+)"[^>]*?><f>Header!B3</f>', xml)})
+    if not starts or starts[0] != 2:
+        raise AssertionError(
+            f"{part}: no block-group header at row 2 — template layout changed, "
+            "update _SHEET_LAYOUT")
+    while len(starts) < _N_GROUPS:
+        starts.append(starts[-1] + pitch)
+    return starts
+
 
 def _sheet_cutoff(xml: str, part: str, n_charts: int) -> int:
     """Last worksheet row to KEEP on a presentation sheet holding `n_charts` charts.
@@ -348,20 +408,105 @@ def _sheet_cutoff(xml: str, part: str, n_charts: int) -> int:
     Supplies / LX tabs stop carrying Header!B3 on later groups, but their chart
     slots stay on the regular pitch — extrapolate.
     """
-    pitch, last_off = _SHEET_LAYOUT[part]
-    starts = sorted({int(m.group(1)) for m in re.finditer(
-        r'<c r="[A-Z]+(\d+)"[^>]*?><f>Header!B3</f>', xml)})
-    if not starts or starts[0] != 2:
-        raise AssertionError(
-            f"{part}: no block-group header at row 2 — template layout changed, "
-            "update _SHEET_LAYOUT")
-    while len(starts) < _N_GROUPS:
-        starts.append(starts[-1] + pitch)
-    g = min(max(1, (n_charts + 1) // 2), _N_GROUPS)  # two charts per group, keep >= 1
+    _pitch, last_off = _SHEET_LAYOUT[part]
+    starts = _sheet_group_starts(xml, part)
+    if part == "xl/worksheets/sheet3.xml":
+        full_pages, remainder = divmod(max(0, n_charts), 4)
+        # A partial page uses one physical row for one chart and two rows for two or
+        # three charts. Cap at the template's 15 rows; chart 30 uses the final right slot.
+        g = min(max(1, full_pages * 2 + min(remainder, 2)), _N_GROUPS)
+    else:
+        g = min(max(1, (n_charts + 1) // 2), _N_GROUPS)  # two charts/group, keep >= 1
     cutoff = starts[g - 1] + last_off
     assert g == _N_GROUPS or cutoff < starts[g], \
         f"{part}: cutoff {cutoff} overlaps group {g + 1} (row {starts[g]})"
     return cutoff
+
+
+def _terminal_print_areas(starts: list[int], n_charts: int, cutoff: int) -> list[str]:
+    """Return ordered Terminal Can print sections, each holding at most two charts.
+
+    Full four-chart chunks occupy a two-row, two-column rectangle that Excel splits
+    at the manual column break. A final one/two-chart chunk prints only the left
+    column, preventing an empty right-column page.
+    """
+    if n_charts <= 0:
+        return [f"$B$2:$D${cutoff}"]
+
+    full_pages, remainder = divmod(n_charts, 4)
+    physical_groups = full_pages * 2 + min(remainder, 2)
+    if physical_groups > _N_GROUPS:
+        return [f"$B$2:$H${cutoff}"]
+
+    areas: list[str] = []
+    full_groups = full_pages * 2 + (2 if remainder >= 3 else 0)
+    if full_groups:
+        full_end = starts[full_groups - 1] + _SHEET_LAYOUT["xl/worksheets/sheet3.xml"][1]
+        areas.append(f"$B$2:$H${full_end}")
+    if remainder in (1, 2):
+        partial_start = starts[full_pages * 2]
+        areas.append(f"$B${partial_start}:$D${cutoff}")
+    return areas
+
+
+def _apply_print_layout(xml: str, part: str, cutoff: int) -> str:
+    """Set Letter-landscape scaling and manual breaks between whole chart groups."""
+    _sheet_name, _last_col, groups_per_page, scale = _PRINT_LAYOUT[part]
+    starts = [row for row in _sheet_group_starts(xml, part) if row <= cutoff]
+    breaks = [starts[i] - 1 for i in range(groups_per_page, len(starts), groups_per_page)]
+
+    is_terminal = part == "xl/worksheets/sheet3.xml"
+    page_order = ' pageOrder="overThenDown"' if is_terminal else ""
+
+    # Terminal Cans print one chart column at 75%; two rows fit with compact margins.
+    # The other presentation sheets retain their two-column 55% layout. Width-only
+    # auto-fit is too large and can split final chart rows before a manual break.
+    xml = re.sub(
+        r'<pageSetup\b[^>]*/>',
+        f'<pageSetup paperSize="1" scale="{scale}" orientation="landscape"{page_order}/>',
+        xml,
+        count=1,
+    )
+    xml = re.sub(
+        r'<pageSetUpPr\b[^>]*/>',
+        '<pageSetUpPr autoPageBreaks="0" fitToPage="0"/>',
+        xml,
+        count=1,
+    )
+    if is_terminal:
+        xml = re.sub(r'<printOptions\b[^>]*/>', '', xml, count=1)
+        xml = re.sub(
+            r'<pageMargins\b[^>]*/>',
+            '<printOptions horizontalCentered="1" verticalCentered="0"/>'
+            '<pageMargins left="0.25" right="0.25" top="0.25" bottom="0.25" '
+            'header="0.15" footer="0.15"/>',
+            xml,
+            count=1,
+        )
+
+    # Replace any template breaks, then insert ours in worksheet-schema order directly
+    # after pageSetup (and before drawing/tableParts). Terminal Cans split before spacer
+    # column E, so the left page ends at the chart edge instead of clipping a sliver of
+    # the populated right-hand chart boundary onto the preceding page.
+    xml = re.sub(r'<rowBreaks\b.*?</rowBreaks>', '', xml, flags=re.S)
+    xml = re.sub(r'<colBreaks\b.*?</colBreaks>', '', xml, flags=re.S)
+    break_sections: list[str] = []
+    if breaks:
+        break_xml = ''.join(
+            f'<brk id="{row}" min="0" max="16383" man="1"/>' for row in breaks)
+        row_breaks = (f'<rowBreaks count="{len(breaks)}" '
+                      f'manualBreakCount="{len(breaks)}">{break_xml}</rowBreaks>')
+        break_sections.append(row_breaks)
+    if is_terminal:
+        break_sections.append(
+            '<colBreaks count="1" manualBreakCount="1">'
+            '<brk id="4" min="0" max="1048575" man="1"/>'
+            '</colBreaks>'
+        )
+    if break_sections:
+        break_xml = ''.join(break_sections)
+        xml = re.sub(r'(<pageSetup\b[^>]*/>)', rf'\1{break_xml}', xml, count=1)
+    return xml
 
 
 def _truncate_rows(xml: str, cutoff: int) -> str:
@@ -748,10 +893,12 @@ def inject(template_path: Path, dmp_design: DMPDesign, output_path: Path) -> Non
     sheet_drop_rids: dict[str, set[str]] = {}     # sheet part -> tablePart rIds to remove
     rels_drop_names: dict[str, set[str]] = {}     # rels part -> table basenames to remove
     drawing_cutoffs: dict[str, int] = {}          # drawing part -> its sheet's cutoff
+    group_starts: dict[str, list[int]] = {}       # sheet part -> physical chart-row starts
     with zipfile.ZipFile(template_path) as ztpl:
         for sheet_part, n_charts in chart_counts.items():
-            cutoff = _sheet_cutoff(ztpl.read(sheet_part).decode("utf-8"),
-                                   sheet_part, n_charts)
+            sheet_xml = ztpl.read(sheet_part).decode("utf-8")
+            group_starts[sheet_part] = _sheet_group_starts(sheet_xml, sheet_part)
+            cutoff = _sheet_cutoff(sheet_xml, sheet_part, n_charts)
             cutoffs[sheet_part] = cutoff
             rels_part = sheet_part.replace("worksheets/", "worksheets/_rels/") + ".rels"
             for rm in _re.finditer(r"<Relationship\b[^>]*?/>",
@@ -772,6 +919,17 @@ def inject(template_path: Path, dmp_design: DMPDesign, output_path: Path) -> Non
                             f"table {name} ({lo}:{hi}) straddles cutoff {cutoff} on {sheet_part}"
                 elif "/drawings/" in target:
                     drawing_cutoffs["xl/drawings/" + name] = cutoff
+
+    # Print areas live in workbook.xml (which is overlaid from openpyxl's save), while
+    # page setup and manual breaks live in each presentation sheet's preserved XML.
+    # Keep both halves driven by the same consolidation cutoffs.
+    for sheet_part, cutoff in cutoffs.items():
+        sheet_name, last_col, _groups_per_page, _scale = _PRINT_LAYOUT[sheet_part]
+        if sheet_part == "xl/worksheets/sheet3.xml":
+            wb[sheet_name].print_area = _terminal_print_areas(
+                group_starts[sheet_part], chart_counts[sheet_part], cutoff)
+        else:
+            wb[sheet_name].print_area = f"$B$2:${last_col}${cutoff}"
 
     with NamedTemporaryFile(delete=False, suffix=".xlsx") as tmpf:
         openpyxl_tmp_path = Path(tmpf.name)
@@ -836,6 +994,7 @@ def inject(template_path: Path, dmp_design: DMPDesign, output_path: Path) -> Non
                     xml = PRESENTATION_REWRITERS[item](xml)
                     xml = _drop_table_parts(xml, sheet_drop_rids.get(item, set()))
                     xml = _truncate_rows(xml, cutoffs[item])
+                    xml = _apply_print_layout(xml, item, cutoffs[item])
                     zout.writestr(item, xml.encode("utf-8"))
                     continue
                 data = overlays.get(item, zin.read(item))
