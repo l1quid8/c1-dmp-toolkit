@@ -22,29 +22,29 @@
 ## Task 1: Baselines and merge
 
 - [x] Run both source suites using the existing virtual environment; record any pre-existing failures.
-- [ ] Merge riser with `--no-commit --no-ff`; reconcile overlapping app, editor, session, validation, and generation code without wholesale ours/theirs resolution.
-- [ ] Preserve independent changes even when Git merges a file without a conflict.
+- [x] Merge riser with `--no-commit --no-ff`; reconcile overlapping app, editor, session, validation, and generation code without wholesale ours/theirs resolution.
+- [x] Preserve independent changes even when Git merges a file without a conflict.
 
 ## Task 2: Cross-feature persistence and editor behavior
 
 - [x] Write failing tests for schema-1, RemoteLink-schema-2, and riser-schema-2 migration into a combined project.
 - [x] Prove normal save/load and recovery retain RemoteLink config/zone overrides plus riser connections/layout.
 - [x] Update schema and reconcile topology mutations so zone override values survive structural edits.
-- [ ] Confirm both RISER and REMOTELINK editors and their generation actions coexist, including invalidation/refresh after topology changes.
-- [ ] Run relevant session, topology, validation, RemoteLink, and editor integration tests; commit the riser merge.
+- [x] Confirm both RISER and REMOTELINK editors and their generation actions coexist, including invalidation/refresh after topology changes.
+- [x] Run relevant session, topology, validation, RemoteLink, and editor integration tests; commit the riser merge.
 
 ## Task 3: Print-layout integration
 
-- [ ] Merge print-layout checkpoint with `--no-commit --no-ff`.
-- [ ] Reconcile injector and door-chart test changes with riser ordering and eight-port support.
-- [ ] Add behavioral regression coverage where the two change sets interact; run all chart/worksheet tests and commit the merge.
+- [x] Merge print-layout checkpoint with `--no-commit --no-ff`.
+- [x] Reconcile injector and door-chart test changes with riser ordering and eight-port support.
+- [x] Add behavioral regression coverage where the two change sets interact; run all chart/worksheet tests and commit the merge.
 
 ## Task 4: Release preparation and verification
 
-- [ ] Prepare version 1.4.0 (new riser feature on top of already tagged 1.3.0); document compatibility and draft release notes with the established formatting.
-- [ ] Run full pytest suite, import/compile checks, combined editor smoke test, and synthetic generation tests.
-- [ ] Independently review integration diff for dropped feature paths and data loss; fix and recheck actionable findings.
-- [ ] Verify all three original commits are ancestors, working tree is clean, and source branches are unchanged. Report any untested platform/release checks without claiming publication.
+- [x] Prepare version 1.4.0 (new riser feature on top of already tagged 1.3.0); document compatibility and draft release notes with the established formatting.
+- [x] Run full pytest suite, import/compile checks, combined editor smoke test, and synthetic generation tests.
+- [x] Independently review integration diff for dropped feature paths and data loss; fix and recheck actionable findings.
+- [x] Verify all three original commits are ancestors and source branches are unchanged; commit the reviewed preparation and confirm a clean integration checkout. Report untested platform/release checks without claiming publication.
 
 ## Execution notes
 
@@ -57,3 +57,10 @@
 - Independent persistence review reproduced three inherited riser risks. Five failing regressions pin exact legacy splitter-ID collisions, pre-drawing graph loss during save/recovery, last-edge resurrection, and lossy legacy refresh of canonical drafts. Fixes preserve canonical graph ownership and reject ID collisions before any mutation.
 - UI merge resolved; 16 new editor tests cover both tabs/four actions, combined warnings, read-only RemoteLink preview, project-independent inspector, undo/redo, and narrow-window footer/sheet layout.
 - Print reconciliation runs in a separate detached scratch worktree from `746b4eb`, merging `eaa8885`. Its verified merge commit will join the integration branch after the first merge, preserving both original histories.
+- First integration merge `7465eac`: 464 tests passed, 6 private-corpus tests skipped; visual demo verified both editors and four output actions. Follow-up `b701a21` closes direct-import last-edge deletion and passes 44 focused tests plus scoped review.
+- Chart scratch merge `233ce00`: checkpoint code retained (only anonymized/corrected comments differ), 13 new interaction tests, 68 chart/worksheet tests passed; controller independently reran 30 chart tests successfully. It merged into integration without conflicts.
+- Combined merge `8684b5f`: all 482 tests passed, 6 private-corpus tests skipped, 5 existing PyMuPDF deprecation warnings. Independent final review then identified wiring-note dirty tracking and RemoteLink keypad edits clearing riser undo history; release preparation remains open until both regressions are fixed and rechecked.
+- First macOS preview built successfully with version 1.4.0, both feature module families, and the unchanged RemoteLink template. Strict ad-hoc signature verification passes after copying without Finder metadata outside the synced workspace. The source app was visually tested with isolated fabricated data; packaged-runtime and Windows/RemoteLink/Excel checks remain separate gates.
+- Final UI review regressions: five failed and the topology-history control passed before fixes; all six then passed, along with all 22 editor integration cases. Wiring-note clears compare compatibility fields as well as graph state; programming-only keypad edits use a separate callback that preserves riser history.
+- Final corrected source: 488 passed, 6 private-corpus tests skipped, 5 existing PyMuPDF warnings in 95.83 seconds; compile and whitespace checks clean. Rebuilt preview outside the synced workspace, verified bundled version/modules/template, archived and re-extracted it, and verified strict deep ad-hoc signing again. No installed application, published release, or original branch was changed.
+- Independent final scoped review: PASS, both UI blockers resolved. The temporary chart-merge checkout was removed after its commit became part of the integration history; all work remains recoverable from that history. Original RemoteLink/riser/checkpoint checkouts and the combined release-prep checkout are retained.

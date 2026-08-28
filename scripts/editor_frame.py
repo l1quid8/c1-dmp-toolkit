@@ -441,10 +441,13 @@ class EditorFrame(ctk.CTkFrame):
         for title, cls, attr in [("SPLITTERS", SplittersTab, "splitters_tab"),
                                  ("KEYPADS", KeypadsTab, "keypads_tab"),
                                  ("POWER", PowerTab, "power_tab")]:
+            programming_options = (
+                {"on_programming_change": self._on_keypad_programming_edit}
+                if cls is KeypadsTab else {})
             widget = cls(self.tabs.tab(title), self.session, self._on_design_edit,
                          on_structure_change=self._on_structure_change,
                          on_hardware_change=self.apply_hardware_change,
-                         on_navigate=self.tabs.set)
+                         on_navigate=self.tabs.set, **programming_options)
             widget.grid(row=0, column=0, sticky="nsew")
             setattr(self, attr, widget)
 
@@ -586,6 +589,11 @@ class EditorFrame(ctk.CTkFrame):
     def _on_remotelink_edit(self):
         self.mark_dirty()
         self.refresh_validation()
+
+    def _on_keypad_programming_edit(self):
+        """Programming edits update the receipt without rebasing riser history."""
+        self._on_remotelink_edit()
+        self._refresh_remotelink_receipt()
 
     def _refresh_remotelink_receipt(self):
         tab = getattr(self, "remotelink_tab", None)

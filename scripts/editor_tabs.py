@@ -1022,13 +1022,15 @@ class SplittersTab(ctk.CTkFrame):
                       if splitter.splitter_type == "KP"
                       else DevicePortRef("MSP", f"LX{_bus_label(val).split()[0]}"))
         before = _graph_signature(design)
+        before_inputs = dict(splitter.inputs or {})
         try:
             set_splitter_input(design, splitter.id, source)
         except TopologyError as exc:
             messagebox.showwarning("Connection not allowed", str(exc))
             self.refresh()
             return
-        if _graph_signature(design) != before:
+        if (_graph_signature(design) != before
+                or splitter.inputs != before_inputs):
             self.session.topology_confirmed = False
             self.on_change()
             self._schedule_topology_rebuild()
@@ -1036,13 +1038,15 @@ class SplittersTab(ctk.CTkFrame):
     def _set_output(self, splitter, index: int, value: str):
         design = self.session.design
         before = _graph_signature(design)
+        before_outputs = list(splitter.outputs or [])
         try:
             set_splitter_output(design, splitter.id, index, value)
         except TopologyError as exc:
             messagebox.showwarning("Connection not allowed", str(exc))
             self.refresh()
             return
-        if _graph_signature(design) != before:
+        if (_graph_signature(design) != before
+                or splitter.outputs != before_outputs):
             self.session.topology_confirmed = False
             self.on_change()
             self._schedule_topology_rebuild()
@@ -1206,10 +1210,12 @@ class SplittersTab(ctk.CTkFrame):
 class KeypadsTab(ctk.CTkFrame):
     def __init__(self, master, session: Session, on_change,
                  on_structure_change=None, on_hardware_change=None, *,
-                 on_navigate: Callable[[str], None] | None = None):
+                 on_navigate: Callable[[str], None] | None = None,
+                 on_programming_change: Callable[[], None] | None = None):
         super().__init__(master, fg_color="transparent")
         self.session = session
         self.on_change = on_change
+        self.on_programming_change = on_programming_change or on_change
         self.on_structure_change = on_structure_change or on_change
         # Removals route through here so the editor can report cascade fallout;
         # falls back to a plain mutate + structure-refresh when unset.
@@ -1398,7 +1404,7 @@ class KeypadsTab(ctk.CTkFrame):
             # The default displayed-area shape changes with device type.
             # Rebuild after the menu callback returns so its entry reflects it.
             self.after_idle(self.refresh)
-        self.on_change()
+        self.on_programming_change()
 
     def _set_source(self, kp, value: str):
         design = self.session.design

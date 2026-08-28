@@ -22,7 +22,7 @@ from rl_injector.rl_config import RLKeypad, RemoteLinkConfig
 from session import Session, sync_master_zones
 from test_riser_scene import branched_design
 from tk_compat import install_scrollbar_redraw_fix
-from topology_service import connect
+from topology_service import connect, set_splitter_input
 from validation import Issue, badge_counts_by_severity, validate_design
 
 
@@ -284,6 +284,97 @@ def test_help_inspector_opens_without_a_project(editor):
     assert button(dialog, "Inspect").cget("state") == "normal"
     assert button(dialog, "Save Summary…").cget("state") == "disabled"
     button(dialog, "Close").invoke()
+
+
+@pytest.mark.parametrize("port", ["input", "output"])
+def test_compatibility_only_clear_notifies_editor_once(editor, port):
+    frame, _calls = editor
+    design = frame.session.design
+    splitter = next(s for s in design.splitters if s.id == "710-LX500-1")
+    if port == "input":
+        set_splitter_input(design, splitter.id, None)
+        splitter.inputs = {"LX-Bus In": "FROM EXISTING FIELD TAP"}
+        clear = lambda: frame.splitters_tab._set_input(splitter, "")
+    else:
+        splitter.outputs[2] = "TO EXISTING FIELD TAP"
+        clear = lambda: frame.splitters_tab._set_output(splitter, 2, "Spare")
+    frame.refresh_all_tabs()
+    frame.session.topology_confirmed = True
+    frame.dirty = False
+    before_graph = copy.deepcopy(design.connections)
+    before_epoch = frame.edit_epoch
+
+    clear()
+
+    assert splitter.inputs == {} if port == "input" else splitter.outputs[2] == "Spare"
+    assert design.connections == before_graph
+    assert frame.dirty, "compatibility-only edits must be saved and recovered"
+    assert frame.edit_epoch == before_epoch + 1
+    assert not frame.session.topology_confirmed
+    assert frame.splitters_tab._topo_after is not None
+
+    # Repeating the same clear is a genuine no-op, not another edit.
+    frame.dirty = False
+    frame.session.topology_confirmed = True
+    clear()
+    assert frame.edit_epoch == before_epoch + 1
+    assert not frame.dirty
+    assert frame.session.topology_confirmed
+
+
+@pytest.mark.parametrize("field,value", [
+    ("name", "LOBBY"), ("device_type", "zone_expander"), ("disp_areas", "invalid"),
+])
+def test_keypad_programming_preserves_riser_undo(editor, field, value):
+    frame, _calls = editor
+    document = frame.session.design.riser_document
+    element_id = "device:KEYPAD-2"
+    original_xy = (document.elements[element_id].x, document.elements[element_id].y)
+    frame.riser_tab.selected = ("element", element_id)
+    frame.riser_tab.nudge(18, 0)
+    assert document.elements[element_id].x == original_xy[0] + 18
+    before_epoch = frame.edit_epoch
+    frame.dirty = False
+    keypad = next(k for k in frame.session.design.keypads if k.number == 2)
+
+    frame.keypads_tab._set_rl_field(keypad, field, value)
+    frame.root.update_idletasks()  # device-type edits defer rebuilding their card
+
+    assert frame.dirty
+    assert frame.edit_epoch == before_epoch + 1
+    assert frame.session.topology_confirmed
+    if field == "name":
+        assert "2 (LOBBY)" in frame.remotelink_tab.receipt.get("1.0", "end")
+    elif field == "disp_areas":
+        labels = [w.cget("text") for w in descendants(frame._issue_chips)
+                  if isinstance(w, ctk.CTkLabel)]
+        assert any("REMOTELINK" in text for text in labels)
+    else:
+        assert frame.session.remotelink.keypads[2].disp_areas == "00"
+
+    frame.riser_tab.undo()
+
+    assert (document.elements[element_id].x, document.elements[element_id].y) == original_xy
+    assert getattr(frame.session.remotelink.keypads[2], field) == value
+    assert frame.session.design.zones[0].rl_type == "EX"
+
+
+def test_keypad_source_edit_still_invalidates_riser_history(editor):
+    frame, _calls = editor
+    design = frame.session.design
+    frame.riser_tab.selected = ("element", "device:KEYPAD-2")
+    frame.riser_tab.nudge(18, 0)
+    assert frame.riser_tab.controller.can_undo
+    moved_x = design.riser_document.elements["device:KEYPAD-2"].x
+    keypad = next(k for k in design.keypads if k.number == 2)
+
+    frame.keypads_tab._set_source(keypad, "")
+
+    assert not frame.riser_tab.controller.can_undo
+    assert not frame.session.topology_confirmed
+    frame.riser_tab.undo()
+    assert not any(edge.target.device_id == "KEYPAD-2" for edge in design.connections)
+    assert design.riser_document.elements["device:KEYPAD-2"].x == moved_x
 
 
 @pytest.mark.parametrize("width,height", [(1000, 680), (860, 560)])
