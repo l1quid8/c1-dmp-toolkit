@@ -220,6 +220,19 @@ def test_renumber_splitter_types_are_independent():
     assert {s.id for s in d.splitters} == {"710-LX500-2", "710-KP-1"}
 
 
+def test_renumber_splitter_preserves_lx_bus_and_scopes_duplicate_number_to_bus():
+    d = DMPDesign(splitters=[
+        Splitter("710-LX500-2", "LX", outputs=["Spare"] * 3),
+        Splitter("710-LX600-1", "LX", outputs=["Spare"] * 3),
+    ])
+
+    renumber_splitter(d, "710-LX600-1", 2)
+
+    assert {splitter.id for splitter in d.splitters} == {
+        "710-LX500-2", "710-LX600-2"
+    }
+
+
 # -------- keypads --------
 
 def test_add_keypad_numbering_and_capacity():

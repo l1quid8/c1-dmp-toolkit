@@ -36,15 +36,16 @@ def design() -> DMPDesign:
     )
 
 
-def test_connect_enforces_bus_compatibility_and_port_occupancy():
+def test_connect_enforces_bus_compatibility_without_blocking_duplicate_ports():
     d = design()
-    edge = connect(d, DevicePortRef("MSP", "LX500"),
-                   DevicePortRef("710-LX500-1", "IN"))
+    first = connect(d, DevicePortRef("MSP", "LX500"),
+                    DevicePortRef("710-LX500-1", "IN"))
+    same_source = connect(d, DevicePortRef("MSP", "LX500"),
+                          DevicePortRef("710-LX500-2", "IN"))
+    same_target = connect(d, DevicePortRef("710-LX500-1", "OUT1"),
+                          DevicePortRef("710-LX500-2", "IN"))
 
-    assert edge in d.connections
-    with pytest.raises(TopologyError, match="already connected"):
-        connect(d, DevicePortRef("MSP", "LX500"),
-                DevicePortRef("710-LX500-2", "IN"))
+    assert d.connections == [first, same_source, same_target]
     with pytest.raises(TopologyError, match="KP splitter"):
         connect(d, DevicePortRef("MSP", "LX500"),
                 DevicePortRef("710-KP-1", "IN"))

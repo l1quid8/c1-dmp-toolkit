@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import heapq
 import re
 from dataclasses import dataclass
 
@@ -17,6 +18,8 @@ from topology_service import TopologyError, validate_connection_endpoints
 TITLE_BLOCK_WIDTH = 270.0
 PAGE_MARGIN = 54.0
 GRID = 18.0
+BRIDGE_HALF_WIDTH = 9.0
+BRIDGE_HEIGHT = 10.0
 
 
 @dataclass(frozen=True)
@@ -25,6 +28,15 @@ class Bridge:
     x: float
     y: float
     orientation: str
+
+
+@dataclass(frozen=True)
+class _RouteContact:
+    first_connection_id: str
+    second_connection_id: str
+    x: float
+    y: float
+    bridge: Bridge | None
 
 
 @dataclass(frozen=True)
@@ -70,23 +82,23 @@ def _normal_location(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _kind(device_id: str) -> str:
+def _kind(design, device_id: str) -> str:
     if device_id == "MSP":
         return "msp"
-    if device_id.startswith("710-"):
+    if any(splitter.id == device_id for splitter in design.splitters):
         return "splitter"
     if device_id.startswith("RSP-"):
         return "rsp"
     return "keypad"
 
 
-def _size(device_id: str) -> tuple[float, float]:
+def _size(design, device_id: str) -> tuple[float, float]:
     return {
         "msp": (220.0, 104.0),
         "splitter": (184.0, 80.0),
         "rsp": (220.0, 110.0),
         "keypad": (148.0, 72.0),
-    }[_kind(device_id)]
+    }[_kind(design, device_id)]
 
 
 def _branch_and_depth(design) -> tuple[dict[str, str], dict[str, int]]:
@@ -114,6 +126,19 @@ def _branch_and_depth(design) -> tuple[dict[str, str], dict[str, int]]:
     return branch, depth
 
 
+def _connection_sort_key(edge):
+    match = re.fullmatch(r"OUT(\d+)", edge.source.port_id)
+    port_order = int(match.group(1)) if match else 0
+    return (
+        edge.source.device_id,
+        port_order,
+        edge.source.port_id,
+        edge.target.device_id,
+        edge.target.port_id,
+        edge.id,
+    )
+
+
 def _snap(value: float) -> float:
     return round(value / GRID) * GRID
 
@@ -121,9 +146,11 @@ def _snap(value: float) -> float:
 def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserDocument:
     """Create a deterministic location-first 24x36 electrical scene."""
     document = default_riser_document(design)
+    source_z_order: list[str] = []
     if title_source is not None:
         document.title_block = title_source.title_block
         document.annotations = list(title_source.annotations)
+        source_z_order = list(title_source.z_order)
     drawing_left = PAGE_MARGIN
     drawing_right = document.page_width - TITLE_BLOCK_WIDTH - PAGE_MARGIN
     drawing_width = drawing_right - drawing_left
@@ -149,24 +176,41 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
     for device_id in device_ids:
         location_devices.setdefault(locations[device_id], []).append(device_id)
 
-    H_GAP = 54.0
-    V_GAP = 126.0
-    FRAME_X = 30.0
-    FRAME_TOP = 70.0
-    FRAME_BOTTOM = 26.0
+    H_GAP = 36.0
+    # Three independent splitter outputs need distinct orthogonal lanes
+    # between vertically stacked devices. A 36-point gap left only four
+    # points after symbol clearances and forced cables through the next 710.
+    V_GAP = 54.0
+    FRAME_X = 24.0
+    FRAME_TOP = 50.0
+    FRAME_BOTTOM = 18.0
 
     def module_geometry(location: str, members: list[str]):
         rows: dict[int, list[str]] = {}
         for device_id in members:
             rows.setdefault(depth[device_id], []).append(device_id)
-        ordered_rows = []
+        ordered_rows: list[list[str]] = []
+        maximum_inner_width = drawing_width - FRAME_X * 2
         for level in sorted(rows):
             ordered = sorted(rows[level], key=lambda item: (
                 {"kp": 0, "root": 1, "lx": 2}.get(branch[item], 1), item))
-            ordered_rows.append(ordered)
-        row_widths = [sum(_size(item)[0] for item in row) +
+            current: list[str] = []
+            current_width = 0.0
+            for item in ordered:
+                item_width = _size(design, item)[0]
+                added = item_width if not current else H_GAP + item_width
+                if current and current_width + added > maximum_inner_width:
+                    ordered_rows.append(current)
+                    current, current_width = [], 0.0
+                    added = item_width
+                current.append(item)
+                current_width += added
+            if current:
+                ordered_rows.append(current)
+        row_widths = [sum(_size(design, item)[0] for item in row) +
                       H_GAP * max(0, len(row) - 1) for row in ordered_rows]
-        row_heights = [max(_size(item)[1] for item in row) for row in ordered_rows]
+        row_heights = [max(_size(design, item)[1] for item in row)
+                       for row in ordered_rows]
         label_width = min(drawing_width, len(location) * 9.5 + FRAME_X * 2)
         width = max(max(row_widths, default=220.0) + FRAME_X * 2,
                     label_width)
@@ -176,7 +220,7 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
         for row, row_width, row_height in zip(ordered_rows, row_widths, row_heights):
             x = (width - row_width) / 2
             for device_id in row:
-                item_width, item_height = _size(device_id)
+                item_width, item_height = _size(design, device_id)
                 local_positions[device_id] = (x, y + (row_height - item_height) / 2)
                 x += item_width + H_GAP
             y += row_height + V_GAP
@@ -188,7 +232,7 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
     module_origins: dict[str, tuple[float, float]] = {}
     root_width, root_height, _root_positions = modules[root_location]
     root_x = drawing_left + (drawing_width - root_width) / 2
-    root_y = 108.0
+    root_y = 72.0
     module_origins[root_location] = (_snap(root_x), _snap(root_y))
 
     def lane(location: str) -> int:
@@ -199,40 +243,87 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
             return 2
         return 1
 
-    remaining = [location for location in location_devices if location != root_location]
-    by_rank: dict[int, list[str]] = {}
-    for location in remaining:
-        by_rank.setdefault(min(depth[item] for item in location_devices[location]), []).append(location)
+    remaining = {location for location in location_devices if location != root_location}
+    adjacency: dict[str, set[str]] = {location: set() for location in remaining}
+    indegree = {location: 0 for location in remaining}
+    for edge in design.connections:
+        source_location = locations.get(edge.source.device_id)
+        target_location = locations.get(edge.target.device_id)
+        if (source_location == target_location or target_location not in remaining
+                or source_location == root_location or source_location not in remaining):
+            continue
+        if target_location not in adjacency[source_location]:
+            adjacency[source_location].add(target_location)
+            indegree[target_location] += 1
 
-    cursor_y = root_y + root_height + 126.0
-    MODULE_GAP = 54.0
-    ROW_GAP = 108.0
-    for rank in sorted(by_rank):
-        pending = sorted(by_rank[rank], key=lambda location: (lane(location), location))
-        rows: list[list[str]] = []
-        current: list[str] = []
-        current_width = 0.0
-        for location in pending:
-            width = modules[location][0]
-            added = width if not current else width + MODULE_GAP
-            if current and current_width + added > drawing_width:
-                rows.append(current)
-                current, current_width = [], 0.0
-                added = width
-            current.append(location)
-            current_width += added
-        if current:
-            rows.append(current)
-        for row in rows:
-            row_width = sum(modules[location][0] for location in row) + \
-                MODULE_GAP * max(0, len(row) - 1)
-            x = drawing_left + max(0.0, (drawing_width - row_width) / 2)
-            row_height = max(modules[location][1] for location in row)
-            for location in row:
-                width, height, _positions = modules[location]
-                module_origins[location] = (_snap(x), _snap(cursor_y + (row_height - height) / 2))
-                x += width + MODULE_GAP
-            cursor_y += row_height + ROW_GAP
+    def location_sort_key(location: str):
+        return (min(depth[item] for item in location_devices[location]),
+                lane(location), location)
+
+    ready = sorted((location for location in remaining if indegree[location] == 0),
+                   key=location_sort_key)
+    ordered_locations: list[str] = []
+    while ready:
+        location = ready.pop(0)
+        ordered_locations.append(location)
+        for target_location in sorted(adjacency[location], key=location_sort_key):
+            indegree[target_location] -= 1
+            if indegree[target_location] == 0:
+                ready.append(target_location)
+                ready.sort(key=location_sort_key)
+    ordered_locations.extend(sorted(remaining - set(ordered_locations),
+                                    key=location_sort_key))
+
+    MODULE_GAP = 36.0
+    ROW_GAP = 54.0
+    packed_rows: list[list[str]] = []
+    current_row: list[str] = []
+    current_width = 0.0
+    for location in ordered_locations:
+        width = modules[location][0]
+        added = width if not current_row else MODULE_GAP + width
+        if current_row and current_width + added > drawing_width:
+            packed_rows.append(current_row)
+            current_row, current_width = [], 0.0
+            added = width
+        current_row.append(location)
+        current_width += added
+    if current_row:
+        packed_rows.append(current_row)
+
+    cursor_y = root_y + root_height + ROW_GAP
+    for row in packed_rows:
+        row_width = sum(modules[location][0] for location in row) + \
+            MODULE_GAP * max(0, len(row) - 1)
+        x = drawing_left + max(0.0, (drawing_width - row_width) / 2)
+        row_height = max(modules[location][1] for location in row)
+        for location in row:
+            width, _height, _positions = modules[location]
+            module_origins[location] = (_snap(x), _snap(cursor_y))
+            x += width + MODULE_GAP
+        cursor_y += row_height + ROW_GAP
+
+    # Sparse risers previously clung to the top edge of the 24x36 sheet,
+    # leaving most of the page blank below the last location module.  Keep
+    # the topology-driven packing intact and translate the completed block
+    # as one unit so the vertical whitespace is balanced.  Dense drawings
+    # that consume the printable height are deliberately left untouched.
+    content_top = min(y for _x, y in module_origins.values())
+    content_bottom = max(
+        module_origins[location][1] + modules[location][1]
+        for location in module_origins
+    )
+    printable_top = PAGE_MARGIN
+    printable_bottom = document.page_height - PAGE_MARGIN
+    content_height = content_bottom - content_top
+    printable_height = printable_bottom - printable_top
+    if content_height < printable_height:
+        balanced_top = printable_top + (printable_height - content_height) / 2
+        shift_y = _snap(balanced_top - content_top)
+        module_origins = {
+            location: (x, y + shift_y)
+            for location, (x, y) in module_origins.items()
+        }
 
     positions: dict[str, tuple[float, float]] = {}
     for location, members in location_devices.items():
@@ -245,7 +336,7 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
 
     for device_id in _device_ids(design):
         x, y = positions[device_id]
-        width, height = _size(device_id)
+        width, height = _size(design, device_id)
         element = RiserElement(
             id=f"device:{device_id}", kind="device", ref=device_id,
             x=x, y=y, width=width, height=height,
@@ -265,32 +356,80 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
 
     location_ids = sorted(k for k, e in document.elements.items() if e.kind == "location")
     device_ids = [f"device:{d}" for d in _device_ids(design)]
-    document.z_order = location_ids + device_ids + [a.id for a in document.annotations]
+    scene_ids = location_ids + device_ids
+    annotation_ids = [annotation.id for annotation in document.annotations]
+    if title_source is None:
+        document.z_order = scene_ids + annotation_ids
+    else:
+        # Re-layout replaces electrical geometry, but markup remains the
+        # user's presentation state. Anchor each annotation to the nearest
+        # preceding live scene object so back/front/interleaved stacking
+        # survives while new or removed hardware is merged safely.
+        live_scene_ids = set(scene_ids)
+        live_annotation_ids = set(annotation_ids)
+        leading_annotations: list[str] = []
+        annotations_after: dict[str, list[str]] = {}
+        seen_annotations: set[str] = set()
+        previous_scene_id: str | None = None
+        for item_id in source_z_order:
+            if item_id in live_scene_ids:
+                previous_scene_id = item_id
+            elif item_id in live_annotation_ids and item_id not in seen_annotations:
+                seen_annotations.add(item_id)
+                if previous_scene_id is None:
+                    leading_annotations.append(item_id)
+                else:
+                    annotations_after.setdefault(previous_scene_id, []).append(item_id)
+        merged_order = list(leading_annotations)
+        for scene_id in scene_ids:
+            merged_order.append(scene_id)
+            merged_order.extend(annotations_after.get(scene_id, ()))
+        merged_order.extend(
+            annotation_id for annotation_id in annotation_ids
+            if annotation_id not in seen_annotations
+        )
+        document.z_order = merged_order
     obstacles = [e for e in document.elements.values() if e.kind == "device"]
-    for edge in design.connections:
+    reserved_segments = []
+    routed_connections: dict[str, RiserRoute] = {}
+    for edge in sorted(design.connections, key=_connection_sort_key):
         source = document.elements.get(f"device:{edge.source.device_id}")
         target = document.elements.get(f"device:{edge.target.device_id}")
         if not source or not target:
             continue
-        start = port_point(source, edge.source.port_id, output=True)
-        end = port_point(target, edge.target.port_id, output=False)
-        points = route_connection(start, end, obstacles, source_ref=source.ref, target_ref=target.ref)
-        document.routes[edge.id] = RiserRoute(edge.id, points)
+        points = route_topology_connection(
+            edge, source, target, obstacles,
+            reserved_segments=reserved_segments,
+        )
+        routed_connections[edge.id] = RiserRoute(edge.id, points)
+        reserved_segments.extend(_route_segments(points))
+    # Routing order is deliberately canonical, while serialized/display
+    # order continues to mirror the domain graph for compatibility.
+    document.routes = {
+        edge.id: routed_connections[edge.id]
+        for edge in design.connections
+        if edge.id in routed_connections
+    }
     _place_route_labels(design, document)
     return document
 
 
 def port_point(element: RiserElement, port_id: str, *, output: bool) -> tuple[float, float]:
     if element.ref == "MSP":
-        order = {"KP BUS": 0.18, "PROG": 0.34, "LX500": 0.55,
-                 "LX600": 0.68, "LX700": 0.81, "LX800": 0.88, "LX900": 0.94}
-        return (_snap(element.x + element.width * order.get(port_id, 0.5)),
-                _snap(element.y + element.height))
+        # These seven targets must remain distinct at editor fit zoom. Do not
+        # grid-snap them: snapping previously collapsed LX800 and LX900 onto
+        # the same coordinate and made reconnecting to the intended bus
+        # impossible.
+        order = {"KP BUS": 0.06, "PROG": 0.207, "LX500": 0.353,
+                 "LX600": 0.5, "LX700": 0.647, "LX800": 0.793,
+                 "LX900": 0.94}
+        return (element.x + element.width * order.get(port_id, 0.5),
+                element.y + element.height)
     match = re.fullmatch(r"OUT([123])", port_id)
     if output and match:
-        return (_snap(element.x + element.width * int(match.group(1)) / 4),
-                _snap(element.y + element.height))
-    return (_snap(element.x + element.width / 2), _snap(element.y))
+        return (element.x + element.width * int(match.group(1)) / 4,
+                element.y + element.height)
+    return (element.x + element.width / 2, element.y)
 
 
 def _segment_hits_rect(a, b, rect: RiserElement, clearance: float = 12.0) -> bool:
@@ -303,77 +442,458 @@ def _segment_hits_rect(a, b, rect: RiserElement, clearance: float = 12.0) -> boo
     return False
 
 
+def _compact_route(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    compact: list[tuple[float, float]] = []
+    for point in points:
+        if compact and point == compact[-1]:
+            continue
+        if (len(compact) >= 2
+                and (compact[-2][0] == compact[-1][0] == point[0]
+                     or compact[-2][1] == compact[-1][1] == point[1])):
+            compact[-1] = point
+        else:
+            compact.append(point)
+    return compact
+
+
+def reattach_route_endpoint(points, new_endpoint: tuple[float, float], *,
+                            at_start: bool) -> list[tuple[float, float]]:
+    """Move one manual-route endpoint without moving the opposite endpoint."""
+    if not at_start:
+        return list(reversed(reattach_route_endpoint(
+            list(reversed(points)), new_endpoint, at_start=True)))
+    points = list(points)
+    if len(points) < 2:
+        return [new_endpoint]
+    old_endpoint, adjacent = points[0], points[1]
+    if new_endpoint == old_endpoint:
+        return points
+    if len(points) == 2:
+        opposite = adjacent
+        if (new_endpoint[0] == opposite[0]
+                or new_endpoint[1] == opposite[1]):
+            return [new_endpoint, opposite]
+        if old_endpoint[0] == opposite[0]:
+            bend = (opposite[0], new_endpoint[1])
+        else:
+            bend = (new_endpoint[0], opposite[1])
+        return [new_endpoint, bend, opposite]
+    points[0] = new_endpoint
+    points[1] = (
+        (new_endpoint[0], adjacent[1])
+        if old_endpoint[0] == adjacent[0]
+        else (adjacent[0], new_endpoint[1])
+    )
+    return points
+
+
+def _route_segments(points: list[tuple[float, float]]):
+    return list(zip(points, points[1:]))
+
+
+def reserved_route_segments(document: RiserDocument, *, exclude_id: str = "",
+                            live_ids: set[str] | None = None):
+    segments = []
+    for connection_id, route in document.routes.items():
+        if connection_id == exclude_id:
+            continue
+        if live_ids is not None and connection_id not in live_ids:
+            continue
+        segments.extend(_route_segments(route.points))
+    return segments
+
+
+def _collinear_overlap_length(first, second) -> float:
+    a, b = first
+    c, d = second
+    if a[1] == b[1] == c[1] == d[1]:
+        return max(
+            0.0,
+            min(max(a[0], b[0]), max(c[0], d[0]))
+            - max(min(a[0], b[0]), min(c[0], d[0])),
+        )
+    if a[0] == b[0] == c[0] == d[0]:
+        return max(
+            0.0,
+            min(max(a[1], b[1]), max(c[1], d[1]))
+            - max(min(a[1], b[1]), min(c[1], d[1])),
+        )
+    return 0.0
+
+
 def route_connection(start: tuple[float, float], end: tuple[float, float],
                      obstacles: list[RiserElement], *, source_ref: str = "",
-                     target_ref: str = "") -> list[tuple[float, float]]:
-    """Route an orthogonal connection, moving its trunk below blockers."""
-    sx, sy = start
-    tx, ty = end
-    mid_y = _snap(sy + max(54.0, (ty - sy) / 2))
-    blockers = [o for o in obstacles if o.ref not in {source_ref, target_ref}]
-    for obstacle in blockers:
-        if _segment_hits_rect((sx, mid_y), (tx, mid_y), obstacle):
-            mid_y = _snap(max(mid_y, obstacle.y + obstacle.height + 30.0))
-    candidates = [
-        [(sx, sy), (sx, mid_y), (tx, mid_y), (tx, ty)],
-        [(sx, sy), (tx, sy), (tx, ty)],
-        [(sx, sy), (sx, ty), (tx, ty)],
+                     target_ref: str = "", reserved_segments=()) -> list[tuple[float, float]]:
+    """Find a shortest obstacle-free Manhattan path on a visibility grid."""
+    if start == end:
+        return [start]
+    reserved_segments = tuple(reserved_segments)
+    reserved_horizontal: dict[float, list] = {}
+    reserved_vertical: dict[float, list] = {}
+    for segment in reserved_segments:
+        first, second = segment
+        if first[1] == second[1]:
+            reserved_horizontal.setdefault(first[1], []).append(segment)
+        elif first[0] == second[0]:
+            reserved_vertical.setdefault(first[0], []).append(segment)
+
+    def contains(point, obstacle):
+        return (obstacle.x <= point[0] <= obstacle.x + obstacle.width
+                and obstacle.y <= point[1] <= obstacle.y + obstacle.height)
+
+    blockers = [
+        obstacle for obstacle in obstacles
+        if obstacle.ref not in {source_ref, target_ref}
+        and not contains(start, obstacle) and not contains(end, obstacle)
     ]
+    xs = {start[0], end[0]}
+    ys = {start[1], end[1]}
     for obstacle in blockers:
-        left = _snap(obstacle.x - 18.0)
-        right = _snap(obstacle.x + obstacle.width + 18.0)
-        top = _snap(obstacle.y - 18.0)
-        bottom = _snap(obstacle.y + obstacle.height + 18.0)
-        candidates.extend([
-            [(sx, sy), (left, sy), (left, ty), (tx, ty)],
-            [(sx, sy), (right, sy), (right, ty), (tx, ty)],
-            [(sx, sy), (sx, top), (tx, top), (tx, ty)],
-            [(sx, sy), (sx, bottom), (tx, bottom), (tx, ty)],
-        ])
+        xs.update((obstacle.x - 18.0, obstacle.x + obstacle.width + 18.0))
+        ys.update((obstacle.y - 18.0, obstacle.y + obstacle.height + 18.0))
+    # Add an adjacent visibility lane beside every existing run. This gives
+    # Dijkstra somewhere useful to move when a direct line is already taken.
+    for first, second in reserved_segments:
+        if first[1] == second[1]:
+            ys.update((first[1] - GRID, first[1] + GRID))
+        elif first[0] == second[0]:
+            xs.update((first[0] - GRID, first[0] + GRID))
+    xs.update((min(xs) - GRID, max(xs) + GRID))
+    ys.update((min(ys) - GRID, max(ys) + GRID))
 
-    def compact(points):
-        result = []
-        for point in points:
-            if not result or point != result[-1]:
-                result.append(point)
-        return result
+    def inside_clearance(point):
+        x, y = point
+        return any(obstacle.x - 12.0 < x < obstacle.x + obstacle.width + 12.0
+                   and obstacle.y - 12.0 < y < obstacle.y + obstacle.height + 12.0
+                   for obstacle in blockers)
 
-    def clear(points):
-        return not any(_segment_hits_rect(a, b, obstacle)
-                       for a, b in zip(points, points[1:]) for obstacle in blockers)
+    nodes = {
+        (x, y) for x in sorted(xs) for y in sorted(ys)
+        if (x, y) in {start, end} or not inside_clearance((x, y))
+    }
+    neighbors: dict[tuple[float, float], list[tuple[tuple[float, float], str]]] = {
+        node: [] for node in nodes
+    }
 
-    viable = [compact(points) for points in candidates if clear(compact(points))]
-    if viable:
-        return min(viable, key=lambda points: (
-            sum(abs(b[0] - a[0]) + abs(b[1] - a[1])
-                for a, b in zip(points, points[1:])), points))
-    return compact(candidates[0])
+    def clear_segment(first, second):
+        return not any(_segment_hits_rect(first, second, obstacle, clearance=12.0)
+                       for obstacle in blockers)
+
+    columns: dict[float, list[tuple[float, float]]] = {}
+    rows: dict[float, list[tuple[float, float]]] = {}
+    for node in nodes:
+        columns.setdefault(node[0], []).append(node)
+        rows.setdefault(node[1], []).append(node)
+    for x in sorted(columns):
+        column = sorted(columns[x], key=lambda p: p[1])
+        for first, second in zip(column, column[1:]):
+            if clear_segment(first, second):
+                neighbors[first].append((second, "v"))
+                neighbors[second].append((first, "v"))
+    for y in sorted(rows):
+        row = sorted(rows[y], key=lambda p: p[0])
+        for first, second in zip(row, row[1:]):
+            if clear_segment(first, second):
+                neighbors[first].append((second, "h"))
+                neighbors[second].append((first, "h"))
+
+    queue = [(0.0, 0, start, "")]
+    distances = {(start, ""): (0.0, 0)}
+    previous = {}
+    final_state = None
+    while queue:
+        cost, bends, node, orientation = heapq.heappop(queue)
+        if distances.get((node, orientation)) != (cost, bends):
+            continue
+        if node == end:
+            final_state = (node, orientation)
+            break
+        for candidate, candidate_orientation in neighbors[node]:
+            length = abs(candidate[0] - node[0]) + abs(candidate[1] - node[1])
+            turn = bool(orientation and orientation != candidate_orientation)
+            reservations = (
+                reserved_horizontal.get(node[1], ())
+                if candidate_orientation == "h"
+                else reserved_vertical.get(node[0], ())
+            )
+            overlap = sum(
+                _collinear_overlap_length((node, candidate), reserved)
+                for reserved in reservations
+            )
+            # Positive overlap visually creates a false electrical junction.
+            # Keep it possible as a last resort on an impossibly dense sheet,
+            # but make any clear detour decisively cheaper. Perpendicular
+            # crossings remain unpenalized and receive bridge hops later.
+            congestion_cost = overlap * 1000.0
+            next_cost = cost + length + (GRID if turn else 0.0) + congestion_cost
+            next_bends = bends + int(turn)
+            state = (candidate, candidate_orientation)
+            if (next_cost, next_bends) < distances.get(state, (float("inf"), 10**9)):
+                distances[state] = (next_cost, next_bends)
+                previous[state] = (node, orientation)
+                heapq.heappush(queue, (next_cost, next_bends, candidate,
+                                       candidate_orientation))
+
+    if final_state is None:
+        # This should require malformed geometry (for example an endpoint
+        # trapped inside an unrelated footprint); validation will flag it.
+        return [start, (start[0], end[1]), end]
+
+    path = []
+    state = final_state
+    while True:
+        path.append(state[0])
+        if state == (start, ""):
+            break
+        state = previous[state]
+    path.reverse()
+
+    return _compact_route(path)
+
+
+def route_topology_connection(edge, source: RiserElement, target: RiserElement,
+                              obstacles: list[RiserElement], *,
+                              reserved_segments=()) -> list[tuple[float, float]]:
+    """Route one logical edge with clear, port-specific device leads.
+
+    The generic Manhattan router is free to leave an endpoint horizontally.
+    Doing that for several outputs on one 710 places independent cables on top
+    of each other and makes them look like a common trunk.  C1 output symbols
+    face down and input symbols face up, so reserve a short vertical lead at
+    both ends before asking the obstacle router to connect them.
+    """
+    reserved_segments = tuple(reserved_segments)
+    start = port_point(source, edge.source.port_id, output=True)
+    end = port_point(target, edge.target.port_id, output=False)
+
+    output_match = re.fullmatch(r"OUT([123])", edge.source.port_id)
+    if output_match:
+        port_number = int(output_match.group(1))
+        source_bottom = source.y + source.height
+        # Use full grid lanes where space permits.  If another device is
+        # directly below the splitter, divide the clear gap among all three
+        # stable output lanes so no lead enters its 12-point safety margin.
+        maximum_drop = GRID * 3
+        for obstacle in obstacles:
+            if obstacle.ref == source.ref or obstacle.y < source_bottom:
+                continue
+            if (obstacle.x - 12.0 <= start[0]
+                    <= obstacle.x + obstacle.width + 12.0):
+                maximum_drop = min(
+                    maximum_drop,
+                    max(12.0, obstacle.y - source_bottom - 12.0),
+                )
+        if maximum_drop >= GRID * 3:
+            drop_distance = GRID * port_number
+        else:
+            lane_spacing = max(3.0, (maximum_drop - 12.0) / 2.0)
+            drop_distance = 12.0 + lane_spacing * (port_number - 1)
+        start_lead = (start[0], start[1] + drop_distance)
+    else:
+        start_lead = (start[0], start[1] + GRID)
+
+    target_lead = (end[0], end[1] - GRID)
+
+    def build(prefix, middle_start, middle_end, suffix):
+        middle = route_connection(
+            middle_start,
+            middle_end,
+            obstacles,
+            # The explicit leads are already outside the endpoint footprints.
+            # Keep source and target in the blocker set so the middle path
+            # cannot double back through either symbol and erase the lead.
+            reserved_segments=reserved_segments,
+        )
+        return _compact_route([*prefix, *middle, *suffix])
+
+    endpoint_refs = {source.ref, target.ref}
+
+    def score(points, preference):
+        segments = _route_segments(points)
+        crossings = sum(
+            _segment_hits_rect(first, second, obstacle, clearance=0)
+            for first, second in segments
+            for obstacle in obstacles
+            if obstacle.ref not in endpoint_refs
+        )
+        overlap = sum(
+            _collinear_overlap_length(segment, reserved)
+            for segment in segments
+            for reserved in reserved_segments
+        )
+        length = sum(
+            abs(second[0] - first[0]) + abs(second[1] - first[1])
+            for first, second in segments
+        )
+        return crossings, overlap, length, len(segments), preference
+
+    standard = build(
+        [start, start_lead], start_lead,
+        target_lead, [target_lead, end],
+    )
+    if score(standard, 0)[:2] == (0, 0):
+        return standard
+
+    def side_leads(element, endpoint, *, downward):
+        direction = 1.0 if downward else -1.0
+        relevant = []
+        available = GRID * 2
+        for obstacle in obstacles:
+            if obstacle.ref in endpoint_refs:
+                continue
+            if not (obstacle.x <= endpoint[0] <= obstacle.x + obstacle.width):
+                continue
+            if downward:
+                if obstacle.y >= endpoint[1]:
+                    available = min(available, obstacle.y - endpoint[1])
+                    relevant.append(obstacle)
+                elif obstacle.y + obstacle.height > endpoint[1]:
+                    available = 0.0
+                    relevant.append(obstacle)
+            else:
+                bottom = obstacle.y + obstacle.height
+                if bottom <= endpoint[1]:
+                    available = min(available, endpoint[1] - bottom)
+                    relevant.append(obstacle)
+                elif obstacle.y < endpoint[1]:
+                    available = 0.0
+                    relevant.append(obstacle)
+        for first, second in reserved_segments:
+            if first[0] != second[0] or first[0] != endpoint[0]:
+                continue
+            low, high = sorted((first[1], second[1]))
+            if downward:
+                if low >= endpoint[1]:
+                    available = min(available, low - endpoint[1])
+                elif high > endpoint[1]:
+                    available = 0.0
+            else:
+                if high <= endpoint[1]:
+                    available = min(available, endpoint[1] - high)
+                elif low < endpoint[1]:
+                    available = 0.0
+        turn_distance = max(1.0, min(GRID, available / 2.0))
+        turn_y = endpoint[1] + direction * turn_distance
+        entry_y = endpoint[1] + direction * GRID
+        left = min([element.x, *(item.x - 12.0 for item in relevant)]) - GRID
+        right = max([
+            element.x + element.width,
+            *(item.x + item.width + 12.0 for item in relevant),
+        ]) + GRID
+        if downward:
+            return [
+                ([endpoint, (endpoint[0], turn_y), (left, turn_y), (left, entry_y)],
+                 (left, entry_y)),
+                ([endpoint, (endpoint[0], turn_y), (right, turn_y), (right, entry_y)],
+                 (right, entry_y)),
+            ]
+        return [
+            ([(left, entry_y), (left, turn_y), (endpoint[0], turn_y), endpoint],
+             (left, entry_y)),
+            ([(right, entry_y), (right, turn_y), (endpoint[0], turn_y), endpoint],
+             (right, entry_y)),
+        ]
+
+    prefixes = [([start, start_lead], start_lead), *side_leads(
+        source, start, downward=True)]
+    suffixes = [([target_lead, end], target_lead), *side_leads(
+        target, end, downward=False)]
+    candidates = [(score(standard, 0), standard)]
+    preference = 1
+    for prefix, middle_start in prefixes:
+        for suffix, middle_end in suffixes:
+            if middle_start == start_lead and middle_end == target_lead:
+                continue
+            candidate = build(prefix, middle_start, middle_end, suffix)
+            candidates.append((score(candidate, preference), candidate))
+            preference += 1
+    return min(candidates, key=lambda item: item[0])[1]
 
 
 def _segments(points):
     return list(zip(points, points[1:]))
 
 
-def find_bridges(routes: dict[str, list[tuple[float, float]]]) -> list[Bridge]:
-    bridges: list[Bridge] = []
+def _route_contacts(
+        routes: dict[str, list[tuple[float, float]]]) -> list[_RouteContact]:
+    """Find contacts between independent cable routes.
+
+    A hop needs clear line on both sides of its center. Prefer the horizontal
+    run (the established drafting convention), then use a vertical hop when a
+    horizontal run ends at the contact. Contacts with no room for either hop
+    remain explicit so validation can warn instead of drawing a false junction.
+    Segments from one route are never compared, so its own bends and electrical
+    endpoints retain their ordinary connected semantics.
+    """
+    contacts: dict[tuple[str, str, float, float], _RouteContact] = {}
     ids = sorted(routes)
+
+    def record(first_id, second_id, x, y, bridge):
+        key = (first_id, second_id, x, y)
+        prior = contacts.get(key)
+        # Multiple segment pairs can describe the same bend. Keep a bridgeable
+        # description over an uncovered one and preserve horizontal preference.
+        if (prior is None
+                or (prior.bridge is None and bridge is not None)
+                or (prior.bridge is not None and bridge is not None
+                    and prior.bridge.orientation == "vertical"
+                    and bridge.orientation == "horizontal")):
+            contacts[key] = _RouteContact(
+                first_id, second_id, x, y, bridge)
+
     for i, first_id in enumerate(ids):
         for second_id in ids[i + 1:]:
             for a1, a2 in _segments(routes[first_id]):
                 for b1, b2 in _segments(routes[second_id]):
                     a_h = a1[1] == a2[1] and a1[0] != a2[0]
                     b_h = b1[1] == b2[1] and b1[0] != b2[0]
-                    if a_h == b_h:
+                    a_v = a1[0] == a2[0] and a1[1] != a2[1]
+                    b_v = b1[0] == b2[0] and b1[1] != b2[1]
+                    if a_h and b_v or a_v and b_h:
+                        h_id, h1, h2, v_id, v1, v2 = (
+                            (first_id, a1, a2, second_id, b1, b2)
+                            if a_h else
+                            (second_id, b1, b2, first_id, a1, a2)
+                        )
+                        x, y = v1[0], h1[1]
+                        if not (min(h1[0], h2[0]) <= x <= max(h1[0], h2[0])
+                                and min(v1[1], v2[1]) <= y <= max(v1[1], v2[1])):
+                            continue
+                        horizontal_clear = min(
+                            abs(x - h1[0]), abs(x - h2[0])) >= BRIDGE_HALF_WIDTH
+                        vertical_clear = min(
+                            abs(y - v1[1]), abs(y - v2[1])) >= BRIDGE_HALF_WIDTH
+                        bridge = None
+                        if horizontal_clear:
+                            bridge = Bridge(h_id, x, y, "horizontal")
+                        elif vertical_clear:
+                            bridge = Bridge(v_id, x, y, "vertical")
+                        record(first_id, second_id, x, y, bridge)
                         continue
-                    h_id, h1, h2, v1, v2 = ((first_id, a1, a2, b1, b2)
-                                             if a_h else (second_id, b1, b2, a1, a2))
-                    x, y = v1[0], h1[1]
-                    if (min(h1[0], h2[0]) < x < max(h1[0], h2[0]) and
-                            min(v1[1], v2[1]) < y < max(v1[1], v2[1])):
-                        bridge = Bridge(h_id, x, y, "horizontal")
-                        if bridge not in bridges:
-                            bridges.append(bridge)
-    return sorted(bridges, key=lambda b: (b.connection_id, b.y, b.x))
+
+                    # Collinear overlap or endpoint contact cannot accept a
+                    # transparent hop. Surface it through validation.
+                    if a_h and b_h and a1[1] == b1[1]:
+                        low = max(min(a1[0], a2[0]), min(b1[0], b2[0]))
+                        high = min(max(a1[0], a2[0]), max(b1[0], b2[0]))
+                        if low <= high:
+                            record(first_id, second_id, (low + high) / 2,
+                                   a1[1], None)
+                    elif a_v and b_v and a1[0] == b1[0]:
+                        low = max(min(a1[1], a2[1]), min(b1[1], b2[1]))
+                        high = min(max(a1[1], a2[1]), max(b1[1], b2[1]))
+                        if low <= high:
+                            record(first_id, second_id, a1[0],
+                                   (low + high) / 2, None)
+    return sorted(contacts.values(), key=lambda item: (
+        item.first_connection_id, item.second_connection_id, item.y, item.x))
+
+
+def find_bridges(routes: dict[str, list[tuple[float, float]]]) -> list[Bridge]:
+    bridges = {contact.bridge for contact in _route_contacts(routes)
+               if contact.bridge is not None}
+    return sorted(bridges, key=lambda b: (
+        b.connection_id, b.y, b.x, b.orientation))
 
 
 def sync_riser_document(design, document: RiserDocument) -> None:
@@ -388,18 +908,43 @@ def sync_riser_document(design, document: RiserDocument) -> None:
     document.unplaced = [d for d in document.unplaced if d in live and d not in existing]
     obstacles = [e for e in document.elements.values()
                  if e.kind == "device" and not e.stale]
-    for edge in design.connections:
-        if edge.id in document.routes:
-            continue
+    live_connection_ids = {edge.id for edge in design.connections}
+    for edge in sorted(design.connections, key=_connection_sort_key):
         source = document.elements.get(f"device:{edge.source.device_id}")
         target = document.elements.get(f"device:{edge.target.device_id}")
         if source is None or target is None:
             continue
         start = port_point(source, edge.source.port_id, output=True)
         end = port_point(target, edge.target.port_id, output=False)
-        document.routes[edge.id] = RiserRoute(
-            edge.id, route_connection(start, end, obstacles,
-                                      source_ref=source.ref, target_ref=target.ref))
+        route = document.routes.get(edge.id)
+        reserved_segments = reserved_route_segments(
+            document,
+            exclude_id=edge.id,
+            live_ids=live_connection_ids,
+        )
+        if route is None or len(route.points) < 2:
+            document.routes[edge.id] = RiserRoute(
+                edge.id,
+                route_topology_connection(
+                    edge, source, target, obstacles,
+                    reserved_segments=reserved_segments,
+                ),
+            )
+            continue
+        if route.points[0] == start and route.points[-1] == end:
+            continue
+        if not route.manual:
+            route.points = route_topology_connection(
+                edge, source, target, obstacles,
+                reserved_segments=reserved_segments,
+            )
+            continue
+        if route.points[0] != start:
+            route.points = reattach_route_endpoint(
+                route.points, start, at_start=True)
+        if route.points[-1] != end:
+            route.points = reattach_route_endpoint(
+                route.points, end, at_start=False)
 
 
 def _overlap(a: RiserElement, b: RiserElement) -> bool:
@@ -422,6 +967,16 @@ def _route_label_box(edge, route):
     return (x - width / 2, y - 14, x + width / 2, y + 3)
 
 
+def _location_heading_box(location: RiserElement):
+    return (
+        location.x + 8,
+        location.y + 4,
+        min(location.x + location.width - 8,
+            location.x + 12 + max(36.0, len(location.ref) * 8.0)),
+        location.y + 30,
+    )
+
+
 def route_label_point(points):
     segments = list(_segments(points))
     if not segments:
@@ -440,6 +995,10 @@ def _place_route_labels(design, document: RiserDocument) -> None:
         (element.x - 5, element.y - 5,
          element.x + element.width + 5, element.y + element.height + 5)
         for element in document.elements.values() if element.kind == "device"
+    ]
+    protected_boxes = device_boxes + [
+        _location_heading_box(element)
+        for element in document.elements.values() if element.kind == "location"
     ]
     used_boxes = []
     edges = {edge.id: edge for edge in design.connections}
@@ -462,7 +1021,7 @@ def _place_route_labels(design, document: RiserDocument) -> None:
             inside = (box[0] >= PAGE_MARGIN / 2 and box[1] >= PAGE_MARGIN / 2 and
                       box[2] <= document.page_width - TITLE_BLOCK_WIDTH - PAGE_MARGIN / 2 and
                       box[3] <= document.page_height - PAGE_MARGIN / 2)
-            if (inside and not any(_boxes_overlap(box, item) for item in device_boxes)
+            if (inside and not any(_boxes_overlap(box, item) for item in protected_boxes)
                     and not any(_boxes_overlap(box, item) for item in used_boxes)):
                 chosen = box
                 break
@@ -538,13 +1097,46 @@ def validate_riser(design, document: RiserDocument) -> list[RiserIssue]:
                 element.y + element.height > document.page_height):
             issues.append(RiserIssue("scene.off_page", "Drawing object is outside the printable area", element.id))
     devices = [e for e in document.elements.values() if e.kind == "device"]
+    locations = [e for e in document.elements.values() if e.kind == "location"]
+    for device in devices:
+        expected = _normal_location(_location(design, device.ref))
+        center = (device.x + device.width / 2, device.y + device.height / 2)
+        containers = [frame for frame in locations
+                      if frame.x <= center[0] <= frame.x + frame.width
+                      and frame.y <= center[1] <= frame.y + frame.height]
+
+        def equivalent(frame):
+            actual = _normal_location(frame.ref)
+            without_floor = re.sub(
+                r"\b\d+(?:ST|ND|RD|TH)\s+FLOOR\b", "", expected)
+            without_floor = re.sub(r"\s+", " ", without_floor).strip()
+            return actual in {expected, without_floor}
+
+        if not any(equivalent(frame) for frame in containers):
+            issues.append(RiserIssue(
+                "scene.location_mismatch",
+                f"{device.ref} is not placed in its current location: {expected}",
+                device.id))
     for index, first in enumerate(devices):
         for second in devices[index + 1:]:
             if _overlap(first, second):
                 issues.append(RiserIssue("scene.overlap", "Device symbols overlap", first.id))
     edges = {edge.id: edge for edge in design.connections}
     label_boxes = []
+    location_heading_boxes = [
+        (location.ref, _location_heading_box(location)) for location in locations
+    ]
     for route_id, route in document.routes.items():
+        if any(x < 0 or y < 0 or x > document.page_width - TITLE_BLOCK_WIDTH
+               or y > document.page_height for x, y in route.points):
+            issues.append(RiserIssue(
+                "scene.off_page", "Cable route is outside the printable drawing area",
+                route_id))
+        if any(first[0] != second[0] and first[1] != second[1]
+               for first, second in _segments(route.points)):
+            issues.append(RiserIssue(
+                "scene.nonorthogonal_route", "Cable route contains a diagonal segment",
+                route_id))
         edge = edges.get(route_id)
         if edge is None:
             continue
@@ -558,6 +1150,13 @@ def validate_riser(design, document: RiserDocument) -> list[RiserIssue]:
                     issues.append(RiserIssue(
                         "scene.label_overlap",
                         f"Cable label overlaps {device.ref}", route_id))
+                    break
+            for location_ref, heading_box in location_heading_boxes:
+                if _boxes_overlap(label_box, heading_box):
+                    issues.append(RiserIssue(
+                        "scene.label_overlap",
+                        f"Cable label overlaps the {location_ref} location heading",
+                        route_id))
                     break
         for obstacle in devices:
             if obstacle.ref in {edge.source.device_id, edge.target.device_id}:
@@ -574,6 +1173,15 @@ def validate_riser(design, document: RiserDocument) -> list[RiserIssue]:
                 issues.append(RiserIssue(
                     "scene.label_overlap", "Cable labels overlap", first_id))
                 break
+    route_points = {route_id: route.points
+                    for route_id, route in document.routes.items()}
+    for contact in _route_contacts(route_points):
+        if contact.bridge is None:
+            issues.append(RiserIssue(
+                "scene.uncovered_intersection",
+                "Independent cables meet without room for a bridge hop",
+                contact.first_connection_id,
+            ))
     for name in ("school_name", "local_code", "address", "project_title",
                  "drawing_title", "system", "sheet_number", "drawn_by",
                  "checked_by", "issue_date"):

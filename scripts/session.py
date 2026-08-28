@@ -384,8 +384,9 @@ def _session_from_dict(d: dict, path: Path) -> Session:
             "Update the app to open it."
         )
     source = d.get("source") or {}
-    design = design_from_dict(d.get("design") or {})
-    if not design.connections:
+    design_data = d.get("design") or {}
+    design = design_from_dict(design_data)
+    if version < 2 or "connections" not in design_data:
         design.connections = derive_legacy_connections(design)
     if design.riser_document is None:
         design.riser_document = default_riser_document(design)

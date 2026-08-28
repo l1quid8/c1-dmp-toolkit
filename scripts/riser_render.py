@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import base64
 import html
+import os
 import re
+import tempfile
 from pathlib import Path
 
 import fitz
 
 from paths import resource_path
-from riser_scene import TITLE_BLOCK_WIDTH, find_bridges, route_label_point
+from riser_scene import (
+    BRIDGE_HALF_WIDTH,
+    BRIDGE_HEIGHT,
+    TITLE_BLOCK_WIDTH,
+    find_bridges,
+    route_label_point,
+)
 
 
 MASTER_WIDTH = 36 * 72
@@ -48,15 +56,38 @@ def _route_path(connection_id: str, points, bridges) -> str:
         if start[1] == end[1]:
             forward = end[0] >= start[0]
             crossings = [b for b in route_bridges
-                         if min(start[0], end[0]) < b.x < max(start[0], end[0])
+                         if b.orientation == "horizontal"
+                         and min(start[0], end[0]) + BRIDGE_HALF_WIDTH <= b.x
+                         <= max(start[0], end[0]) - BRIDGE_HALF_WIDTH
                          and abs(b.y - start[1]) < 0.01]
             crossings.sort(key=lambda b: b.x, reverse=not forward)
             for bridge in crossings:
-                before = bridge.x - 9 if forward else bridge.x + 9
-                after = bridge.x + 9 if forward else bridge.x - 9
+                before = (bridge.x - BRIDGE_HALF_WIDTH if forward
+                          else bridge.x + BRIDGE_HALF_WIDTH)
+                after = (bridge.x + BRIDGE_HALF_WIDTH if forward
+                         else bridge.x - BRIDGE_HALF_WIDTH)
                 commands.append(f"L {before:.2f} {start[1]:.2f}")
                 commands.append(
-                    f"Q {bridge.x:.2f} {start[1] - 10:.2f} {after:.2f} {start[1]:.2f}")
+                    f"Q {bridge.x:.2f} {start[1] - BRIDGE_HEIGHT:.2f} "
+                    f"{after:.2f} {start[1]:.2f}")
+            commands.append(f"L {end[0]:.2f} {end[1]:.2f}")
+        elif start[0] == end[0]:
+            forward = end[1] >= start[1]
+            crossings = [b for b in route_bridges
+                         if b.orientation == "vertical"
+                         and min(start[1], end[1]) + BRIDGE_HALF_WIDTH <= b.y
+                         <= max(start[1], end[1]) - BRIDGE_HALF_WIDTH
+                         and abs(b.x - start[0]) < 0.01]
+            crossings.sort(key=lambda b: b.y, reverse=not forward)
+            for bridge in crossings:
+                before = (bridge.y - BRIDGE_HALF_WIDTH if forward
+                          else bridge.y + BRIDGE_HALF_WIDTH)
+                after = (bridge.y + BRIDGE_HALF_WIDTH if forward
+                         else bridge.y - BRIDGE_HALF_WIDTH)
+                commands.append(f"L {start[0]:.2f} {before:.2f}")
+                commands.append(
+                    f"Q {start[0] + BRIDGE_HEIGHT:.2f} {bridge.y:.2f} "
+                    f"{start[0]:.2f} {after:.2f}")
             commands.append(f"L {end[0]:.2f} {end[1]:.2f}")
         else:
             commands.append(f"L {end[0]:.2f} {end[1]:.2f}")
@@ -69,13 +100,28 @@ def _device_detail(design, ref: str) -> str:
         rsp = next((r for r in design.rsps if r.number == number), None)
         if rsp:
             zone = f"Z{min(rsp.zones)}–Z{max(rsp.zones)}" if rsp.zones else ""
-            return " · ".join(x for x in (rsp.model, zone, rsp.location or "") if x)
-    if ref.startswith("KEYPAD-"):
-        number = int(ref.split("-", 1)[1])
-        keypad = next((k for k in design.keypads if k.number == number), None)
-        return keypad.location or "" if keypad else ""
-    splitter = next((s for s in design.splitters if s.id == ref), None)
-    return splitter.location or "" if splitter else ""
+            return " · ".join(x for x in (rsp.model, zone) if x)
+    return ""
+
+
+def _is_splitter(design, ref: str) -> bool:
+    return any(splitter.id == ref for splitter in design.splitters)
+
+
+def _wrap_words(value: str, maximum_characters: int) -> list[str]:
+    words = (value or "").replace("\n", " ").split()
+    if not words:
+        return [""]
+    lines: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        if len(current) + 1 + len(word) <= maximum_characters:
+            current += f" {word}"
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
 
 
 def _svg_bytes(design, document, *, width, height, physical_width: str,
@@ -129,7 +175,7 @@ def _svg_bytes(design, document, *, width, height, physical_width: str,
         if detail:
             lines.append(f'<text x="{x + w/2:.2f}" y="{y + h/2 + 17:.2f}" text-anchor="middle" '
                          f'font-size="{13.2 if small else 13}">{_esc(detail)}</text>')
-        if element.ref.startswith("710-"):
+        if _is_splitter(design, element.ref):
             lines.append(f'<text x="{x + w/2:.2f}" y="{y + 12:.2f}" text-anchor="middle" font-size="{secondary_size}">IN</text>')
             for index in range(1, 4):
                 px = x + w * index / 4
@@ -154,7 +200,11 @@ def _svg_bytes(design, document, *, width, height, physical_width: str,
     lines.append('</g>')
 
     lines.append('<g id="markup">')
-    for annotation in document.annotations:
+    annotations = sorted(
+        document.annotations,
+        key=lambda item: (document.z_order.index(item.id)
+                          if item.id in document.z_order else len(document.z_order)))
+    for annotation in annotations:
         points = " ".join(f"{x:.2f},{y:.2f}" for x, y in annotation.points)
         stroke_width = max(annotation.stroke_width, 0.77 if small else 0.0)
         common = (f'stroke="{_esc(annotation.stroke)}" stroke-width="{stroke_width:.2f}" '
@@ -205,11 +255,22 @@ def _svg_bytes(design, document, *, width, height, physical_width: str,
     ]
     for index, revision in enumerate(tb.revisions[-6:]):
         text_rows.append((590 + index * 25, f"REV: {revision}", 11, "normal"))
+    text_width = TITLE_BLOCK_WIDTH - 60
+    text_center = tx + (TITLE_BLOCK_WIDTH - 36) / 2
     for y, text, size, weight in text_rows:
         size = max(size, secondary_size)
-        lines.append(f'<text x="{tx + (TITLE_BLOCK_WIDTH - 36)/2:.2f}" y="{y:.2f}" '
+        maximum_characters = max(8, int(text_width / max(1.0, size * 0.6)))
+        wrapped = _wrap_words(str(text or ""), maximum_characters)
+        line_height = size * 1.15
+        first_y = y - (len(wrapped) - 1) * line_height / 2
+        tspans = "".join(
+            f'<tspan x="{text_center:.2f}" y="{first_y + index * line_height:.2f}">'
+            f'{_esc(line)}</tspan>'
+            for index, line in enumerate(wrapped)
+        )
+        lines.append(f'<text x="{text_center:.2f}" y="{y:.2f}" '
                      f'text-anchor="middle" stroke="none" fill="#111" font-size="{size}" '
-                     f'font-weight="{weight}">{_esc(text)}</text>')
+                     f'font-weight="{weight}">{tspans}</text>')
     lines.append('</g></g></svg>')
     return "\n".join(lines).encode("utf-8")
 
@@ -256,8 +317,18 @@ def generate_riser_bundle(design, document, output_dir: str | Path) -> list[Path
     output_dir.mkdir(parents=True, exist_ok=True)
     slug = _slug(design.site_info.school_name or "UNTITLED")
     revision = _next_revision(output_dir, slug)
-    base = output_dir / f"{slug}_riser_rev{revision}"
-    master = render_pdf(design, document, Path(f"{base}_24x36.pdf"), profile="24x36")
-    small = render_pdf(design, document, Path(f"{base}_11x17.pdf"), profile="11x17")
-    svg = render_svg(design, document, Path(f"{base}.svg"))
-    return [master, small, svg]
+    names = [
+        f"{slug}_riser_rev{revision}_24x36.pdf",
+        f"{slug}_riser_rev{revision}_11x17.pdf",
+        f"{slug}_riser_rev{revision}.svg",
+    ]
+    with tempfile.TemporaryDirectory(prefix=f".{slug}_riser_", dir=output_dir) as staging:
+        staging_dir = Path(staging)
+        staged = [staging_dir / name for name in names]
+        render_pdf(design, document, staged[0], profile="24x36")
+        render_pdf(design, document, staged[1], profile="11x17")
+        render_svg(design, document, staged[2])
+        final = [output_dir / name for name in names]
+        for source, target in zip(staged, final):
+            os.replace(source, target)
+    return final

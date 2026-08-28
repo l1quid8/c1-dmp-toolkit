@@ -20,7 +20,7 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 import theme
-from topology_service import refresh_connections_from_legacy
+from topology_service import project_legacy_topology, prune_unknown_connections
 from hardware import snapshot_refs, diff_refs
 from session import Session, save_session, sync_master_zones, write_recovery, clear_recovery
 from validation import validate_design, badge_counts, badge_counts_by_severity
@@ -346,10 +346,14 @@ class EditorFrame(ctk.CTkFrame):
         self._recovery_job = None
         if not self.dirty:
             return
+        if hasattr(self, "riser_tab"):
+            self.riser_tab.cancel(redraw=False)
         with contextlib.suppress(Exception):
             write_recovery(self.session)
 
     def save(self) -> bool:
+        if hasattr(self, "riser_tab"):
+            self.riser_tab.cancel(redraw=False)
         try:
             save_session(self.session)
         except Exception as exc:
@@ -527,6 +531,8 @@ class EditorFrame(ctk.CTkFrame):
         sync_master_zones(self.session.design)
         self.mark_dirty()
         self.refresh_validation()
+        if hasattr(self, "power_tab"):
+            self.power_tab.sync_locations()
         if hasattr(self, "riser_tab"):
             self.riser_tab.refresh()
 
@@ -540,7 +546,9 @@ class EditorFrame(ctk.CTkFrame):
 
     def _on_structure_change(self):
         """Hardware was added or removed: every tab's choices and rows shift."""
-        refresh_connections_from_legacy(self.session.design)
+        prune_unknown_connections(self.session.design)
+        project_legacy_topology(self.session.design)
+        self.session.topology_confirmed = False
         sync_master_zones(self.session.design)
         self.mark_dirty()
         self.refresh_validation()
@@ -557,6 +565,8 @@ class EditorFrame(ctk.CTkFrame):
         """
         before = snapshot_refs(self.session.design)
         mutate()
+        prune_unknown_connections(self.session.design)
+        project_legacy_topology(self.session.design)
         changes = diff_refs(before, snapshot_refs(self.session.design))
         if changes:
             self.session.topology_confirmed = False
@@ -650,7 +660,11 @@ class EditorFrame(ctk.CTkFrame):
         summarize the open issues and let the tech choose "generate anyway"
         or jump to a problem. Generation is never blocked — the printed sheet
         is itself a review pass with the superintendent."""
-        issues = self.refresh_validation()
+        issues = validate_design(
+            self.session.design,
+            topology_confirmed=self.session.topology_confirmed,
+            for_generation=True,
+        )
         if not issues and not note:
             on_proceed()
             return

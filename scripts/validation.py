@@ -9,6 +9,7 @@ are unit-testable without Tk.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import Callable, Iterator, Optional
 
@@ -166,6 +167,25 @@ def _rule_topology_confirmed(design: DMPDesign, ctx: dict) -> Iterator[Issue]:
     )
 
 
+def _rule_duplicate_ports(design: DMPDesign, ctx: dict) -> Iterator[Issue]:
+    outgoing = Counter(edge.source for edge in design.connections)
+    incoming = Counter(edge.target for edge in design.connections)
+    for port, count in outgoing.items():
+        if count > 1:
+            yield Issue(
+                code="topology.duplicate_port", severity="error",
+                tab=TAB_SPLITTERS, ref=None,
+                message=f"{port.device_id} {port.port_id} has {count} outgoing connections",
+            )
+    for port, count in incoming.items():
+        if count > 1:
+            yield Issue(
+                code="topology.duplicate_port", severity="error",
+                tab=TAB_SPLITTERS, ref=None,
+                message=f"{port.device_id} {port.port_id} has {count} incoming connections",
+            )
+
+
 RULES: list[Callable[[DMPDesign, dict], Iterator[Issue]]] = [
     _rule_site_required,
     _rule_zone_descriptions,
@@ -176,14 +196,22 @@ RULES: list[Callable[[DMPDesign, dict], Iterator[Issue]]] = [
     _rule_topology_confirmed,
 ]
 
+GENERATION_RULES: list[Callable[[DMPDesign, dict], Iterator[Issue]]] = [
+    _rule_duplicate_ports,
+]
+
 
 # -------- entry points --------
 
-def validate_design(design: DMPDesign, *, topology_confirmed: bool = False) -> list[Issue]:
+def validate_design(design: DMPDesign, *, topology_confirmed: bool = False,
+                    for_generation: bool = False) -> list[Issue]:
     ctx = {"topology_confirmed": topology_confirmed}
     issues: list[Issue] = []
     for rule in RULES:
         issues.extend(rule(design, ctx))
+    if for_generation:
+        for rule in GENERATION_RULES:
+            issues.extend(rule(design, ctx))
     return issues
 
 

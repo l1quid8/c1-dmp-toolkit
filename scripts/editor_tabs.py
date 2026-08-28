@@ -43,11 +43,19 @@ from hardware import (
     renumber_splitter,
 )
 from session import Session
-from topology_service import refresh_connections_from_legacy
+from splitter_order import lx_bus_number as _lx_bus_number, ordered_splitters
+from riser_model import DevicePortRef
+from topology_service import (
+    TopologyError,
+    set_keypad_source,
+    set_splitter_input,
+    set_splitter_output,
+)
 from ui_widgets import (
     AutocompleteEntry,
     Card,
     Chip,
+    SearchableComboBox,
     SectionLabel,
     accent_outline_button,
     attach_tooltip,
@@ -296,7 +304,7 @@ def _menu_tone(value: str) -> str:
     return "connected"
 
 
-def _style_menu(holder: ctk.CTkFrame, menu: ctk.CTkOptionMenu, tone: str) -> None:
+def _style_menu(holder: ctk.CTkFrame, menu, tone: str) -> None:
     fill, fg, border = _MENU_TONES[tone]
     holder.configure(fg_color=fill, border_color=border)
     menu.configure(fg_color=fill, button_color=fill, text_color=fg)
@@ -313,6 +321,29 @@ def _bordered_menu(parent, values, command, *, tone: str,
         holder, values=values, width=width,
         height=theme.HEIGHT["control"] - 2,
         corner_radius=theme.RADIUS["control"],
+        fg_color=fill, button_color=fill,
+        button_hover_color=theme.HOVER_SUBTLE, text_color=fg,
+        font=theme.ui_font(theme.SIZE["chip"]),
+        dropdown_fg_color=theme.SURFACE, dropdown_text_color=theme.TEXT,
+        dropdown_hover_color=theme.HOVER_SUBTLE,
+        dropdown_font=theme.ui_font(theme.SIZE["chip"]),
+        command=command,
+    )
+    menu.pack(fill="x", padx=1, pady=1)
+    return holder, menu
+
+
+def _bordered_searchable_menu(parent, values, command, *, tone: str,
+                              width: int = 108):
+    """Searchable counterpart to _bordered_menu with the same visual recipe."""
+    fill, fg, border = _MENU_TONES[tone]
+    holder = ctk.CTkFrame(parent, fg_color=fill, border_width=1,
+                          border_color=border,
+                          corner_radius=theme.RADIUS["control"])
+    menu = SearchableComboBox(
+        holder, values=values, width=width,
+        height=theme.HEIGHT["control"] - 2,
+        corner_radius=theme.RADIUS["control"], border_width=0,
         fg_color=fill, button_color=fill,
         button_hover_color=theme.HOVER_SUBTLE, text_color=fg,
         font=theme.ui_font(theme.SIZE["chip"]),
@@ -460,6 +491,28 @@ def _keypad_source_choices(session: Session) -> list[str]:
                       if s.splitter_type == "KP"]
 
 
+def _graph_signature(design) -> tuple:
+    return tuple((edge.id, edge.source, edge.target, edge.cable_type,
+                  edge.status, edge.quantity, edge.custom_label)
+                 for edge in design.connections)
+
+
+def _wiring_device_numbers(design, pattern: re.Pattern) -> set[int]:
+    """Device numbers named by riser edges or their legacy output tokens."""
+    numbers: set[int] = set()
+    for edge in design.connections:
+        for ref in (edge.source, edge.target):
+            match = pattern.fullmatch(ref.device_id or "")
+            if match:
+                numbers.add(int(match.group(1)))
+    for splitter in design.splitters:
+        for output in splitter.outputs or []:
+            match = pattern.fullmatch((output or "").strip())
+            if match:
+                numbers.add(int(match.group(1)))
+    return numbers
+
+
 def prompt_add_keypad(root, session: Session, on_done) -> None:
     win = _dialog_shell(root, "Add keypad")
     _dialog_title(win, "Add a keypad")
@@ -479,10 +532,14 @@ def prompt_add_keypad(root, session: Session, on_done) -> None:
                      ).pack(anchor="w", padx=20, pady=(10, 0))
 
     def confirm():
+        keypad = None
         try:
-            add_keypad(session.design, loc.get().strip() or None,
-                       source_menu.get(), glob_var.get())
-        except HardwareError as exc:
+            keypad = add_keypad(session.design, loc.get().strip() or None,
+                                None, glob_var.get())
+            set_keypad_source(session.design, keypad.number, source_menu.get())
+        except (HardwareError, TopologyError) as exc:
+            if keypad is not None and keypad in session.design.keypads:
+                session.design.keypads.remove(keypad)
             messagebox.showerror("Can't add keypad", str(exc), parent=win)
             return
         win.grab_release()
@@ -518,6 +575,8 @@ class SplittersTab(ctk.CTkFrame):
         self.on_navigate = on_navigate
 
         self._cards: dict[str, ctk.CTkFrame] = {}
+        self._bus_filter = "ALL"
+        self._cards_scroll_job: str | None = None
         self._topology: Topology | None = None
         self._topo_after: str | None = None
 
@@ -572,9 +631,6 @@ class SplittersTab(ctk.CTkFrame):
     def refresh(self):
         for w in self.top.winfo_children():
             w.destroy()
-        for w in self.body.winfo_children():
-            w.destroy()
-        self._cards.clear()
 
         row = 0
         for conflict in [c for c in self.session.design.conflicts
@@ -583,18 +639,48 @@ class SplittersTab(ctk.CTkFrame):
                 row=row, column=0, sticky="ew", pady=(0, theme.PAD["sm"]))
             row += 1
         self._build_header_row().grid(row=row, column=0, sticky="ew")
+        self._refresh_cards()
+        self._rebuild_topology(force=True)
 
-        design = self.session.design
-        if not design.splitters:
-            _empty_note(self.body, "No splitters in this design.").grid(
+    def _ordered_splitters(self):
+        """Numeric display order only; never reorder the shared topology."""
+        return ordered_splitters(self.session.design.splitters)
+
+    def _refresh_cards(self, *, reset_scroll=False):
+        canvas = self.body._parent_canvas
+        position = 0.0 if reset_scroll else canvas.yview()[0]
+        if self._cards_scroll_job is not None:
+            self.after_cancel(self._cards_scroll_job)
+        for w in self.body.winfo_children():
+            w.destroy()
+        self._cards.clear()
+        splitters = [s for s in self._ordered_splitters()
+                     if self._bus_filter == "ALL"
+                     or s.splitter_type.upper() == self._bus_filter]
+        if not splitters:
+            text = ("No splitters in this design." if self._bus_filter == "ALL"
+                    else f"No {self._bus_filter} splitters in this design.")
+            _empty_note(self.body, text).grid(
                 row=0, column=0, pady=24)
         else:
-            for i, splitter in enumerate(design.splitters):
+            for i, splitter in enumerate(splitters):
                 card = self._build_splitter_card(splitter)
                 card.grid(row=i, column=0, sticky="ew", pady=(0, theme.PAD["sm"]))
                 self._cards[splitter.id] = card
 
-        self._rebuild_topology(force=True)
+        def restore_scroll():
+            self._cards_scroll_job = None
+            canvas.yview_moveto(position)
+
+        # Let Tk finish layout without synchronously pumping nested callbacks.
+        self._cards_scroll_job = self.after_idle(restore_scroll)
+
+    def _set_filter(self, value):
+        if value not in ("ALL", "LX", "KP") or value == self._bus_filter:
+            return
+        self._bus_filter = value
+        self._filter_control.set(value)
+        self._refresh_cards(reset_scroll=True)
 
     # ---- conflict banners ----
 
@@ -637,6 +723,18 @@ class SplittersTab(ctk.CTkFrame):
         frame = ctk.CTkFrame(self.top, fg_color="transparent")
         frame.columnconfigure(0, weight=1)
 
+        self._filter_control = ctk.CTkSegmentedButton(
+            frame, values=["ALL", "LX", "KP"], command=self._set_filter,
+            height=theme.HEIGHT["control"],
+            font=theme.ui_font(theme.SIZE["chip"], "bold"),
+            selected_color=theme.ACCENT, selected_hover_color=theme.ACCENT,
+            unselected_color=theme.SURFACE_CHIP,
+            unselected_hover_color=theme.HOVER_SUBTLE)
+        self._filter_control.set(self._bus_filter)
+        self._filter_control.grid(row=0, column=0, sticky="w")
+        attach_tooltip(self._filter_control,
+                       "Filter cards by bus family. LX includes buses 500–900. "
+                       "Cards are numbered in order; electrical wiring is unchanged.")
         accent_outline_button(frame, "+ Add Splitter", self._add_clicked,
                               width=150).grid(row=0, column=1, sticky="e")
 
@@ -725,18 +823,40 @@ class SplittersTab(ctk.CTkFrame):
 
     def _output_choices(self, splitter) -> list[str]:
         design = self.session.design
-        rsp_names = [f"RSP-{r.number}" for r in design.rsps]
-        kp_names = [f"KEYPAD #{k.number}" for k in design.keypads if k.number != 1]
-        others = [f"To {o.id}" for o in design.splitters if o.id != splitter.id]
-        return ["Spare"] + rsp_names + kp_names + others
+        ordered = self._ordered_splitters()
+        if splitter.splitter_type == "KP":
+            numbers = {int(keypad.number) for keypad in design.keypads}
+            numbers.update(_wiring_device_numbers(
+                design, re.compile(r"KEYPAD(?:\s*#|-)(\d+)", re.I)))
+            targets = [f"KEYPAD #{number}" for number in sorted(numbers)]
+            others = [f"To {other.id}" for other in ordered
+                      if other.id != splitter.id and other.splitter_type == "KP"]
+        else:
+            numbers = {int(rsp.number) for rsp in design.rsps}
+            numbers.update(_wiring_device_numbers(
+                design, re.compile(r"RSP[- ](\d+)", re.I)))
+            targets = [f"RSP-{number}" for number in sorted(numbers)]
+            by_id = {item.id: item for item in design.splitters}
+            bus_number = _lx_bus_number(splitter, by_id)
+            others = [f"To {other.id}" for other in ordered
+                      if other.id != splitter.id and other.splitter_type == "LX"
+                      and _lx_bus_number(other, by_id) == bus_number]
+        return ["Spare"] + targets + others
 
     def _input_choices(self, splitter) -> list[str]:
         design = self.session.design
+        ordered = self._ordered_splitters()
         if splitter.splitter_type == "LX":
-            bus = [f"{n} BUS IN FROM XR/550" for n in (500, 600, 700)]
+            by_id = {item.id: item for item in design.splitters}
+            bus_number = _lx_bus_number(splitter, by_id)
+            bus = [f"{bus_number} BUS IN FROM XR/550"]
+            upstream = [f"From {other.id}" for other in ordered
+                        if other.id != splitter.id and other.splitter_type == "LX"
+                        and _lx_bus_number(other, by_id) == bus_number]
         else:
             bus = ["KEYPAD BUS IN FROM XR/550"]
-        upstream = [f"From {o.id}" for o in design.splitters if o.id != splitter.id]
+            upstream = [f"From {other.id}" for other in ordered
+                        if other.id != splitter.id and other.splitter_type == "KP"]
         return bus + upstream
 
     def _build_splitter_card(self, splitter) -> ctk.CTkFrame:
@@ -745,7 +865,7 @@ class SplittersTab(ctk.CTkFrame):
 
         id_row = ctk.CTkFrame(card, fg_color="transparent")
         id_row.grid(row=0, column=0, sticky="w", padx=(12, 0), pady=(11, 0))
-        prefix = "710-LX500-" if splitter.splitter_type == "LX" else "710-KP-"
+        prefix = splitter.id.rsplit("-", 1)[0] + "-"
         ctk.CTkLabel(id_row, text=prefix, text_color=theme.TEXT,
                      font=theme.mono_font(13, "bold")).pack(side="left")
         num_entry = _styled_entry(id_row, width=40,
@@ -789,10 +909,11 @@ class SplittersTab(ctk.CTkFrame):
 
         first_input = _first_input(splitter)
         in_var = tk.StringVar(value=first_input)
-        combo = ctk.CTkComboBox(
+        combo = SearchableComboBox(
             in_row, variable=in_var, height=theme.HEIGHT["control"],
             corner_radius=theme.RADIUS["control"], border_width=1,
             values=self._input_choices(splitter),
+            allow_custom=True,
             font=theme.mono_font(theme.SIZE["meta"]),
             dropdown_fg_color=theme.SURFACE, dropdown_text_color=theme.TEXT,
             dropdown_hover_color=theme.HOVER_SUBTLE,
@@ -800,32 +921,33 @@ class SplittersTab(ctk.CTkFrame):
         )
         combo.grid(row=0, column=1, sticky="ew")
         self._tone_input(combo, first_input)
-        in_var.trace_add("write", lambda *_a, s=splitter, v=in_var, c=combo:
-                         (self._set_input(s, v.get()), self._tone_input(c, v.get())))
+        combo.configure(command=lambda value, s=splitter, c=combo:
+                        self._commit_input(s, value, c))
 
-        # -- OUT: three ports, each carrying its state in its border.
+        # -- OUT: one full-width row per port so destination suffixes stay
+        # readable even when all three outputs link to long splitter IDs.
         out_row = ctk.CTkFrame(card, fg_color="transparent")
         out_row.grid(row=2, column=0, columnspan=3, sticky="ew",
                      padx=12, pady=(6, 11))
-        ctk.CTkLabel(out_row, text="OUT", width=30, anchor="w",
-                     text_color=theme.TEXT_TERTIARY,
-                     font=theme.ui_font(theme.SIZE["badge"], "bold")).grid(
-            row=0, column=0, sticky="w")
+        out_row.columnconfigure(1, weight=1)
 
         choices = self._output_choices(splitter)
         outs = list(splitter.outputs or [])
         for i in range(3):
+            ctk.CTkLabel(out_row, text=f"OUT {i + 1}", width=38, anchor="w",
+                         text_color=theme.TEXT_TERTIARY,
+                         font=theme.ui_font(theme.SIZE["badge"], "bold")).grid(
+                row=i, column=0, sticky="w", pady=(0 if i == 0 else 4, 0))
             current = outs[i] if i < len(outs) else "Spare"
             values = list(choices) if current in choices else [current] + list(choices)
-            holder, menu = _bordered_menu(out_row, values, None,
-                                          tone=_menu_tone(current))
+            holder, menu = _bordered_searchable_menu(
+                out_row, values, None, tone=_menu_tone(current))
             menu.configure(
                 command=lambda value, s=splitter, idx=i, h=holder, m=menu:
                 (_style_menu(h, m, _menu_tone(value)), self._set_output(s, idx, value)))
             menu.set(current)
-            out_row.columnconfigure(i + 1, weight=1)
-            holder.grid(row=0, column=i + 1, sticky="ew",
-                        padx=(theme.PAD["xs"], 0))
+            holder.grid(row=i, column=1, sticky="ew",
+                        padx=(theme.PAD["xs"], 0), pady=(0 if i == 0 else 4, 0))
         return card
 
     def _tone_input(self, combo: ctk.CTkComboBox, value: str) -> None:
@@ -842,25 +964,82 @@ class SplittersTab(ctk.CTkFrame):
                             button_color=theme.SURFACE_CHIP,
                             button_hover_color=theme.HOVER_SUBTLE)
 
+    def _commit_input(self, splitter, value: str, combo=None):
+        self._set_input(splitter, value)
+        if combo is not None and combo.winfo_exists():
+            self._tone_input(combo, _first_input(splitter))
+
     def _set_input(self, splitter, value: str):
         val = value.strip()
-        # preserve the existing input key if present, else derive from bus type
-        key = next(iter(splitter.inputs), None) or (
-            "LX-Bus In" if splitter.splitter_type == "LX" else "KP-Bus In")
-        splitter.inputs = {key: val} if val else {}
-        refresh_connections_from_legacy(self.session.design)
-        self.on_change()
-        self._schedule_topology_rebuild()
+        design = self.session.design
+        target = DevicePortRef(splitter.id, "IN")
+        current = next((edge for edge in design.connections if edge.target == target), None)
+        parent_text = val[5:].strip() if val[:5].casefold() == "from " else None
+        known_parent = parent_text and any(
+            item.id == parent_text for item in design.splitters)
+        panel_feed = (
+            val.casefold() == "keypad bus in from xr/550"
+            if splitter.splitter_type.upper() == "KP"
+            else bool(re.fullmatch(
+                r"\d{3}\s+BUS\s+IN\s+FROM\s+XR/550", val, re.I)))
+        if val and not known_parent and not panel_feed:
+            before_graph = _graph_signature(design)
+            before_inputs = dict(splitter.inputs or {})
+            set_splitter_input(design, splitter.id, None)
+            key = ("KP-Bus In" if splitter.splitter_type.upper() == "KP"
+                   else "LX-Bus In")
+            splitter.inputs = {key: val}
+            if (_graph_signature(design) != before_graph
+                    or splitter.inputs != before_inputs):
+                self.session.topology_confirmed = False
+                self.on_change()
+                self._schedule_topology_rebuild()
+            return
+        source = None
+        if val[:5].casefold() == "from ":
+            parent = val[5:].strip()
+            if current is not None and current.source.device_id == parent:
+                source = current.source
+            else:
+                occupied = {edge.source for edge in design.connections
+                            if current is None or edge.id != current.id}
+                source = next((DevicePortRef(parent, f"OUT{index}")
+                               for index in range(1, 4)
+                               if DevicePortRef(parent, f"OUT{index}") not in occupied), None)
+                if source is None:
+                    messagebox.showwarning(
+                        "Connection not allowed", f"{parent} has no free output ports")
+                    self.refresh()
+                    return
+        elif val:
+            source = (DevicePortRef("MSP", "PROG")
+                      if splitter.splitter_type == "KP"
+                      else DevicePortRef("MSP", f"LX{_bus_label(val).split()[0]}"))
+        before = _graph_signature(design)
+        try:
+            set_splitter_input(design, splitter.id, source)
+        except TopologyError as exc:
+            messagebox.showwarning("Connection not allowed", str(exc))
+            self.refresh()
+            return
+        if _graph_signature(design) != before:
+            self.session.topology_confirmed = False
+            self.on_change()
+            self._schedule_topology_rebuild()
 
     def _set_output(self, splitter, index: int, value: str):
-        outs = list(splitter.outputs or [])
-        while len(outs) <= index:
-            outs.append("Spare")
-        outs[index] = value
-        splitter.outputs = outs
-        refresh_connections_from_legacy(self.session.design)
-        self.on_change()
-        self._schedule_topology_rebuild()
+        design = self.session.design
+        before = _graph_signature(design)
+        try:
+            set_splitter_output(design, splitter.id, index, value)
+        except TopologyError as exc:
+            messagebox.showwarning("Connection not allowed", str(exc))
+            self.refresh()
+            return
+        if _graph_signature(design) != before:
+            self.session.topology_confirmed = False
+            self.on_change()
+            self._schedule_topology_rebuild()
 
     # ---- topology panel ----
 
@@ -998,6 +1177,9 @@ class SplittersTab(ctk.CTkFrame):
 
     def _focus_card(self, splitter_id: str) -> None:
         """Scroll the clicked node's card into view and pulse it."""
+        if splitter_id not in self._cards and any(
+                s.id == splitter_id for s in self.session.design.splitters):
+            self._set_filter("ALL")
         card = self._cards.get(splitter_id)
         if card is None or not card.winfo_exists():
             return
@@ -1127,8 +1309,17 @@ class KeypadsTab(ctk.CTkFrame):
         return card
 
     def _set_source(self, kp, value: str):
-        kp.source = value
-        self.on_change()
+        design = self.session.design
+        before = _graph_signature(design)
+        try:
+            set_keypad_source(design, kp.number, value)
+        except TopologyError as exc:
+            messagebox.showwarning("Connection not allowed", str(exc))
+            self.refresh()
+            return
+        if _graph_signature(design) != before:
+            self.session.topology_confirmed = False
+            self.on_change()
 
 
 # ------------------------------------------------------------------ #
@@ -1153,6 +1344,8 @@ class PowerTab(ctk.CTkFrame):
             lambda mutate: (mutate(), self.on_structure_change()))
         # Accepted for a uniform tab contract; this tab has nothing to link to.
         self.on_navigate = on_navigate
+        self._location_vars: dict[int, tk.StringVar] = {}
+        self._syncing_locations = False
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
@@ -1163,6 +1356,7 @@ class PowerTab(ctk.CTkFrame):
         self.refresh()
 
     def refresh(self):
+        self._location_vars.clear()
         for w in self.body.winfo_children():
             w.destroy()
 
@@ -1193,6 +1387,19 @@ class PowerTab(ctk.CTkFrame):
         for i, rsp in enumerate(design.rsps):
             self._build_rsp_card(rsp, ps_by_number).grid(
                 row=i + 1, column=0, sticky="ew", pady=4)
+
+    def sync_locations(self):
+        """Reflect external assignments without rebuilding fields or firing edits."""
+        self._syncing_locations = True
+        try:
+            for rsp in self.session.design.rsps:
+                variable = self._location_vars.get(rsp.number)
+                value = rsp.location or ""
+                # Keep a trailing space while the user is typing a room name.
+                if variable is not None and variable.get().strip() != value.strip():
+                    variable.set(value)
+        finally:
+            self._syncing_locations = False
 
     def _add_clicked(self):
         prompt_add_expander(self.winfo_toplevel(), self.session,
@@ -1229,8 +1436,11 @@ class PowerTab(ctk.CTkFrame):
             side="left", padx=(theme.PAD["xs"], 0))
 
         loc_var = tk.StringVar(value=rsp.location or "")
+        self._location_vars[rsp.number] = loc_var
 
         def loc_edited(*_a, r=rsp):
+            if self._syncing_locations:
+                return
             value = loc_var.get().strip() or None
             r.location = value
             ps = ps_by_number.get(r.number)

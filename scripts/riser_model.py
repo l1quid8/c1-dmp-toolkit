@@ -127,7 +127,8 @@ def _panel_port(splitter) -> str:
     return f"LX{match.group(1)}" if match else "LX500"
 
 
-def derive_legacy_connections(design) -> list[TopologyConnection]:
+def derive_legacy_connections(
+        design, *, assume_service_keypad: bool = True) -> list[TopologyConnection]:
     """Translate the schema-1 string topology into stable port-to-port edges."""
     result: list[TopologyConnection] = []
     seen: set[tuple[str, str, str, str]] = set()
@@ -139,9 +140,16 @@ def derive_legacy_connections(design) -> list[TopologyConnection]:
             result.append(_connection(source, target))
 
     by_id = {s.id: s for s in getattr(design, "splitters", [])}
+    by_normal_id = {s.id.upper(): s.id for s in getattr(design, "splitters", [])}
+
+    def named_parent(input_text: str) -> str | None:
+        if not input_text.lower().startswith("from "):
+            return None
+        return by_normal_id.get(input_text[5:].strip().upper())
+
     for splitter in getattr(design, "splitters", []):
         input_text = next(iter((splitter.inputs or {}).values()), "").strip()
-        if not input_text.lower().startswith("from 710-"):
+        if input_text and named_parent(input_text) is None:
             add(DevicePortRef("MSP", _panel_port(splitter)),
                 DevicePortRef(splitter.id, "IN"))
         for index, raw in enumerate(splitter.outputs or [], 1):
@@ -167,19 +175,36 @@ def derive_legacy_connections(design) -> list[TopologyConnection]:
     # should already be represented by splitter output rows.
     for keypad in getattr(design, "keypads", []):
         source = (keypad.source or "").strip().upper()
-        if source in {"MSP", "XR550", "KP BUS"} or keypad.number == 1 and not source:
+        if (source in {"MSP", "XR550", "KP BUS"}
+                or assume_service_keypad and keypad.number == 1 and not source):
             add(DevicePortRef("MSP", "KP BUS"),
                 DevicePortRef(f"KEYPAD-{keypad.number}", "IN"))
+
+    # A schema-1 keypad may name its upstream 710 only in ``keypad.source``.
+    # Allocate the first free output deterministically when no output row
+    # redundantly names that keypad.
+    used = {(c.source.device_id, c.source.port_id) for c in result}
+    incoming = {c.target.device_id for c in result}
+    for keypad in getattr(design, "keypads", []):
+        target_id = f"KEYPAD-{keypad.number}"
+        parent = (keypad.source or "").strip()
+        if target_id in incoming or parent not in by_id:
+            continue
+        for index in range(1, 4):
+            port = (parent, f"OUT{index}")
+            if port not in used:
+                add(DevicePortRef(*port), DevicePortRef(target_id, "IN"))
+                used.add(port)
+                incoming.add(target_id)
+                break
 
     # Some legacy data names a parent only in the child's IN field. Attach it
     # to the first unused output so the edge is not silently lost.
     used = {(c.source.device_id, c.source.port_id) for c in result}
     for splitter in getattr(design, "splitters", []):
         input_text = next(iter((splitter.inputs or {}).values()), "").strip()
-        if input_text[:5].lower() != "from ":
-            continue
-        parent = input_text[5:].strip()
-        if parent not in by_id:
+        parent = named_parent(input_text)
+        if parent is None:
             continue
         if any(c.target.device_id == splitter.id for c in result):
             continue
@@ -201,4 +226,3 @@ def default_riser_document(design) -> RiserDocument:
         address=address,
         project_title=site.school_name or "",
     ))
-

@@ -181,10 +181,11 @@ def _extract_loc_code_from_page(page, exclude: set[str]) -> Optional[str]:
 
 
 # Single-line full address pattern (used against the title-block / page-1 text).
-# Matches lines like '17551 MIRANDA ST. , ENCINO , CA 91316' or
-# '728 WOODWORTH ST, SAN FERNANDO, CA 91340'.
+# Matches lines like '17551 MIRANDA ST. , ENCINO , CA 91316',
+# '728 WOODWORTH ST, SAN FERNANDO, CA 91340', and title blocks that omit
+# the street suffix, such as '2025 GRIFFIN, LOS ANGELES, CA 90031'.
 TITLE_ADDRESS_RE = re.compile(
-    r"^\s*(\d+\s+[A-Z][A-Z0-9. ]+?(?:ST|AVE|BLVD|RD|WAY|DR|LN|CT)\.?)\s*,\s*"
+    r"^\s*(\d+\s+[A-Z][A-Z0-9.#' \-]+?)\s*,\s*"
     r"([A-Z][A-Z ]+?)\s*,\s*([A-Z]{2})\s+(\d{5})\s*$",
     re.MULTILINE,
 )
@@ -231,15 +232,36 @@ def extract_combus_lines(text: str) -> list[CombusLine]:
     """
     lines = [ln.strip() for ln in text.splitlines()]
 
-    # Bound the search to the COMBUS LINES section
-    start = 0
-    end = len(lines)
+    # Bound the search to the COMBUS LINES section. CAD extraction does not
+    # always preserve visual reading order: a neighboring zone-schedule block
+    # can appear between this section's title and its actual table rows. Anchor
+    # on the table's own NO./BUILDING/FLOOR/ROOM header when it is available.
+    section_start = 0
     for idx, s in enumerate(lines):
         if "COMBUS LINES" in s.upper():
-            start = idx + 1
+            section_start = idx + 1
             break
+
+    start = section_start
+    table_header = None
+    for idx in range(section_start, len(lines)):
+        if not re.fullmatch(r"NO\.?", lines[idx], re.IGNORECASE):
+            continue
+        header = " ".join(lines[idx:idx + 8]).upper()
+        if all(token in header for token in ("BUILDING", "FLOOR", "ROOM", "CABLE")):
+            table_header = idx
+            break
+    if table_header is not None:
+        for idx in range(table_header + 1, min(len(lines), table_header + 20)):
+            if COMBUS_RSP_ID_RE.match(lines[idx]) or COMBUS_KP_ID_RE.match(lines[idx]):
+                start = idx
+                break
+
+    end = len(lines)
     for idx in range(start, len(lines)):
-        if "MOTION DETECTOR ZONE SCHEDULE" in lines[idx].upper():
+        upper = lines[idx].upper()
+        if (upper.startswith("SCHOOL NAME:")
+                or "MOTION DETECTOR ZONE SCHEDULE" in upper):
             end = idx
             break
 

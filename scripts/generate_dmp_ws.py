@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import argparse
 import sys
+from copy import copy
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Optional
 
 import openpyxl
+from openpyxl.styles import Side
 from openpyxl.utils import get_column_letter
 
 # Make sibling modules importable
@@ -32,6 +34,7 @@ import re
 from extract_topology import cluster_devices, extract_spans
 from inject_door_chart import _slugify
 from topology_service import ensure_explicit_topology, project_legacy_topology
+from splitter_order import ordered_splitters
 
 # Phase 3 (vector-line edge detection) is optional — gracefully degrade if it's not in place.
 try:
@@ -96,11 +99,41 @@ def _apply_phase3_topology(design, edges, phase3_devices) -> int:
     dmp_kp = [s for s in design.splitters if s.splitter_type == "KP"]
 
     phase3_id_to_dmp_id: dict[str, str] = {}
-    # Direct positional pairing (works when Phase 3 found the same number of splitters as we created)
-    for p3, dmp in zip(phase3_lx, dmp_lx):
-        phase3_id_to_dmp_id[p3.id] = dmp.id
-    for p3, dmp in zip(phase3_kp, dmp_kp):
-        phase3_id_to_dmp_id[p3.id] = dmp.id
+
+    def _map_splitter_group(phase3_group, dmp_group) -> None:
+        """Map preserved electrical IDs first; position is legacy fallback only.
+
+        DMP splitters are stored in location order while Phase-3 devices sort by
+        bus/slot.  Zipping those lists silently permutes a valid extracted graph
+        whenever a remote room alphabetically precedes the MSP room.
+        """
+        def norm(identifier: str) -> str:
+            return re.sub(r"[\s-]+", "", identifier or "").upper()
+
+        by_norm = {norm(splitter.id): splitter for splitter in dmp_group}
+        used_dmp_ids: set[str] = set()
+        unmatched_phase3 = []
+        for phase3 in phase3_group:
+            exact = by_norm.get(norm(phase3.id))
+            if exact is None or exact.id in used_dmp_ids:
+                unmatched_phase3.append(phase3)
+                continue
+            phase3_id_to_dmp_id[phase3.id] = exact.id
+            used_dmp_ids.add(exact.id)
+
+        # Older worksheet imports may carry synthesized IDs that cannot match
+        # the printed Phase-3 labels.  Preserve the historical positional
+        # behavior only for the remaining unmatched devices.
+        unmatched_dmp = [splitter for splitter in dmp_group
+                         if splitter.id not in used_dmp_ids]
+        for phase3, dmp in zip(unmatched_phase3, unmatched_dmp):
+            phase3_id_to_dmp_id[phase3.id] = dmp.id
+
+    _map_splitter_group(phase3_lx, dmp_lx)
+    _map_splitter_group(phase3_kp, dmp_kp)
+    dmp_id_to_phase3_id = {
+        dmp_id: phase3_id for phase3_id, dmp_id in phase3_id_to_dmp_id.items()
+    }
 
     # Bus number for top-of-bus inputs — keyed by phase3 device id
     phase3_id_to_bus: dict[str, int] = {}
@@ -122,17 +155,46 @@ def _apply_phase3_topology(design, edges, phase3_devices) -> int:
             return f"To {dmp_id}" if dmp_id else None
         return None
 
+    def _family(dev) -> Optional[str]:
+        if dev.kind == "RSP":
+            return "LX"
+        if dev.kind in ("KEYPAD", "SERVICE_KP"):
+            return "KP"
+        if dev.kind == "SPLITTER":
+            ident = (dev.id or "").upper()
+            if "KP" in ident:
+                return "KP"
+            if "LX" in ident:
+                return "LX"
+        return None
+
     # Bucket edges by source DMP splitter id
     outputs_by_src: dict[str, list[str]] = {}
     inputs_by_dst: dict[str, str] = {}  # dst_dmp_id -> input description (splitter→splitter only)
+    msp_inputs: set[str] = set()        # roots explicitly observed as MSP→splitter
     n_applied = 0
 
     for edge in edges:
         src_dmp_id = phase3_id_to_dmp_id.get(edge.src.id)
         dst_dmp_id = phase3_id_to_dmp_id.get(edge.dst.id)
 
+        # A panel feed is valid only when the vector graph actually touches the
+        # MSP and a known splitter.  Do not infer this later merely because an
+        # input was missed: doing so promotes every remote splitter to a second
+        # direct root and hides an incomplete extraction.
+        if edge.src.kind == "MSP":
+            if dst_dmp_id and edge.dst.kind == "SPLITTER":
+                msp_inputs.add(dst_dmp_id)
+                n_applied += 1
+            continue
+
         # Splitter → anything: this is an output of src
-        if src_dmp_id:
+        if src_dmp_id and edge.src.kind == "SPLITTER":
+            # RSPs are LX-bus leaves and keypads are KP-bus leaves.  Apply the
+            # same compatibility rule here as the vector reconstruction so a
+            # malformed or caller-supplied edge cannot corrupt the worksheet.
+            if _family(edge.src) != _family(edge.dst):
+                continue
             desc = _output_desc(edge.dst)
             if desc:
                 outputs_by_src.setdefault(src_dmp_id, []).append(desc)
@@ -156,23 +218,25 @@ def _apply_phase3_topology(design, edges, phase3_devices) -> int:
             outs.append("Spare")
         splitter.outputs = outs[:3]
 
-        # Inputs: explicit "From X" if splitter→splitter, otherwise "{bus} BUS IN FROM XR/550"
+        # Inputs: explicit "From X" for a splitter chain, or a panel feed only
+        # when an MSP→splitter edge was actually extracted.  An unseen input is
+        # intentionally left blank so completeness checking invokes the safer
+        # auto-derived fallback rather than inventing duplicate MSP roots.
         if splitter.id in inputs_by_dst:
             input_key = "LX-Bus In" if splitter.splitter_type == "LX" else "KP-Bus In"
             splitter.inputs = {input_key: inputs_by_dst[splitter.id]}
-        else:
+        elif splitter.id in msp_inputs:
             if splitter.splitter_type == "LX":
                 # Find the corresponding Phase 3 device to recover the bus number
-                bus = None
-                for p3, dmp in zip(phase3_lx, dmp_lx):
-                    if dmp.id == splitter.id:
-                        bus = phase3_id_to_bus.get(p3.id)
-                        break
+                phase3_id = dmp_id_to_phase3_id.get(splitter.id)
+                bus = phase3_id_to_bus.get(phase3_id) if phase3_id else None
                 if bus is None:
                     bus = 500  # safe default (most common single-bus deployment)
                 splitter.inputs = {"LX-Bus In": f"{bus} BUS IN FROM XR/550"}
             else:
                 splitter.inputs = {"KP-Bus In": "KEYPAD BUS IN FROM XR/550"}
+        else:
+            splitter.inputs = {}
 
     return n_applied
 
@@ -181,15 +245,68 @@ def _phase3_topology_complete(design: DMPDesign) -> bool:
     """True if riser-extracted splitter I/O covers every RSP and every
     non-service keypad as a splitter output — i.e. it can be trusted over the
     auto-derive convention. If anything is missing, the convention is used."""
-    produced: set[str] = set()
+    splitter_types = {s.id: s.splitter_type for s in design.splitters}
+    produced: list[str] = []
+    chain_inputs: dict[str, int] = {s.id: 0 for s in design.splitters}
+    panel_roots: set[tuple[str, str]] = set()
     for s in design.splitters:
+        values = [str(v).strip() for v in (s.inputs or {}).values()
+                  if str(v).strip()]
+        if len(values) != 1:
+            return False
+        input_value = values[0]
+        from_match = re.fullmatch(r"From\s+(.+)", input_value, re.IGNORECASE)
+        if from_match:
+            upstream = from_match.group(1).strip()
+            if splitter_types.get(upstream) != s.splitter_type:
+                return False
+        elif not input_value.upper().endswith("BUS IN FROM XR/550"):
+            return False
+        else:
+            if s.splitter_type == "KP":
+                root_port = ("KP", "PROG")
+            else:
+                id_match = _LX_BUS_RE.search(s.id or "")
+                input_match = re.match(r"(\d{3})\s+BUS\s+IN", input_value,
+                                       re.IGNORECASE)
+                id_bus = id_match.group(1) if id_match else None
+                input_bus = input_match.group(1) if input_match else None
+                if not id_bus or not input_bus or id_bus != input_bus:
+                    return False
+                root_port = ("LX", id_bus)
+            if root_port in panel_roots:
+                return False
+            panel_roots.add(root_port)
+
         for o in (s.outputs or []):
-            produced.add(str(o).strip())
+            output = str(o).strip()
+            if not output or output == "Spare":
+                continue
+            produced.append(output)
+            if output.startswith("RSP "):
+                if s.splitter_type != "LX":
+                    return False
+            elif output.startswith("KEYPAD #"):
+                if s.splitter_type != "KP":
+                    return False
+            elif output.startswith("To "):
+                target = output[3:].strip()
+                if splitter_types.get(target) != s.splitter_type:
+                    return False
+                chain_inputs[target] = chain_inputs.get(target, 0) + 1
+            else:
+                return False
+
+    for s in design.splitters:
+        input_value = next(iter(s.inputs.values())).strip()
+        is_chained = bool(re.fullmatch(r"From\s+.+", input_value, re.IGNORECASE))
+        if chain_inputs.get(s.id, 0) != (1 if is_chained else 0):
+            return False
     for rsp in design.rsps:
-        if f"RSP {rsp.number}" not in produced:
+        if produced.count(f"RSP {rsp.number}") != 1:
             return False
     for kp in design.keypads:
-        if kp.number != 1 and f"KEYPAD #{kp.number}" not in produced:
+        if kp.number != 1 and produced.count(f"KEYPAD #{kp.number}") != 1:
             return False
     return True
 
@@ -832,6 +949,43 @@ def _write_cell_safe(ws, cell_ref: str, value) -> None:
         pass
 
 
+def _trim_hardware_sheet(ws, last_row: int) -> None:
+    """Trim the A:D hardware table after its last complete device block.
+
+    Clearing values alone leaves merged, bordered placeholder blocks in Excel's
+    used range. Remove those blocks and their row metadata before serialization.
+    Callers retain the header even with no hardware, keeping sheet names stable.
+    """
+    old_last_row = ws.max_row
+    for merged in list(ws.merged_cells.ranges):
+        if merged.min_row > last_row:
+            ws.unmerge_cells(str(merged))
+    if old_last_row > last_row:
+        ws.delete_rows(last_row + 1, old_last_row - last_row)
+    # openpyxl's delete_rows does not remove row dimensions or page breaks.
+    for row in list(ws.row_dimensions):
+        if row > last_row:
+            del ws.row_dimensions[row]
+    ws.row_breaks.brk = [item for item in ws.row_breaks.brk if item.id < last_row]
+    ws.print_area = f"A1:D{last_row}"
+
+    # Some template cells rely on the NEXT block's top border to close this one.
+    # Once that block is removed, explicitly close the whole retained table with
+    # the template's medium black separator, preserving all other border edges.
+    bottom = Side(style="medium", color="000000")
+    edge_cells = {(last_row, col) for col in range(1, 5)}
+    # A merged ID also stores its bottom border on the top-left anchor. Set both
+    # anchor and perimeter so it survives XLSX serialization and Excel display.
+    for merged in ws.merged_cells.ranges:
+        if merged.max_row == last_row and merged.min_col <= 4:
+            edge_cells.add((merged.min_row, merged.min_col))
+    for row, col in edge_cells:
+        cell = ws.cell(row, col)
+        border = copy(cell.border)
+        border.bottom = bottom
+        cell.border = border
+
+
 def dmp_filename(school_slug: str, stamp: str | None = None,
                  date_str: str | None = None) -> str:
     """Output filename for a generated DMP worksheet.
@@ -922,8 +1076,8 @@ def write_dmp_xlsx(design: DMPDesign, template_path: Path, output_path: Path,
 
     # DMP 714 Exp Mod sheet
     ws = wb["DMP 714 Exp Mod"]
-    # Clear rows 4-40 first to remove template pre-fill
-    for clear_row in range(4, 41):
+    # Clear every template slot before writing actual modules.
+    for clear_row in range(4, ws.max_row + 1):
         for col in ["A", "B", "C", "D", "E"]:
             try:
                 ws[f"{col}{clear_row}"].value = None
@@ -941,6 +1095,8 @@ def write_dmp_xlsx(design: DMPDesign, template_path: Path, output_path: Path,
             zone_max = max(rsp.zones)
             _write_cell_safe(ws, f"C{row}", f"{zone_min} - {zone_max}")
         _write_cell_safe(ws, f"D{row}", rsp.location)
+
+    _trim_hardware_sheet(ws, 3 + len(design.rsps))
 
     # Keypad sheet
     ws = wb["Keypad"]
@@ -992,18 +1148,22 @@ def write_dmp_xlsx(design: DMPDesign, template_path: Path, output_path: Path,
             return ""
         return ""
 
+    # Sort whole device blocks before writing into the template's merged cells.
+    # This is the same presentation order as the editor, not a topology mutation.
+    display_splitters = ordered_splitters(design.splitters)
+
     # 710 Splitter-Repeater(KP-Bus) sheet (note the trailing space in sheet name)
     ws = wb["710 Splitter-Repeater(KP-Bus) "] if "710 Splitter-Repeater(KP-Bus) " in wb.sheetnames else None
     if ws:
-        # Clear rows 2-50 first
-        for clear_row in range(2, 51):
+        # Clear every template slot without disturbing its formatting/merges.
+        for clear_row in range(2, ws.max_row + 1):
             for col in ["A", "B", "C", "D", "E"]:
                 try:
                     ws[f"{col}{clear_row}"].value = None
                 except:
                     pass
 
-        kp_splitters = [s for s in design.splitters if s.splitter_type == "KP"]
+        kp_splitters = [s for s in display_splitters if s.splitter_type == "KP"]
         row = 2
         for splitter in kp_splitters:
             _write_cell_safe(ws, f"A{row}", splitter.id)
@@ -1025,6 +1185,8 @@ def write_dmp_xlsx(design: DMPDesign, template_path: Path, output_path: Path,
                         _write_cell_safe(ws, f"D{row}", dest_loc)
                 row += 1
 
+        _trim_hardware_sheet(ws, 1 + 4 * len(kp_splitters))
+
     # 710 Splitter-Repeater LX500 sheet (check both "LX500" and "LXBus" name variants)
     ws_lx_name = None
     for name in wb.sheetnames:
@@ -1038,15 +1200,15 @@ def write_dmp_xlsx(design: DMPDesign, template_path: Path, output_path: Path,
         ws_lx_name = "710 Splitter-Repeater LX500"
     if ws_lx_name:
         ws = wb[ws_lx_name]
-        # Clear rows 2-50 first
-        for clear_row in range(2, 51):
+        # The LX template extends past row 50; unused IDs must not leak through.
+        for clear_row in range(2, ws.max_row + 1):
             for col in ["A", "B", "C", "D", "E"]:
                 try:
                     ws[f"{col}{clear_row}"].value = None
                 except:
                     pass
 
-        lx_splitters = [s for s in design.splitters if s.splitter_type == "LX"]
+        lx_splitters = [s for s in display_splitters if s.splitter_type == "LX"]
         row = 2
         for splitter in lx_splitters:
             _write_cell_safe(ws, f"A{row}", splitter.id)
@@ -1068,10 +1230,12 @@ def write_dmp_xlsx(design: DMPDesign, template_path: Path, output_path: Path,
                         _write_cell_safe(ws, f"D{row}", dest_loc)
                 row += 1
 
+        _trim_hardware_sheet(ws, 1 + 4 * len(lx_splitters))
+
     # DMP 505-12_G Power Supply 1-10 sheet
     ws = wb["DMP 505-12_G Power Supply 1-10"]
-    # Clear rows 2-50 first
-    for clear_row in range(2, 51):
+    # This template has 30 slots despite its legacy "1-10" sheet name.
+    for clear_row in range(2, ws.max_row + 1):
         for col in ["A", "B", "C", "D", "E"]:
             try:
                 ws[f"{col}{clear_row}"].value = None
@@ -1090,6 +1254,8 @@ def write_dmp_xlsx(design: DMPDesign, template_path: Path, output_path: Path,
             _write_cell_safe(ws, f"C{row}", ps.relays.get(relay_num, ""))
             _write_cell_safe(ws, f"D{row}", ps.location)
             row += 1
+
+    _trim_hardware_sheet(ws, 1 + 4 * len(design.power_supplies))
 
     # Rename template's Point Info sheets to match the example's naming convention.
     # Template ships them as "DMP 714 Point Info 1"..."15"; example uses "DMP 714-16 Point Info (N)".

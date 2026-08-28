@@ -48,6 +48,7 @@ from topology_service import ensure_explicit_topology, project_legacy_topology
 from riser_render import generate_riser_bundle
 from riser_scene import layout_riser, sync_riser_document, validate_riser
 from editor_tabs import auto_hide_scrollbar
+from tk_compat import install_scrollbar_redraw_fix
 from rl_injector.xml_export import generate_account_xml
 import theme
 from ui_widgets import (
@@ -186,6 +187,7 @@ class TextRedirector:
 
 class App:
     def __init__(self):
+        install_scrollbar_redraw_fix()
         # Resolve the appearance mode before the first widget exists —
         # CustomTkinter samples the active mode when a widget is constructed,
         # so a later switch would leave the root window in the wrong palette.

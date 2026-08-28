@@ -160,10 +160,11 @@ def test_inject_eight_port_reshape_and_power_supplies(tmp_path):
     wb = openpyxl.load_workbook(out, data_only=False)
     tc = wb["Terminal Cans"]
 
-    # RSP2 (8-port) is the right block of group 1 (header F7): 8 data rows then AUX POWER.
-    assert str(tc["F16"].value).startswith("=Master!A")   # 8th (last) real data row
-    assert tc["F17"].value == "AUX POWER"                  # AUX lifted up
-    assert tc["F18"].value is None                         # blanks below
+    # RSP2 (8-port) is chart 2 in the vertical stack (header B32): 8 data rows,
+    # then AUX POWER. Terminal Cans no longer uses a right-hand F:H chart.
+    assert str(tc["B41"].value).startswith("=Master!A")   # 8th (last) real data row
+    assert tc["B42"].value == "AUX POWER"                  # AUX lifted up
+    assert tc["B43"].value is None                         # blanks below
 
     # Power Supplies reads RSP2's real supervisory rows (Z523/Z524 → Master rows 89/90),
     # not the 16-port slot positions.
