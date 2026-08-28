@@ -1,7 +1,7 @@
 """The unified project editor — the working document of the field-edit workflow.
 
 EditorFrame hosts a tab per output sheet group (SITE / ZONES / SPLITTERS /
-KEYPADS / POWER) over a Session's DMPDesign and fills the application's main
+KEYPADS / POWER / REMOTELINK / RISER) over a Session and fills the application's main
 area. Edits write straight onto the design; the session file only changes on
 an explicit Save, with a debounced background recovery file guarding against
 crashes.
@@ -20,15 +20,18 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 import theme
+from topology_service import project_legacy_topology, prune_unknown_connections
 from hardware import snapshot_refs, diff_refs
 from session import Session, save_session, sync_master_zones, write_recovery, clear_recovery
 from validation import validate_design, badge_counts, badge_counts_by_severity
 from editor_zones import ZonesTab
 from editor_remotelink import RemoteLinkTab
+from riser_editor import RiserTab
 from editor_tabs import (
     KeypadsTab,
     PowerTab,
     SplittersTab,
+    _graph_signature,
     auto_hide_scrollbar,
     prompt_add_expander,
 )
@@ -67,7 +70,7 @@ def _format_install_date(d) -> str:
     suffix = "th" if 11 <= n % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
     return f"{d.strftime('%B').upper()} {n}{suffix} {d.year}"
 
-TAB_TITLES = ["SITE", "ZONES", "SPLITTERS", "KEYPADS", "POWER", "REMOTELINK"]
+TAB_TITLES = ["SITE", "ZONES", "SPLITTERS", "KEYPADS", "POWER", "REMOTELINK", "RISER"]
 
 
 def _bind_click_tree(widget, command):
@@ -292,11 +295,12 @@ class EditorFrame(ctk.CTkFrame):
 
     def __init__(self, master, root, session: Session, *,
                  on_generate_worksheet=None, on_generate_chart=None,
-                 on_generate_remotelink=None,
+                 on_generate_remotelink=None, on_generate_riser=None,
                  on_status_change=None, on_validation_change=None):
         super().__init__(master, fg_color="transparent")
         self.root = root
         self.session = session
+        self._topology_signature = _graph_signature(session.design)
         self.dirty = False
         # Bumped on every edit; the app snapshots it after a worksheet generate
         # to warn when a door chart would be built from a stale worksheet.
@@ -305,6 +309,7 @@ class EditorFrame(ctk.CTkFrame):
         self._on_generate_worksheet = on_generate_worksheet or (lambda: None)
         self._on_generate_chart = on_generate_chart or (lambda: None)
         self._on_generate_remotelink = on_generate_remotelink or (lambda: None)
+        self._on_generate_riser = on_generate_riser or (lambda: None)
         self.on_status_change = on_status_change or (lambda text, dirty: None)
         self.on_validation_change = on_validation_change or (lambda text, ok: None)
         self._site_vars: dict[str, ctk.StringVar] = {}
@@ -346,10 +351,14 @@ class EditorFrame(ctk.CTkFrame):
         self._recovery_job = None
         if not self.dirty:
             return
+        if hasattr(self, "riser_tab"):
+            self.riser_tab.cancel(redraw=False)
         with contextlib.suppress(Exception):
             write_recovery(self.session)
 
     def save(self) -> bool:
+        if hasattr(self, "riser_tab"):
+            self.riser_tab.cancel(redraw=False)
         try:
             save_session(self.session)
         except Exception as exc:
@@ -444,11 +453,16 @@ class EditorFrame(ctk.CTkFrame):
         )
         self.remotelink_tab.grid(row=0, column=0, sticky="nsew")
 
+        self.riser_tab = RiserTab(
+            self.tabs.tab("RISER"), self.session, self._on_riser_edit,
+            on_generate=self._on_generate_riser)
+        self.riser_tab.grid(row=0, column=0, sticky="nsew")
+
         self._build_footer()
 
     def _build_footer(self):
-        """Footer bar: save state and open-issue chips left, the three generate
-        actions right. Generation runs in the background and never replaces the
+        """Footer bar: save state and open-issue chips left, generation actions
+        right. Generation runs in the background and never replaces the
         editor — outputs are revision-numbered artifacts you refresh at will."""
         # A 1px top rule, drawn as a border-coloured backing strip: CTkFrame
         # borders are all four sides or none.
@@ -483,21 +497,58 @@ class EditorFrame(ctk.CTkFrame):
 
         right = ctk.CTkFrame(bar, fg_color="transparent")
         right.grid(row=0, column=2, sticky="e", padx=(0, theme.PAD["lg"]))
+        self._footer_bar = bar
+        self._footer_left = left
+        self._footer_actions = right
+        self._footer_stacked = False
         self._gen_chart_btn = secondary_button(
             right, "Generate Door Chart", self._on_generate_chart)
         self._gen_chart_btn.pack(side="left", padx=(0, theme.PAD["sm"]))
         self._gen_rl_btn = secondary_button(
             right, "RemoteLink Account", self._on_generate_remotelink)
         self._gen_rl_btn.pack(side="left", padx=(0, theme.PAD["sm"]))
+        self._gen_riser_btn = secondary_button(
+            right, "Generate Riser", self._on_generate_riser)
+        self._gen_riser_btn.pack(side="left", padx=(0, theme.PAD["sm"]))
         self._gen_ws_btn = _PrimaryAction(
             right, "Generate Worksheet", "E", self._on_generate_worksheet)
         self._gen_ws_btn.pack(side="left")
 
         self._update_save_button()
+        bar.bind("<Configure>", lambda _event: self._layout_footer(), add="+")
+
+    def _layout_footer(self):
+        """Wrap actions below issue chips only when a single row would clip."""
+        bar = self._footer_bar
+        needed = (self._footer_left.winfo_reqwidth()
+                  + self._footer_actions.winfo_reqwidth()
+                  + 3 * theme.PAD["lg"])
+        stacked = bar.winfo_width() < needed
+        if stacked != self._footer_stacked:
+            self._footer_stacked = stacked
+            extra = theme.HEIGHT["button"] + theme.PAD["sm"] if stacked else 0
+            bar.configure(height=theme.HEIGHT["footer"] + extra)
+            bar.rowconfigure(1, weight=1 if stacked else 0)
+            self._footer_actions.grid_configure(
+                row=1 if stacked else 0, column=0 if stacked else 2,
+                columnspan=3 if stacked else 1)
+        if getattr(self, "_sheet", None) is not None:
+            card = self._sheet["card"]
+            offset = self._issue_sheet_offset()
+            # Re-placing at the same position still queues Tk layout work.
+            # Keep Configure callbacks idempotent while the window resizes.
+            if float(card.place_info()["y"]) != offset:
+                card.place_configure(y=offset)
+
+    def _issue_sheet_offset(self):
+        """Keep the sheet above the rendered footer, including wrapped actions."""
+        height = max(theme.HEIGHT["footer"], self._reverse_widget_scaling(
+            self._footer_bar.winfo_height()))
+        return -(height + theme.PAD["sm"] + 1)
 
     def set_generating(self, which: str | None):
         """Reflect a running generation on the buttons: `which` is
-        'worksheet', 'chart', 'remotelink', or None when idle. All disable while
+        'worksheet', 'chart', 'remotelink', 'riser', or None when idle. All disable while
         one runs (they share the design and the output pipeline)."""
         running = which is not None
         self._gen_ws_btn.configure(
@@ -510,6 +561,9 @@ class EditorFrame(ctk.CTkFrame):
             text="Generating…" if which == "remotelink"
                  else "RemoteLink Account",
             state="disabled" if running else "normal")
+        self._gen_riser_btn.configure(
+            text="Generating…" if which == "riser" else "Generate Riser",
+            state="disabled" if running else "normal")
 
     def _on_zones_edit(self):
         sync_master_zones(self.session.design)
@@ -519,10 +573,15 @@ class EditorFrame(ctk.CTkFrame):
 
     def _on_design_edit(self):
         """Splitter/keypad/power edits: RSP locations feed master rows too."""
+        self._sync_topology_review()
         sync_master_zones(self.session.design)
         self.mark_dirty()
         self.refresh_validation()
         self._refresh_remotelink_receipt()
+        if hasattr(self, "power_tab"):
+            self.power_tab.sync_locations()
+        if hasattr(self, "riser_tab"):
+            self.riser_tab.refresh()
 
     def _on_remotelink_edit(self):
         self.mark_dirty()
@@ -533,13 +592,31 @@ class EditorFrame(ctk.CTkFrame):
         if tab is not None:
             tab.refresh()
 
+    def _on_riser_edit(self):
+        """Canvas topology edits must be visible in the legacy cards at once."""
+        self._sync_topology_review()
+        sync_master_zones(self.session.design)
+        self.mark_dirty()
+        self.refresh_validation()
+        self.splitters_tab.refresh()
+        self.keypads_tab.refresh()
+
+    def _sync_topology_review(self):
+        """Wiring changes (including undo) invalidate review; markup does not."""
+        signature = _graph_signature(self.session.design)
+        if signature != self._topology_signature:
+            self.session.topology_confirmed = False
+        self._topology_signature = signature
+
     def _on_structure_change(self):
         """Hardware was added or removed: every tab's choices and rows shift."""
+        prune_unknown_connections(self.session.design)
+        project_legacy_topology(self.session.design)
+        self.session.topology_confirmed = False
         sync_master_zones(self.session.design)
         self.mark_dirty()
         self.refresh_validation()
         self.refresh_all_tabs()
-        self._refresh_remotelink_receipt()
 
     def apply_hardware_change(self, mutate):
         """Run a removal that may cascade, then surface what it rewired.
@@ -552,9 +629,12 @@ class EditorFrame(ctk.CTkFrame):
         """
         before = snapshot_refs(self.session.design)
         mutate()
+        prune_unknown_connections(self.session.design)
+        project_legacy_topology(self.session.design)
         changes = diff_refs(before, snapshot_refs(self.session.design))
-        if changes:
-            self.session.topology_confirmed = False
+        # A removed connection may have no surviving legacy reference to report.
+        # Every hardware mutation still requires a new wiring review.
+        self.session.topology_confirmed = False
         sync_master_zones(self.session.design)
         self.mark_dirty()
         self.refresh_validation()
@@ -625,6 +705,8 @@ class EditorFrame(ctk.CTkFrame):
         self.keypads_tab.refresh()
         self.power_tab.refresh()
         self.remotelink_tab.refresh()
+        self.riser_tab.refresh()
+        self._topology_signature = _graph_signature(self.session.design)
 
     # ------------------------------------------------------------------ #
     # Pre-generate issue summary (warn, never block)                        #
@@ -640,6 +722,8 @@ class EditorFrame(ctk.CTkFrame):
                 self.zones.select_zone(int(ref.split(":", 1)[1]))
         elif issue.tab == "REMOTELINK" and hasattr(self, "remotelink_tab"):
             self.remotelink_tab.focus_issue(ref)
+        elif issue.tab == "RISER" and hasattr(self, "riser_tab"):
+            self.riser_tab.goto_issue(issue)
 
     def show_issues_dialog(self, on_proceed, *, proceed_label: str,
                            note: str | None = None):
@@ -647,7 +731,12 @@ class EditorFrame(ctk.CTkFrame):
         summarize the open issues and let the tech choose "generate anyway"
         or jump to a problem. Generation is never blocked — the printed sheet
         is itself a review pass with the superintendent."""
-        issues = self.refresh_validation()
+        issues = validate_design(
+            self.session.design,
+            topology_confirmed=self.session.topology_confirmed,
+            for_generation=True,
+            remotelink=self.session.remotelink,
+        )
         if not issues and not note:
             on_proceed()
             return
@@ -668,7 +757,7 @@ class EditorFrame(ctk.CTkFrame):
         # propagation — a column floor is the way to size the sheet.
         card.columnconfigure(0, weight=1, minsize=SHEET_WIDTH)
         card.place(relx=1.0, rely=1.0, anchor="se", x=-theme.PAD["lg"],
-                   y=-(theme.HEIGHT["footer"] + theme.PAD["sm"] + 1))
+                   y=self._issue_sheet_offset())
         card.lift()
 
         escape_id = self.root.bind("<Escape>", lambda _e: self._close_sheet(),
@@ -837,6 +926,8 @@ class EditorFrame(ctk.CTkFrame):
             chip.pack(side="left", padx=(0, 6))
             add_hover(chip, border_color=theme.ACCENT)
             _bind_click_tree(chip, lambda t=tab_name: self.tabs.set(t))
+        if hasattr(self, "_footer_bar"):
+            self.after_idle(self._layout_footer)
 
     # ------------------------------------------------------------------ #
     # SITE tab                                                              #

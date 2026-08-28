@@ -182,7 +182,7 @@ def test_save_load_session(tmp_sessions_dir):
     assert loaded.path == path
 
 
-def test_session_saves_schema_two_and_top_level_remotelink_config(tmp_sessions_dir):
+def test_session_saves_combined_schema_and_top_level_remotelink_config(tmp_sessions_dir):
     """Older apps must reject configured projects instead of erasing new fields."""
     session = Session(
         design=_populated_design(),
@@ -192,8 +192,7 @@ def test_session_saves_schema_two_and_top_level_remotelink_config(tmp_sessions_d
     path = save_session(session)
     raw = json.loads(path.read_text(encoding="utf-8"))
 
-    assert SCHEMA_VERSION == 2
-    assert raw["schema_version"] == 2
+    assert raw["schema_version"] == 3
     assert raw["remotelink"]["account_num"] == "3141"
     assert raw["remotelink"]["receiver_num"] == "7"
 

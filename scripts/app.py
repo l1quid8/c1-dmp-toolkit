@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import copy
 import threading
 import subprocess
 import contextlib
@@ -43,7 +44,11 @@ from session import (
     unique_session_path,
 )
 from editor_frame import EditorFrame
+from topology_service import ensure_explicit_topology, project_legacy_topology
+from riser_render import generate_riser_bundle
+from riser_scene import layout_riser, sync_riser_document, validate_riser
 from editor_tabs import auto_hide_scrollbar
+from tk_compat import install_scrollbar_redraw_fix
 from rl_injector.account_doc import render_text
 from rl_injector.errors import InjectorError
 from rl_injector.rl_config import resolve_config
@@ -79,7 +84,7 @@ make changes.
    Drop a design PDF, an existing DMP worksheet (.xlsx), or a saved project (.dmps) onto \
 the home screen. The app parses it and detects the school name.
 
-2. EDIT  (six tabs)
+2. EDIT  (seven tabs)
    • SITE — school, address, contact, tech, install date, IP / gateway, XR-550 location, \
 and RemoteLink panel connection settings.
    • ZONES — searchable grid of every zone. Filter chips: All / Needs attention (blank or \
@@ -91,6 +96,8 @@ checked it against the riser diagram (required before FINAL).
    • POWER — RSP / power-supply locations; add or remove expanders here.
    • REMOTELINK — account, users, arming model, optional advanced settings, and a live \
 read-back receipt of the account that will be generated.
+   • RISER — auto-layout the shared topology, adjust devices and orthogonal cable routes, \
+add markup, edit the title block, and review riser-specific warnings.
 
    Naming rules the checks enforce: SPARE must be uppercase, and RSP references \
 must be hyphenated (RSP-3, not RSP 3).
@@ -101,8 +108,8 @@ mean you have edits that aren't on disk yet. A background recovery file guards a
 crashes between saves.
 
 4. GENERATE  (repeat as needed)
-   The footer generates the worksheet, door chart, or encrypted RemoteLink account. \
-The chart is built from the newest worksheet. Each worksheet/chart run writes the next revision \
+   The footer generates the worksheet, door chart, riser, or encrypted RemoteLink account. \
+The chart is built from the newest worksheet. Each worksheet/chart/riser run writes the next revision \
 — school_dmp_rev1.xlsx, rev2, … — keeping earlier revisions, so the normal loop is: \
 generate, print, review with the superintendent, edit, regenerate. If checks are failing \
 you'll see a summary first, but generation is never blocked. You stay in the editor the \
@@ -197,6 +204,7 @@ class TextRedirector:
 
 class App:
     def __init__(self):
+        install_scrollbar_redraw_fix()
         # Resolve the appearance mode before the first widget exists —
         # CustomTkinter samples the active mode when a widget is constructed,
         # so a later switch would leave the root window in the wrong palette.
@@ -264,6 +272,7 @@ class App:
         self.root.bind_all(f"<{mod}-w>", lambda _e=None: self._process_another())
         self.root.bind_all(f"<{mod}-e>", lambda _e=None: self._generate_worksheet())
         self.root.bind_all(f"<{mod}-d>", lambda _e=None: self._generate_door_chart())
+        self.root.bind_all(f"<{mod}-r>", lambda _e=None: self._generate_riser())
 
         try:
             self.root.drop_target_register(DND_FILES)
@@ -398,6 +407,8 @@ class App:
                             command=self._generate_worksheet)
         ws_menu.add_command(label="Generate Door Chart", accelerator=accel("D"),
                             command=self._generate_door_chart)
+        ws_menu.add_command(label="Generate Riser", accelerator=accel("R"),
+                            command=self._generate_riser)
         self._menubar.add_cascade(label="Worksheet", menu=ws_menu)
 
         # ---- Help (always present — lowers the README-dependence) ----
@@ -451,6 +462,8 @@ class App:
         can_chart = idle and self._latest_worksheet_path() is not None
         self._worksheet_menu.entryconfigure(
             "Generate Door Chart", state="normal" if can_chart else "disabled")
+        self._worksheet_menu.entryconfigure(
+            "Generate Riser", state="normal" if idle else "disabled")
 
     def _build_toolbar(self):
         bar = ctk.CTkFrame(self.root, fg_color=theme.CHROME,
@@ -1251,6 +1264,7 @@ class App:
         ensure_editable_zones(session.design)
         normalize_rsp_tokens(session.design)
         normalize_zone_descriptions(session.design)
+        ensure_explicit_topology(session.design)
         self.session = session
         self.parsed_design = session.design  # generation flows read this
         self.state = "editing"
@@ -1262,6 +1276,7 @@ class App:
             on_generate_worksheet=self._generate_worksheet,
             on_generate_chart=self._generate_door_chart,
             on_generate_remotelink=self._generate_remotelink,
+            on_generate_riser=self._generate_riser,
             on_status_change=self._on_editor_status,
             on_validation_change=self._on_editor_validation,
         )
@@ -1384,6 +1399,7 @@ class App:
 
         def proceed():
             design = self.session.design
+            project_legacy_topology(design)
             sync_master_zones(design)
             # Persist the per-machine site defaults (tech, IP, ...). Phone and
             # install date are deliberately excluded: phone is school-specific
@@ -1432,6 +1448,57 @@ class App:
             self._run_async(work, on_done, on_error)
 
         self.editor.show_issues_dialog(proceed, proceed_label="Generate anyway")
+
+    def _generate_riser(self):
+        """Generate one revision-matched 24x36 PDF, 11x17 PDF, and SVG."""
+        if self.state != "editing" or not self.session or not self.editor \
+                or self._generating is not None:
+            return
+        if self.editor.dirty and messagebox.askyesno(
+                "Save project?", "Save the project before generating the riser?"):
+            self.editor.save()
+
+        design = self.session.design
+        if design.riser_document is None or not design.riser_document.elements:
+            design.riser_document = layout_riser(design)
+        sync_riser_document(design, design.riser_document)
+        issues = validate_riser(design, design.riser_document)
+        if issues:
+            lines = [f"• {issue.message}" for issue in issues[:12]]
+            if len(issues) > 12:
+                lines.append(f"• …and {len(issues) - 12} more")
+            if not messagebox.askyesno(
+                    "Riser validation warnings",
+                    "Review these warnings in the RISER tab:\n\n" + "\n".join(lines) +
+                    "\n\nGenerate anyway?"):
+                self.editor.tabs.set("RISER")
+                return
+
+        out_dir = self.output_dir
+        render_design = copy.deepcopy(design)
+        document = render_design.riser_document
+        self._set_generating("riser")
+
+        def work():
+            with contextlib.redirect_stdout(self._redirector), \
+                 contextlib.redirect_stderr(self._redirector):
+                return generate_riser_bundle(render_design, document, out_dir)
+
+        def on_done(paths):
+            self._set_generating(None)
+            master, small, svg = paths
+            revision = master.name.split("_riser_rev", 1)[-1].split("_", 1)[0]
+            self._show_toast(
+                f"Riser rev {revision} ready",
+                action=("Open 24×36", lambda: open_file(master)),
+                meta=f"{master.name} · 11×17 PDF + editable SVG",
+                folder=svg)
+
+        def on_error(exc):
+            self._set_generating(None)
+            messagebox.showerror("Riser generation failed", str(exc))
+
+        self._run_async(work, on_done, on_error)
 
     def _generate_door_chart(self):
         """Generate the next door-chart revision from the newest worksheet."""
@@ -1936,6 +2003,9 @@ class App:
             (f"{mod}+S", "Save the project (.dmps)"),
             (f"{mod}+E", "Generate the DMP worksheet (next revision)"),
             (f"{mod}+D", "Generate the door chart (next revision)"),
+            (f"{mod}+R", "Generate the vector riser bundle (next revision)"),
+            ("Delete / Backspace", "Delete selected riser markup or cable"),
+            ("Arrow keys", "Nudge selected riser objects on the grid"),
             ("Double-click / Return / F2", "Edit the selected zone cell"),
             ("Escape", "Cancel a zone edit"),
         ]

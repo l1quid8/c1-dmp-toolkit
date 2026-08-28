@@ -700,11 +700,20 @@ def compute_device_footprints(devices: list[Device], segments: list,
     for d in devices:
         cx, cy = d.anchor.cx, d.anchor.cy
         hits = [r for r in rects if r[0] - 6 <= cx <= r[2] + 6 and r[1] - 6 <= cy <= r[3] + 6]
-        if hits:
-            # RSP / MSP are drawn rectangles — the box IS the connection footprint.
-            r = min(hits, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]))
-            footprints[d.id] = r
-            rect_of[d.id] = r
+        container = min(hits, key=lambda r: (r[2] - r[0]) * (r[3] - r[1])) \
+            if hits else None
+        if container is not None:
+            # Remember containment independently from the electrical footprint.
+            # A splitter drawn *inside* an RSP/MSP rectangle belongs to that
+            # location, but the whole enclosing rectangle is not its port area.
+            # Collapsing the two made every symbol in a cabinet electrically
+            # indistinguishable from every other symbol in the same cabinet.
+            rect_of[d.id] = container
+
+        if d.kind in ("RSP", "MSP") and container is not None:
+            # RSP / MSP are the actual container devices, so their rectangle is
+            # their connection footprint.
+            footprints[d.id] = container
         elif d.kind == "SPLITTER":
             # Top-of-bus splitter symbols have no plain rectangle; wires tap within
             # ~40pt of the anchor. Keep the box tight so stacked splitters (~100pt
@@ -727,6 +736,87 @@ def compute_device_footprints(devices: list[Device], segments: list,
     return footprints, splitter_on_rsp
 
 
+def _restore_bridge_hops(segments: list, *, align_tol: float = 1.5,
+                         min_leg: float = 30.0, min_gap: float = 8.0,
+                         max_gap: float = 60.0,
+                         min_crossing: float = 30.0) -> list:
+    """Restore straight graph links hidden by CAD jump-over curves.
+
+    PyMuPDF exposes the straight legs of a cable but not the Bezier arc used to
+    hop over an independent crossing.  The result is two collinear wire legs
+    separated by a small gap.  Join only when both legs and the crossed segment
+    are substantial axis-aligned runs; this excludes the many short curves and
+    table/symbol strokes on a riser page.  The synthetic link is deliberately
+    *not* split at the perpendicular crossing, so the two electrical nets remain
+    independent.
+    """
+    horizontal: list[tuple[float, float, float, float]] = []
+    vertical: list[tuple[float, float, float, float]] = []
+    # tuples are (fixed coordinate, interval start, interval end, length)
+    for p1, p2 in segments:
+        x1, y1 = p1
+        x2, y2 = p2
+        length = math.hypot(x2 - x1, y2 - y1)
+        if length < min_leg:
+            continue
+        if abs(y1 - y2) <= align_tol:
+            horizontal.append(((y1 + y2) / 2, min(x1, x2), max(x1, x2), length))
+        if abs(x1 - x2) <= align_tol:
+            vertical.append(((x1 + x2) / 2, min(y1, y2), max(y1, y2), length))
+
+    def inferred_hops(parallel, crossings, horizontal_hop: bool):
+        additions = set()
+        ordered = sorted(parallel)
+        for i, (fixed, start, end, _length) in enumerate(ordered):
+            for fixed2, start2, end2, _length2 in ordered[i + 1:]:
+                if fixed2 - fixed > align_tol:
+                    break
+                if end <= start2:
+                    gap_start, gap_end = end, start2
+                elif end2 <= start:
+                    gap_start, gap_end = end2, start
+                else:
+                    continue
+                gap = gap_end - gap_start
+                if not min_gap < gap <= max_gap:
+                    continue
+                hop_fixed = (fixed + fixed2) / 2
+                crosses = any(
+                    cross_len >= min_crossing
+                    and gap_start + 2 < cross_fixed < gap_end - 2
+                    and cross_start - align_tol <= hop_fixed <= cross_end + align_tol
+                    for cross_fixed, cross_start, cross_end, cross_len in crossings
+                )
+                if not crosses:
+                    continue
+                if horizontal_hop:
+                    additions.add(((gap_start, hop_fixed), (gap_end, hop_fixed)))
+                else:
+                    additions.add(((hop_fixed, gap_start), (hop_fixed, gap_end)))
+        return additions
+
+    links = inferred_hops(horizontal, vertical, True)
+    links.update(inferred_hops(vertical, horizontal, False))
+    if not links:
+        return segments
+    return list(segments) + sorted(links)
+
+
+def _bus_family(device: Device) -> Optional[str]:
+    """Electrical family carried by a riser device, if it is bus-specific."""
+    if device.kind == "RSP":
+        return "LX"
+    if device.kind in ("KEYPAD", "SERVICE_KP"):
+        return "KP"
+    if device.kind == "SPLITTER":
+        device_id = (device.id or "").upper()
+        if "KP" in device_id:
+            return "KP"
+        if "LX" in device_id:
+            return "LX"
+    return None
+
+
 def reconstruct_edges(segments: list, devices: list[Device], spans: list[TextSpan],
                       footprints: dict | None = None,
                       pdf_path: Path | None = None,
@@ -745,7 +835,12 @@ def reconstruct_edges(segments: list, devices: list[Device], spans: list[TextSpa
     INF = 1e18
 
     raw_edges: list[tuple[str, str]] = []
-    for comp_segs in _segment_components(segments):
+    # A container footprint can touch more than one independent wire component.
+    # Leaves still have a single input, so retain the shortest wire-distance
+    # candidate globally instead of emitting one feed per touched component.
+    leaf_candidates: dict[str, tuple[float, str]] = {}
+    wire_segments = _restore_bridge_hops(segments)
+    for comp_segs in _segment_components(wire_segments):
         split = _split_at_junctions(comp_segs)
         nodes, adj = _build_wire_graph(split)
 
@@ -777,24 +872,60 @@ def reconstruct_edges(segments: list, devices: list[Device], spans: list[TextSpa
             for i in present:
                 msp_d[i] = wdist(msp, i)
 
-        # each leaf -> the splitter nearest it along the wires
+        # Each leaf connects only to a splitter on its electrical family.  When
+        # the MSP is present, also require the splitter to be at or above the
+        # leaf's MSP distance: a local downstream splitter can be geometrically
+        # closer to an upstream RSP on the same trunk, but cannot feed backward.
         for lf in leaves:
-            if not splitters:
+            compatible = [s for s in splitters
+                          if _bus_family(by_id[s]) == _bus_family(by_id[lf])]
+            if msp is not None and msp_d.get(lf, INF) < INF:
+                compatible = [s for s in compatible
+                              if msp_d.get(s, INF) <= msp_d[lf] + 8.0]
+            if not compatible:
                 continue
-            best = min(splitters, key=lambda s: wdist(s, lf))
-            if wdist(best, lf) < INF:
-                raw_edges.append((best, lf))
+            best = min(compatible, key=lambda s: wdist(s, lf))
+            distance = wdist(best, lf)
+            if distance < INF:
+                candidate = (distance, best)
+                if lf not in leaf_candidates or candidate < leaf_candidates[lf]:
+                    leaf_candidates[lf] = candidate
 
-        # each splitter's feed -> nearest upstream device (smaller MSP distance)
+        # Each splitter's feed is the nearest *compatible* upstream device.
+        # MSP footprints enclose their internal splitter symbols, so MSP and the
+        # real upstream splitter can have equal graph distance to a remote unit.
+        # Prefer the explicit splitter in that tie; otherwise every downstream
+        # unit is incorrectly promoted to a direct panel feed.
         ordered = sorted(splitters, key=lambda s: msp_d.get(s, INF))
         for k, s in enumerate(ordered):
             upstream = ([msp] if msp is not None else []) + ordered[:k]
-            upstream = [u for u in upstream if u is not None]
+            upstream = [u for u in upstream if u is not None and (
+                by_id[u].kind == "MSP"
+                or _bus_family(by_id[u]) == _bus_family(by_id[s])
+            )]
             if not upstream:
                 continue
-            feed = min(upstream, key=lambda u: wdist(u, s))
+            feed = min(upstream, key=lambda u: (
+                wdist(u, s),
+                0 if by_id[u].kind == "SPLITTER" else 1,
+            ))
             if wdist(feed, s) < INF:
                 raw_edges.append((feed, s))
+
+    raw_edges.extend((src, leaf) for leaf, (_distance, src)
+                     in leaf_candidates.items())
+
+    # A cabinet component can expose MSP -> S while a separate cable component
+    # correctly exposes upstream-splitter -> S.  The latter is the actual input;
+    # retain direct MSP feeds only for splitters with no extracted splitter feed.
+    downstream_splitters = {
+        dst for src, dst in raw_edges
+        if by_id[src].kind == "SPLITTER" and by_id[dst].kind == "SPLITTER"
+    }
+    raw_edges = [
+        (src, dst) for src, dst in raw_edges
+        if not (by_id[src].kind == "MSP" and dst in downstream_splitters)
+    ]
 
     edges: list[Edge] = []
     seen: set = set()

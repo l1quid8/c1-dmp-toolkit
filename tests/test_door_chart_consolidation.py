@@ -20,8 +20,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from parse_dmp_worksheet import DMPDesign, Splitter  # noqa: E402
-from inject_door_chart import inject  # noqa: E402
+from parse_dmp_worksheet import DMPDesign, RSP, Splitter  # noqa: E402
+from inject_door_chart import inject, zone_to_master_row  # noqa: E402
+from hardware import zone_block_for  # noqa: E402
 from test_door_chart_eight_port import _mixed_design  # noqa: E402
 
 DOOR_CHART_TEMPLATE = REPO_ROOT / "door_chart_template_blank.xlsx"
@@ -73,10 +74,10 @@ def test_msp_tab_absent_and_master_intact(tmp_path):
 # -------- truncation --------
 
 def test_truncation_bounds_mixed_design(tmp_path):
-    """3 RSPs (max module 3) and no splitters -> 2 groups on TC/RSPs/PS, 1 on LX."""
+    """3 RSPs become 3 stacked TC charts; compact sheets retain paired groups."""
     out = _inject(tmp_path, _mixed_design())
     zf = zipfile.ZipFile(out)
-    assert _max_sheet_row(zf, 3) == 51   # Terminal Cans: group 2 ends at 27+24
+    assert _max_sheet_row(zf, 3) == 76   # Terminal Cans: chart 3 ends at 52+24
     assert _max_sheet_row(zf, 4) == 51   # RSPs: 28+23
     assert _max_sheet_row(zf, 5) == 24   # Power Supplies: 14+10
     assert _max_sheet_row(zf, 6) == 12   # LX: no splitters, one blanked group kept
@@ -93,11 +94,65 @@ def test_truncation_bounds_mixed_design(tmp_path):
 def test_no_formulas_or_headers_below_cutoff(tmp_path):
     out = _inject(tmp_path, _mixed_design())
     zf = zipfile.ZipFile(out)
-    for sheet_num, cutoff in ((3, 51), (4, 51), (5, 24), (6, 12)):
+    for sheet_num, cutoff in ((3, 76), (4, 51), (5, 24), (6, 12)):
         xml = zf.read(f"xl/worksheets/sheet{sheet_num}.xml").decode()
         for m in re.finditer(r'<c r="[A-Z]+(\d+)"[^>]*?><f>(Master|Header)!', xml):
             assert int(m.group(1)) <= cutoff, \
                 f"sheet{sheet_num}: formula cell on row {m.group(1)} survived truncation"
+
+
+def test_print_layout_uses_chart_group_page_breaks(tmp_path):
+    """Terminal Cans stacks two full-width charts per landscape page."""
+    design = _mixed_design()
+    for number in range(4, 8):
+        design.rsps.append(RSP(
+            number=number,
+            location=f"BUILDING {number}",
+            zones=list(zone_block_for(number)),
+        ))
+    design.splitters = [_lx(i) for i in range(1, 12)]
+
+    wb = openpyxl.load_workbook(_inject(tmp_path, design))
+    expected = {
+        "Terminal Cans": ("$B$1:$D$176", []),
+        "RSPs": ("$B$1:$H$103", [53]),
+        "Power Supplies": ("$B$1:$F$48", [25]),
+        "LX-KP-710s": ("$B$1:$F$72", [25, 49]),
+    }
+    for tab, (print_area, breaks) in expected.items():
+        ws = wb[tab]
+        assert str(ws.print_area).rsplit("!", 1)[-1] == print_area
+        assert [brk.id for brk in ws.row_breaks.brk] == breaks
+        if tab == "Terminal Cans":
+            assert ws.page_setup.fitToWidth is None
+            assert ws.page_setup.fitToHeight is None
+            assert ws.page_setup.scale == 68
+            assert ws.sheet_properties.pageSetUpPr.fitToPage is False
+            assert ws.print_options.horizontalCentered is True
+        else:
+            assert ws.page_setup.fitToWidth == 1
+            assert ws.page_setup.fitToHeight == 0
+            assert ws.page_setup.scale is None
+            assert ws.sheet_properties.pageSetUpPr.fitToPage is True
+
+    tc = wb["Terminal Cans"]
+    # Reading order is flattened from the template's left/right pairs into one
+    # full-width vertical stack.  Two 25-row chart blocks make each printed page.
+    expected_headers = [
+        f"=Master!D{zone_to_master_row(min(rsp.zones))}"
+        for rsp in sorted(design.rsps, key=lambda rsp: rsp.number)
+    ]
+    assert [tc[f"B{row}"].value for row in (7, 32, 57, 82, 107, 132, 157)] == \
+        expected_headers
+    assert all(tc[f"F{row}"].value is None for row in range(1, tc.max_row + 1))
+    assert tc.max_row == 176
+    # Template right-hand charts carry a styled trailing row. In the vertical
+    # stack it must become a plain spacer or Excel prints its border at the top
+    # of the following page, making adjacent charts look clipped/merged.
+    for spacer_row in range(26, tc.max_row + 1, 25):
+        assert all(tc.cell(spacer_row, col).value is None and
+                   not tc.cell(spacer_row, col).has_style
+                   for col in range(2, 5))
 
 
 # -------- LX-KP-710s compaction --------

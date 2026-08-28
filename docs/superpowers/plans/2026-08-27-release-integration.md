@@ -21,15 +21,15 @@
 
 ## Task 1: Baselines and merge
 
-- [ ] Run both source suites using the existing virtual environment; record any pre-existing failures.
+- [x] Run both source suites using the existing virtual environment; record any pre-existing failures.
 - [ ] Merge riser with `--no-commit --no-ff`; reconcile overlapping app, editor, session, validation, and generation code without wholesale ours/theirs resolution.
 - [ ] Preserve independent changes even when Git merges a file without a conflict.
 
 ## Task 2: Cross-feature persistence and editor behavior
 
-- [ ] Write failing tests for schema-1, RemoteLink-schema-2, and riser-schema-2 migration into a combined project.
-- [ ] Prove normal save/load and recovery retain RemoteLink config/zone overrides plus riser connections/layout.
-- [ ] Update schema and reconcile topology mutations so zone override values survive structural edits.
+- [x] Write failing tests for schema-1, RemoteLink-schema-2, and riser-schema-2 migration into a combined project.
+- [x] Prove normal save/load and recovery retain RemoteLink config/zone overrides plus riser connections/layout.
+- [x] Update schema and reconcile topology mutations so zone override values survive structural edits.
 - [ ] Confirm both RISER and REMOTELINK editors and their generation actions coexist, including invalidation/refresh after topology changes.
 - [ ] Run relevant session, topology, validation, RemoteLink, and editor integration tests; commit the riser merge.
 
@@ -51,3 +51,9 @@
 - Separate worktree created successfully from `40b5dcc`; original worktrees clean.
 - Both source branches use schema 2 for different fields. Combined schema 3 is intentional backward-read protection, not a loss of support for older projects.
 - Integration is tightly coupled; controller owns session/UI merge. A bounded independent chart worker may resolve only the chart-specific files while that work proceeds.
+- Source baselines: RemoteLink 251 passed/6 skipped; riser 355 passed/6 skipped. First combined suite: 443 passed/6 skipped before additional editor regressions.
+- New regression initially failed because a schema-2 reader accepted a combined save. Schema 3 fixes that guard; all eight combined persistence/multi-export tests pass.
+- Chart reconciliation decision: retain checkpoint `eaa8885` physical layout and fixed-scale pagination, not the competing 68% vertical-stack rewrite from the riser branch. Riser topology/worksheet changes remain intact; mixed-port mapping and per-RSP AUX labels must be retained.
+- Independent persistence review reproduced three inherited riser risks. Five failing regressions pin exact legacy splitter-ID collisions, pre-drawing graph loss during save/recovery, last-edge resurrection, and lossy legacy refresh of canonical drafts. Fixes preserve canonical graph ownership and reject ID collisions before any mutation.
+- UI merge resolved; 16 new editor tests cover both tabs/four actions, combined warnings, read-only RemoteLink preview, project-independent inspector, undo/redo, and narrow-window footer/sheet layout.
+- Print reconciliation runs in a separate detached scratch worktree from `746b4eb`, merging `eaa8885`. Its verified merge commit will join the integration branch after the first merge, preserving both original histories.

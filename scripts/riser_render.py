@@ -1,0 +1,334 @@
+"""SVG/PDF renderers and revision-matched riser output bundles."""
+
+from __future__ import annotations
+
+import base64
+import html
+import os
+import re
+import tempfile
+from pathlib import Path
+
+import fitz
+
+from paths import resource_path
+from riser_scene import (
+    BRIDGE_HALF_WIDTH,
+    BRIDGE_HEIGHT,
+    TITLE_BLOCK_WIDTH,
+    find_bridges,
+    route_label_point,
+)
+
+
+MASTER_WIDTH = 36 * 72
+MASTER_HEIGHT = 24 * 72
+SMALL_WIDTH = 17 * 72
+SMALL_HEIGHT = 11 * 72
+
+
+def _esc(value) -> str:
+    return html.escape(str(value or ""), quote=True)
+
+
+def _slug(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", (value or "").strip()).strip("_") or "UNTITLED"
+
+
+def _logo_data() -> str:
+    path = resource_path("logos/c1_logo.png")
+    try:
+        return base64.b64encode(path.read_bytes()).decode("ascii")
+    except OSError:
+        return ""
+
+
+def _connection_map(design):
+    return {edge.id: edge for edge in design.connections}
+
+
+def _route_path(connection_id: str, points, bridges) -> str:
+    if not points:
+        return ""
+    commands = [f"M {points[0][0]:.2f} {points[0][1]:.2f}"]
+    route_bridges = [b for b in bridges if b.connection_id == connection_id]
+    for start, end in zip(points, points[1:]):
+        if start[1] == end[1]:
+            forward = end[0] >= start[0]
+            crossings = [b for b in route_bridges
+                         if b.orientation == "horizontal"
+                         and min(start[0], end[0]) + BRIDGE_HALF_WIDTH <= b.x
+                         <= max(start[0], end[0]) - BRIDGE_HALF_WIDTH
+                         and abs(b.y - start[1]) < 0.01]
+            crossings.sort(key=lambda b: b.x, reverse=not forward)
+            for bridge in crossings:
+                before = (bridge.x - BRIDGE_HALF_WIDTH if forward
+                          else bridge.x + BRIDGE_HALF_WIDTH)
+                after = (bridge.x + BRIDGE_HALF_WIDTH if forward
+                         else bridge.x - BRIDGE_HALF_WIDTH)
+                commands.append(f"L {before:.2f} {start[1]:.2f}")
+                commands.append(
+                    f"Q {bridge.x:.2f} {start[1] - BRIDGE_HEIGHT:.2f} "
+                    f"{after:.2f} {start[1]:.2f}")
+            commands.append(f"L {end[0]:.2f} {end[1]:.2f}")
+        elif start[0] == end[0]:
+            forward = end[1] >= start[1]
+            crossings = [b for b in route_bridges
+                         if b.orientation == "vertical"
+                         and min(start[1], end[1]) + BRIDGE_HALF_WIDTH <= b.y
+                         <= max(start[1], end[1]) - BRIDGE_HALF_WIDTH
+                         and abs(b.x - start[0]) < 0.01]
+            crossings.sort(key=lambda b: b.y, reverse=not forward)
+            for bridge in crossings:
+                before = (bridge.y - BRIDGE_HALF_WIDTH if forward
+                          else bridge.y + BRIDGE_HALF_WIDTH)
+                after = (bridge.y + BRIDGE_HALF_WIDTH if forward
+                         else bridge.y - BRIDGE_HALF_WIDTH)
+                commands.append(f"L {start[0]:.2f} {before:.2f}")
+                commands.append(
+                    f"Q {start[0] + BRIDGE_HEIGHT:.2f} {bridge.y:.2f} "
+                    f"{start[0]:.2f} {after:.2f}")
+            commands.append(f"L {end[0]:.2f} {end[1]:.2f}")
+        else:
+            commands.append(f"L {end[0]:.2f} {end[1]:.2f}")
+    return " ".join(commands)
+
+
+def _device_detail(design, ref: str) -> str:
+    if ref.startswith("RSP-"):
+        number = int(ref.split("-", 1)[1])
+        rsp = next((r for r in design.rsps if r.number == number), None)
+        if rsp:
+            zone = f"Z{min(rsp.zones)}–Z{max(rsp.zones)}" if rsp.zones else ""
+            return " · ".join(x for x in (rsp.model, zone) if x)
+    return ""
+
+
+def _is_splitter(design, ref: str) -> bool:
+    return any(splitter.id == ref for splitter in design.splitters)
+
+
+def _wrap_words(value: str, maximum_characters: int) -> list[str]:
+    words = (value or "").replace("\n", " ").split()
+    if not words:
+        return [""]
+    lines: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        if len(current) + 1 + len(word) <= maximum_characters:
+            current += f" {word}"
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def _svg_bytes(design, document, *, width, height, physical_width: str,
+               physical_height: str, profile: str = "24x36") -> bytes:
+    small = profile == "11x17"
+    secondary_size = 13.2 if small else 11
+    cable_size = 15.3 if small else 14
+    bridges = find_bridges({key: route.points for key, route in document.routes.items()})
+    connections = _connection_map(design)
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        (f'<svg xmlns="http://www.w3.org/2000/svg" '
+         f'xmlns:xlink="http://www.w3.org/1999/xlink" width="{physical_width}" '
+         f'height="{physical_height}" viewBox="0 0 {document.page_width:.0f} {document.page_height:.0f}">'),
+        ('<defs><marker id="arrowhead" markerWidth="10" markerHeight="7" '
+         'refX="9" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" '
+         ' fill="context-stroke"/></marker></defs>'),
+        '<rect width="100%" height="100%" fill="white"/>',
+        '<g id="drawing" font-family="Arial, Helvetica, sans-serif" fill="#111111">',
+    ]
+
+    for element_id in document.z_order:
+        element = document.elements.get(element_id)
+        if element is None:
+            continue
+        if element.kind == "location":
+            lines.append(
+                f'<g id="{_esc(element.id)}" class="location"><rect x="{element.x:.2f}" '
+                f'y="{element.y:.2f}" width="{element.width:.2f}" height="{element.height:.2f}" '
+                'rx="8" fill="none" stroke="#8b949e" stroke-width="1" '
+                'stroke-dasharray="8 5"/><line x1="{:.2f}" y1="{:.2f}" x2="{:.2f}" y2="{:.2f}" '
+                'stroke="#d7dde3" stroke-width="1"/><text x="{:.2f}" y="{:.2f}" '
+                'font-size="{:.1f}" font-weight="bold">{}</text></g>'.format(
+                    element.x, element.y + 34, element.x + element.width, element.y + 34,
+                    element.x + 12, element.y + 22,
+                    13.2 if small else 13, _esc(element.ref)))
+            continue
+        if element.kind != "device":
+            continue
+        x, y, w, h = element.x, element.y, element.width, element.height
+        lines.append(f'<g id="{_esc(element.id)}" class="device {_esc(element.ref)}">')
+        if element.ref.startswith("KEYPAD-"):
+            lines.append(f'<ellipse cx="{x + w/2:.2f}" cy="{y + h/2:.2f}" rx="{w/2:.2f}" '
+                         f'ry="{h/2:.2f}" fill="white" stroke="#111" stroke-width="2"/>')
+        else:
+            lines.append(f'<rect x="{x:.2f}" y="{y:.2f}" width="{w:.2f}" height="{h:.2f}" '
+                         'rx="4" fill="white" stroke="#111" stroke-width="2"/>')
+        lines.append(f'<text x="{x + w/2:.2f}" y="{y + h/2 - 3:.2f}" text-anchor="middle" '
+                     f'font-size="18" font-weight="bold">{_esc(element.ref)}</text>')
+        detail = _device_detail(design, element.ref)
+        if detail:
+            lines.append(f'<text x="{x + w/2:.2f}" y="{y + h/2 + 17:.2f}" text-anchor="middle" '
+                         f'font-size="{13.2 if small else 13}">{_esc(detail)}</text>')
+        if _is_splitter(design, element.ref):
+            lines.append(f'<text x="{x + w/2:.2f}" y="{y + 12:.2f}" text-anchor="middle" font-size="{secondary_size}">IN</text>')
+            for index in range(1, 4):
+                px = x + w * index / 4
+                lines.append(f'<text x="{px:.2f}" y="{y + h - 7:.2f}" text-anchor="middle" '
+                             f'font-size="{secondary_size}">OUT {index}</text>')
+        lines.append('</g>')
+
+    lines.append('<g id="topology" fill="none" stroke="#111" stroke-width="1.2">')
+    for connection_id, route in document.routes.items():
+        path_d = _route_path(connection_id, route.points, bridges)
+        lines.append(f'<path id="route-{_esc(connection_id)}" d="{path_d}"/>')
+    lines.append('</g>')
+    lines.append(f'<g id="cable-labels" font-size="{cable_size}" font-weight="bold">')
+    for connection_id, route in document.routes.items():
+        edge = connections.get(connection_id)
+        if edge is None or not route.points:
+            continue
+        x, y = route_label_point(route.points) or (0.0, 0.0)
+        x += route.label_offset[0]
+        y += route.label_offset[1]
+        lines.append(f'<text x="{x:.2f}" y="{y:.2f}" text-anchor="middle">{_esc(edge.label)}</text>')
+    lines.append('</g>')
+
+    lines.append('<g id="markup">')
+    annotations = sorted(
+        document.annotations,
+        key=lambda item: (document.z_order.index(item.id)
+                          if item.id in document.z_order else len(document.z_order)))
+    for annotation in annotations:
+        points = " ".join(f"{x:.2f},{y:.2f}" for x, y in annotation.points)
+        stroke_width = max(annotation.stroke_width, 0.77 if small else 0.0)
+        common = (f'stroke="{_esc(annotation.stroke)}" stroke-width="{stroke_width:.2f}" '
+                  f'fill="{_esc(annotation.fill or "none")}"')
+        if annotation.kind == "text" and annotation.points:
+            x, y = annotation.points[0]
+            anchor = {"left": "start", "center": "middle", "right": "end"}.get(
+                annotation.alignment, "start")
+            font_size = max(annotation.font_size, 13.2 if small else 0.0)
+            lines.append(f'<text id="{_esc(annotation.id)}" x="{x:.2f}" y="{y:.2f}" '
+                         f'font-size="{font_size:.2f}" font-weight="{_esc(annotation.font_weight)}" '
+                         f'text-anchor="{anchor}" fill="{_esc(annotation.stroke)}">'
+                         f'{_esc(annotation.text)}</text>')
+        elif annotation.kind in {"rectangle", "ellipse"} and len(annotation.points) >= 2:
+            (x1, y1), (x2, y2) = annotation.points[:2]
+            if annotation.kind == "rectangle":
+                lines.append(f'<rect id="{_esc(annotation.id)}" x="{min(x1,x2):.2f}" y="{min(y1,y2):.2f}" '
+                             f'width="{abs(x2-x1):.2f}" height="{abs(y2-y1):.2f}" {common}/>')
+            else:
+                lines.append(f'<ellipse id="{_esc(annotation.id)}" cx="{(x1+x2)/2:.2f}" cy="{(y1+y2)/2:.2f}" '
+                             f'rx="{abs(x2-x1)/2:.2f}" ry="{abs(y2-y1)/2:.2f}" {common}/>')
+        elif len(annotation.points) >= 2:
+            marker = ' marker-end="url(#arrowhead)"' if annotation.kind == "arrow" else ""
+            lines.append(f'<polyline id="{_esc(annotation.id)}" points="{points}" '
+                         f'{common}{marker}/>')
+    lines.append('</g>')
+
+    tb = document.title_block
+    tx = document.page_width - TITLE_BLOCK_WIDTH
+    lines.append('<g id="title-block" stroke="#111" fill="white">')
+    lines.append(f'<rect x="{tx:.2f}" y="36" width="{TITLE_BLOCK_WIDTH - 36:.2f}" '
+                 f'height="{document.page_height - 72:.2f}" stroke-width="2"/>')
+    logo = _logo_data()
+    if logo:
+        lines.append(f'<image x="{tx + 22:.2f}" y="64" width="{TITLE_BLOCK_WIDTH - 80:.2f}" height="80" '
+                     f'preserveAspectRatio="xMidYMid meet" xlink:href="data:image/png;base64,{logo}"/>')
+    text_rows = [
+        (170, tb.school_name, 18, "bold"),
+        (205, tb.address.replace("\n", " · "), 12, "normal"),
+        (245, f"LOCAL CODE: {tb.local_code}", 12, "bold"),
+        (310, tb.project_title, 14, "bold"),
+        (370, tb.drawing_title, 18, "bold"),
+        (410, f"SYSTEM: {tb.system}", 12, "bold"),
+        (470, f"DRAWN BY: {tb.drawn_by}", 11, "normal"),
+        (500, f"CHECKED BY: {tb.checked_by}", 11, "normal"),
+        (530, f"DATE: {tb.issue_date}", 11, "normal"),
+        (document.page_height - 115, f"SHEET {tb.sheet_number}", 20, "bold"),
+    ]
+    for index, revision in enumerate(tb.revisions[-6:]):
+        text_rows.append((590 + index * 25, f"REV: {revision}", 11, "normal"))
+    text_width = TITLE_BLOCK_WIDTH - 60
+    text_center = tx + (TITLE_BLOCK_WIDTH - 36) / 2
+    for y, text, size, weight in text_rows:
+        size = max(size, secondary_size)
+        maximum_characters = max(8, int(text_width / max(1.0, size * 0.6)))
+        wrapped = _wrap_words(str(text or ""), maximum_characters)
+        line_height = size * 1.15
+        first_y = y - (len(wrapped) - 1) * line_height / 2
+        tspans = "".join(
+            f'<tspan x="{text_center:.2f}" y="{first_y + index * line_height:.2f}">'
+            f'{_esc(line)}</tspan>'
+            for index, line in enumerate(wrapped)
+        )
+        lines.append(f'<text x="{text_center:.2f}" y="{y:.2f}" '
+                     f'text-anchor="middle" stroke="none" fill="#111" font-size="{size}" '
+                     f'font-weight="{weight}">{tspans}</text>')
+    lines.append('</g></g></svg>')
+    return "\n".join(lines).encode("utf-8")
+
+
+def render_svg(design, document, output_path: str | Path) -> Path:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(_svg_bytes(
+        design, document, width=MASTER_WIDTH, height=MASTER_HEIGHT,
+        physical_width="36in", physical_height="24in", profile="24x36"))
+    return output_path
+
+
+def render_pdf(design, document, output_path: str | Path, *, profile: str = "24x36") -> Path:
+    if profile not in {"24x36", "11x17"}:
+        raise ValueError("profile must be 24x36 or 11x17")
+    width, height = ((MASTER_WIDTH, MASTER_HEIGHT) if profile == "24x36"
+                     else (SMALL_WIDTH, SMALL_HEIGHT))
+    svg = _svg_bytes(design, document, width=width, height=height,
+                     physical_width=str(width), physical_height=str(height),
+                     profile=profile)
+    source = fitz.open(stream=svg, filetype="svg")
+    pdf_bytes = source.convert_to_pdf()
+    source.close()
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(pdf_bytes)
+    return output_path
+
+
+def _next_revision(output_dir: Path, slug: str) -> int:
+    pattern = re.compile(rf"^{re.escape(slug)}_riser_rev(\d+)(?:_|\.)")
+    revisions = []
+    if output_dir.exists():
+        for path in output_dir.iterdir():
+            match = pattern.match(path.name)
+            if match:
+                revisions.append(int(match.group(1)))
+    return max(revisions, default=0) + 1
+
+
+def generate_riser_bundle(design, document, output_dir: str | Path) -> list[Path]:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    slug = _slug(design.site_info.school_name or "UNTITLED")
+    revision = _next_revision(output_dir, slug)
+    names = [
+        f"{slug}_riser_rev{revision}_24x36.pdf",
+        f"{slug}_riser_rev{revision}_11x17.pdf",
+        f"{slug}_riser_rev{revision}.svg",
+    ]
+    with tempfile.TemporaryDirectory(prefix=f".{slug}_riser_", dir=output_dir) as staging:
+        staging_dir = Path(staging)
+        staged = [staging_dir / name for name in names]
+        render_pdf(design, document, staged[0], profile="24x36")
+        render_pdf(design, document, staged[1], profile="11x17")
+        render_svg(design, document, staged[2])
+        final = [output_dir / name for name in names]
+        for source, target in zip(staged, final):
+            os.replace(source, target)
+    return final

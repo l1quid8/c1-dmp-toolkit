@@ -136,9 +136,13 @@ def remove_expander(design: DMPDesign, number: int) -> None:
 # -------- splitters --------
 
 _SPLITTER_NUM_RE = re.compile(r"(\d+)\s*$")
+_LX_BUS_ID_RE = re.compile(r"^710-LX(\d{3})-", re.I)
+_BUS_INPUT_RE = re.compile(r"(\d{3})\s*BUS", re.I)
 
 
-def _splitter_id(splitter_type: str, n: int) -> str:
+def _splitter_id(splitter_type: str, n: int, *, existing_id: str | None = None) -> str:
+    if existing_id and _SPLITTER_NUM_RE.search(existing_id):
+        return _SPLITTER_NUM_RE.sub(str(n), existing_id)
     return f"710-LX500-{n}" if splitter_type == "LX" else f"710-KP-{n}"
 
 
@@ -147,12 +151,32 @@ def _splitter_number(splitter: Splitter) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _splitter_bus(splitter: Splitter) -> str | None:
+    """Return an LX splitter's electrical bus, including legacy IDs."""
+    if splitter.splitter_type != "LX":
+        return None
+    match = _LX_BUS_ID_RE.match(splitter.id or "")
+    if match:
+        return match.group(1)
+    for value in (splitter.inputs or {}).values():
+        match = _BUS_INPUT_RE.search(value or "")
+        if match:
+            return match.group(1)
+    # Legacy LX-710-N identifiers do not encode the bus.  Historical files
+    # without a bus-bearing input were LX500 designs.
+    return "500"
+
+
 def _used_numbers(design: DMPDesign, splitter_type: str,
-                  exclude: Splitter | None = None) -> set[int]:
+                  exclude: Splitter | None = None, *, bus: str | None = None) -> set[int]:
     """Trailing numbers already taken by splitters of this type."""
+    if splitter_type == "LX":
+        bus = bus or "500"
     used = set()
     for s in design.splitters:
         if s.splitter_type != splitter_type or s is exclude:
+            continue
+        if splitter_type == "LX" and _splitter_bus(s) != bus:
             continue
         n = _splitter_number(s)
         if n is not None:
@@ -214,13 +238,43 @@ def renumber_splitter(design: DMPDesign, splitter_id: str,
         raise HardwareError(
             f"Splitter number must be between 1 and {MAX_SPLITTERS_PER_TYPE}."
         )
-    new_id = _splitter_id(splitter.splitter_type, new_number)
-    if new_number in _used_numbers(design, splitter.splitter_type, exclude=splitter):
+    new_id = _splitter_id(
+        splitter.splitter_type, new_number, existing_id=splitter.id)
+    # Legacy LX-710-N names do not encode their bus. A chained input may
+    # therefore resolve to a different numbering pool even when the final ID
+    # collides. IDs are graph/layout keys, so reject exact collisions first.
+    if any(s is not splitter and s.id == new_id for s in design.splitters):
+        raise HardwareError(f"{new_id} already exists. Pick a free number.")
+    if new_number in _used_numbers(
+            design, splitter.splitter_type, exclude=splitter,
+            bus=_splitter_bus(splitter)):
         raise HardwareError(f"{new_id} already exists. Pick a free number.")
 
     old_id = splitter.id
     splitter.id = new_id
     _retoken_splitter_refs(design, old_id, new_id)
+
+    # Schema-2 connections are canonical. Renumber their endpoint references
+    # in place so cable IDs, metadata, and manual routes remain stable.
+    from riser_model import DevicePortRef
+    for edge in getattr(design, "connections", []):
+        if edge.source.device_id == old_id:
+            edge.source = DevicePortRef(new_id, edge.source.port_id)
+        if edge.target.device_id == old_id:
+            edge.target = DevicePortRef(new_id, edge.target.port_id)
+
+    document = getattr(design, "riser_document", None)
+    if document is not None:
+        old_key, new_key = f"device:{old_id}", f"device:{new_id}"
+        element = document.elements.pop(old_key, None)
+        if element is not None:
+            element.id = new_key
+            element.ref = new_id
+            document.elements[new_key] = element
+            document.z_order = [new_key if item == old_key else item
+                                for item in document.z_order]
+        document.unplaced = [new_id if item == old_id else item
+                             for item in document.unplaced]
     design.splitters.sort(key=lambda s: (s.splitter_type, _splitter_number(s) or 0))
     return splitter
 

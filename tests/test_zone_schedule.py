@@ -12,7 +12,11 @@ import sys
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from parse_zone_schedule import extract_zones  # noqa: E402
+from parse_zone_schedule import (  # noqa: E402
+    extract_address_from_title_block,
+    extract_combus_lines,
+    extract_zones,
+)
 
 
 def _by_num(records):
@@ -75,3 +79,71 @@ def test_no_false_zone_from_noise_lines():
     ])
     zones = _by_num(extract_zones(text))
     assert set(zones) == {510}
+
+
+def test_title_block_address_accepts_street_name_without_suffix():
+    """Some C1 title blocks omit AVE/ST even though the site address is valid."""
+    text = "\n".join([
+        "9000 ROCHESTER AVE #150",
+        "RANCHO CUCAMONGA, CA 91730",
+        "2025 GRIFFIN, LOS ANGELES, CA 90031",
+    ])
+
+    assert extract_address_from_title_block(text) == {
+        "address_line1": "2025 GRIFFIN",
+        "address_line2": "LOS ANGELES, CA 90031",
+    }
+
+
+def test_combus_rows_survive_reordered_zone_schedule_text_before_table():
+    """CAD/OCR ordering can emit a neighboring schedule before COMBUS rows."""
+    text = "\n".join([
+        "SCHOOL NAME: TARZANA ES",
+        "COMBUS LINES (RSP & KEYPADS)",
+        "GENERAL NOTES:",
+        "MOTION DETECTOR ZONE SCHEDULE",
+        "ZONE NO.",
+        "Z549/RSP4",
+        "KINDERGARTEN BLDG",
+        "NO.",
+        "BUILDING",
+        "FLOOR NO.",
+        "ROOM/AREA",
+        "FED FROM",
+        "CABLE TYPE",
+        "KEYPAD 1",
+        "MAIN BLDG (SERVICE KP)",
+        "1ST FLR",
+        "SUPPLY ROOM",
+        "MSP",
+        "(N)WP240",
+        "KEYPAD 2",
+        "MAIN BLDG",
+        "1ST FLR",
+        "MAIN OFFICE",
+        "MSP",
+        "(N)AQC240",
+        "KEYPAD 3",
+        "AUDITORIUM",
+        "1ST FLR",
+        "CAFE MANAGER'S OFFICE",
+        "MSP",
+        "(N)AQC240",
+        "KEYPAD 4",
+        "BLDG X1325M",
+        "1ST FLR",
+        "CLERK'S AREA",
+        "MSP",
+        "(N)AQC240",
+        "SCHOOL NAME: TARZANA ES",
+        "MOTION DETECTOR ZONE SCHEDULE",
+    ])
+
+    rows = extract_combus_lines(text)
+
+    assert [(row.kind, row.n, row.room) for row in rows] == [
+        ("KEYPAD", 1, "SUPPLY ROOM"),
+        ("KEYPAD", 2, "MAIN OFFICE"),
+        ("KEYPAD", 3, "CAFE MANAGER'S OFFICE"),
+        ("KEYPAD", 4, "CLERK'S AREA"),
+    ]

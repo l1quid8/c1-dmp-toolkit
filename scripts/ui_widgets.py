@@ -34,6 +34,211 @@ import theme
 _NAV_KEYS = {"Up", "Down", "Return", "Escape", "Tab", "Left", "Right"}
 
 
+def filter_choice_values(values: list[str], query: str) -> list[str]:
+    """Case-insensitive substring search with prefix matches shown first."""
+    typed = (query or "").strip().casefold()
+    if not typed:
+        return list(values)
+    matches = [(index, value) for index, value in enumerate(values)
+               if typed in value.casefold()]
+    matches.sort(key=lambda item: (
+        not item[1].casefold().startswith(typed), item[0]))
+    return [value for _index, value in matches]
+
+
+class SearchableComboBox(ctk.CTkComboBox):
+    """A CTkComboBox whose popup filters as the user types.
+
+    The stock CustomTkinter combo is editable but its menu always remains a
+    static list. This keeps the familiar field + chevron appearance while
+    using an in-window Listbox that can be narrowed without leaving the field.
+    By default typed text must resolve to one of the choices; ``allow_custom``
+    preserves the splitter-IN editor's existing free-text behavior.
+    """
+
+    def __init__(self, master, *, values: list[str], allow_custom: bool = False,
+                 max_visible: int = 8, **combo_kw):
+        self._choice_values = list(values)
+        self._allow_custom = allow_custom
+        self._max_visible = max_visible
+        self._popup: tk.Listbox | None = None
+        self._popup_anchor: tuple[int, int, int, int] | None = None
+        self._popup_watch_job: str | None = None
+        self._committed = ""
+        super().__init__(master, values=self._choice_values, **combo_kw)
+        self._committed = self.get()
+
+        self.bind("<KeyRelease>", self._on_key_release)
+        self.bind("<Down>", self._focus_popup)
+        self.bind("<Return>", self._commit_entry)
+        self.bind("<Escape>", lambda _event: self._cancel_search())
+        self.bind("<FocusOut>", self._on_focus_out)
+        self.bind("<Destroy>", lambda _event: self._hide())
+
+    def configure(self, require_redraw=False, **kwargs):
+        if "values" in kwargs:
+            self._choice_values = list(kwargs["values"])
+        return super().configure(require_redraw=require_redraw, **kwargs)
+
+    def set(self, value: str):
+        super().set(value)
+        self._committed = value
+
+    def _on_key_release(self, event):
+        if event.keysym in _NAV_KEYS:
+            return
+        self._show(filter_choice_values(self._choice_values, self.get()))
+
+    def _clicked(self, event=None):
+        if self._state is not tk.DISABLED and self._choice_values:
+            self._show(self._choice_values)
+
+    def _show(self, items: list[str]):
+        if not items:
+            self._hide()
+            return
+        top = self.winfo_toplevel()
+        if self._popup is None:
+            self._popup = tk.Listbox(
+                top, activestyle="none", highlightthickness=1,
+                highlightcolor=theme.resolve(theme.ACCENT),
+                relief="solid", borderwidth=1,
+                bg=theme.resolve(theme.SURFACE),
+                fg=theme.resolve(theme.TEXT),
+                selectbackground=theme.resolve(theme.ACCENT),
+                selectforeground=theme.resolve(theme.ON_ACCENT),
+                font=("", 12), exportselection=False,
+            )
+            self._popup.bind("<Return>", lambda _event: self._accept())
+            self._popup.bind("<ButtonRelease-1>", lambda _event: self._accept())
+            self._popup.bind("<Escape>", lambda _event: self._cancel_search())
+            self._popup.bind("<Tab>", lambda _event: self._accept())
+            self._popup.bind("<FocusOut>", self._on_focus_out)
+        self._popup.delete(0, "end")
+        for item in items:
+            self._popup.insert("end", item)
+        self._popup.configure(height=min(len(items), self._max_visible))
+
+        x = self.winfo_rootx() - top.winfo_rootx()
+        y = self.winfo_rooty() - top.winfo_rooty() + self.winfo_height()
+        self._popup.place(x=x, y=y, width=max(self.winfo_width(), 120))
+        self._popup.lift()
+        self._popup_anchor = self._anchor_geometry()
+        if self._popup_watch_job is None:
+            self._popup_watch_job = self.after(40, self._watch_anchor)
+
+    def _hide(self):
+        if self._popup_watch_job is not None:
+            try:
+                self.after_cancel(self._popup_watch_job)
+            except tk.TclError:
+                pass
+            self._popup_watch_job = None
+        self._popup_anchor = None
+        if self._popup is not None:
+            self._popup.destroy()
+            self._popup = None
+
+    def _anchor_geometry(self) -> tuple[int, int, int, int]:
+        return (self.winfo_rootx(), self.winfo_rooty(),
+                self.winfo_width(), self.winfo_height())
+
+    def _anchor_is_attached(self) -> bool:
+        """True while this control still belongs to a visible tab/card tree."""
+        widget = self
+        top = self.winfo_toplevel()
+        while widget is not top:
+            if not widget.winfo_manager():
+                return False
+            widget = widget.master
+        return True
+
+    def _watch_anchor(self):
+        """Dismiss a root-level popup when scrolling or navigation moves it."""
+        self._popup_watch_job = None
+        if self._popup is None:
+            return
+        try:
+            moved = self._anchor_geometry() != self._popup_anchor
+            detached = not self._anchor_is_attached()
+        except tk.TclError:
+            self._hide()
+            return
+        if moved or detached:
+            self._hide()
+            return
+        self._popup_watch_job = self.after(40, self._watch_anchor)
+
+    def _focus_popup(self, _event=None):
+        query = self.get() if self.get() != self._committed else ""
+        if self._popup is None:
+            self._show(filter_choice_values(self._choice_values, query))
+        if self._popup is not None and self._popup.size():
+            self._popup.focus_set()
+            self._popup.selection_clear(0, "end")
+            self._popup.selection_set(0)
+            self._popup.activate(0)
+        return "break"
+
+    def _accept(self):
+        if self._popup is None or not self._popup.curselection():
+            return "break"
+        value = self._popup.get(self._popup.curselection()[0])
+        self._choose(value)
+        return "break"
+
+    def _choose(self, value: str):
+        self._hide()
+        # Commit before invoking the editor callback: a rejected topology
+        # change may rebuild the card (and destroy this widget) immediately.
+        super().set(value)
+        self._committed = value
+        if self._command is not None:
+            self._command(value)
+        try:
+            if self.winfo_exists():
+                self.focus_set()
+                self._entry.icursor("end")
+        except tk.TclError:
+            pass
+
+    def _commit_entry(self, _event=None):
+        typed = self.get().strip()
+        exact = next((value for value in self._choice_values
+                      if value.casefold() == typed.casefold()), None)
+        if exact is not None:
+            if exact != self._committed:
+                self._choose(exact)
+            else:
+                self._hide()
+            return "break"
+        if self._allow_custom:
+            changed = typed != self._committed
+            super().set(typed)
+            self._committed = typed
+            self._hide()
+            if changed and self._command is not None:
+                self._command(typed)
+            return "break"
+        super().set(self._committed)
+        self._hide()
+        return "break"
+
+    def _cancel_search(self):
+        super().set(self._committed)
+        self._hide()
+        self.focus_set()
+        return "break"
+
+    def _on_focus_out(self, _event):
+        self.after(120, self._finish_focus_out)
+
+    def _finish_focus_out(self):
+        if self._popup is not None and self.focus_get() is self._popup:
+            return
+        self._commit_entry()
+
+
 class AutocompleteEntry(ctk.CTkEntry):
     """A CTkEntry with a type-ahead dropdown over `suggestions`.
 

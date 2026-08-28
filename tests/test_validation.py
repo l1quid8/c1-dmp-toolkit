@@ -20,6 +20,7 @@ from parse_dmp_worksheet import (  # noqa: E402
     Splitter,
     ZoneInfo,
 )
+from riser_model import DevicePortRef, TopologyConnection  # noqa: E402
 from validation import (  # noqa: E402
     Issue,
     badge_counts,
@@ -235,6 +236,44 @@ def test_remotelink_config_issue_routes_to_warning_badge_without_blocking():
     assert hit.tab == "REMOTELINK"
     assert hit.severity == "warning"
     assert finalize_ok(issues)
+
+# -------- topology.duplicate_port (generation only) --------
+
+def test_duplicate_topology_ports_are_reported_only_for_generation():
+    design = _valid_design()
+    design.connections = [
+        TopologyConnection(
+            "edge-1",
+            DevicePortRef("MSP", "LX500"),
+            DevicePortRef("710-LX500-1", "IN"),
+        ),
+        TopologyConnection(
+            "edge-2",
+            DevicePortRef("MSP", "LX500"),
+            DevicePortRef("RSP-1", "IN"),
+        ),
+        TopologyConnection(
+            "edge-3",
+            DevicePortRef("710-LX500-1", "OUT1"),
+            DevicePortRef("RSP-1", "IN"),
+        ),
+    ]
+
+    live_issues = validate_design(design, topology_confirmed=True)
+    generation_issues = validate_design(
+        design, topology_confirmed=True, for_generation=True)
+
+    assert "topology.duplicate_port" not in _codes(live_issues)
+    duplicates = [
+        issue for issue in generation_issues
+        if issue.code == "topology.duplicate_port"
+    ]
+    assert [issue.message for issue in duplicates] == [
+        "MSP LX500 has 2 outgoing connections",
+        "RSP-1 IN has 2 incoming connections",
+    ]
+    assert all(issue.severity == "error" and issue.tab == "SPLITTERS"
+               for issue in duplicates)
 
 
 # -------- aggregation --------

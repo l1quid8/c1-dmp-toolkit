@@ -1,7 +1,8 @@
 # C1 DMP Toolkit
 
-Desktop app (macOS + Windows) that turns a security-system design PDF into two
-Excel deliverables: a **DMP Installation Worksheet** and a **Door Chart** —
+Desktop app (macOS + Windows) that turns a security-system design PDF into a
+**DMP Installation Worksheet**, **Door Chart**, editable **Riser Diagram**, and
+encrypted **RemoteLink Account** —
 with a built-in editor for correcting the design in the field before anything
 is generated.
 
@@ -15,12 +16,14 @@ is generated.
 - an existing DMP worksheet (`.xlsx`), or
 - a saved project (`.dmps`) from a previous visit.
 
-**Outputs** — revision-numbered Excel files, generated on demand from the
+**Outputs** — revision-numbered files, generated on demand from the
 editor:
 
 - `school_dmp_rev1.xlsx`, `rev2`, … — the DMP Installation Worksheet
 - `school_door_chart_rev1.xlsx`, … — the Door Chart, built from the newest
   worksheet
+- `school_riser_rev1_24x36.pdf`, `school_riser_rev1_11x17.pdf`, and
+  `school_riser_rev1.svg` — one revision-matched vector riser bundle
 
 Prior revisions are kept on disk, so the working loop is: **generate → print →
 review with the site superintendent → edit → regenerate.**
@@ -38,7 +41,7 @@ recent projects for one-click reopening across days and site visits.
 ### 2. Edit
 
 Parsing lands in a tabbed editor — **SITE / ZONES / SPLITTERS / KEYPADS /
-POWER / REMOTELINK** — which is the working document; generated files are
+POWER / REMOTELINK / RISER** — which is the working document; generated files are
 artifacts and are never re-imported.
 
 - **SITE** — school details plus RemoteLink panel connection, IP, port, and
@@ -63,6 +66,10 @@ artifacts and are never re-imported.
   live read-back receipt of exactly what the generated account will contain.
   Advanced settings that can make a panel act on its own stay collapsed behind
   an explicit warning.
+- **RISER** — balanced KP/LX auto-layout on one `INT-5.0` sheet, direct device
+  and cable editing, topology-aware connect/reconnect, orthogonal route handles,
+  markup tools, title-block fields, undo/redo, validation jumps, and an Unplaced
+  tray. Electrical changes appear immediately in SPLITTERS and worksheet output.
 - **Validation** runs live (status-bar chips per tab: required IP/gateway/
   tech/date, no blank or placeholder zone descriptions, `RSP-N`/`SPARE`
   naming, conflicts resolved, wiring reviewed). It warns — it never blocks.
@@ -77,6 +84,8 @@ Buttons at the bottom of the editor (also Worksheet menu / keyboard):
 - **Generate Door Chart** (`Cmd/Ctrl+D`) — builds the chart from the newest
   worksheet, warning if the design has changed since that worksheet was
   generated.
+- **Generate Riser** (`Cmd/Ctrl+R`) — writes searchable vector PDFs at 24×36
+  and 11×17 plus a standalone editable SVG from the same saved scene.
 - **Generate RemoteLink Account** — builds an encrypted RemoteLink `.xml`
   account export from the settings reviewed across **SITE, ZONES, KEYPADS, and
   REMOTELINK**. The final dialog is deliberately read-only: it shows the
@@ -128,6 +137,15 @@ plus hover tooltips on the less obvious controls.
 
 A **light / dark** toggle in the header restyles the whole app instantly and
 remembers your choice for next launch.
+
+### Opening older projects
+
+The combined release opens projects from the original app, the RemoteLink
+integration, and the riser integration. Saving keeps both RemoteLink settings
+and the editable riser (connections, layout, routes, and markup) together.
+Combined projects use **schema 3**; older schema-2 builds will ask you to update
+instead of opening a project they cannot preserve. Keep a copy of the original
+`.dmps` if you need to continue using an older build.
 
 ## Repository layout
 
