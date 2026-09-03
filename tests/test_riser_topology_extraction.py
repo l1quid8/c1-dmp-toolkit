@@ -19,6 +19,7 @@ import extract_topology as topology  # noqa: E402
 from extract_topology import Device, TextSpan, reconstruct_edges  # noqa: E402
 from generate_dmp_ws import (  # noqa: E402
     _apply_phase3_topology,
+    _auto_derive_splitter_io,
     _phase3_topology_complete,
 )
 from parse_dmp_worksheet import DMPDesign, Keypad, RSP, Splitter  # noqa: E402
@@ -214,6 +215,59 @@ def test_phase3_maps_preserved_splitter_ids_before_location_order_fallback():
     }
     assert by_id[lx1.id].outputs[0] == f"To {lx2.id}"
     assert by_id[lx2.id].inputs == {"LX-Bus In": f"From {lx1.id}"}
+
+
+def test_auto_derive_uses_electrical_ids_not_location_storage_order():
+    """Fallback roots and assignments must follow printed splitter numbers."""
+    storage_order = [
+        "710-LX500-3",
+        "710-LX500-2",
+        "710-LX500-1",
+        "710-KP-2",
+        "710-KP-1",
+    ]
+    design = DMPDesign(
+        rsps=[RSP(number=number, location=f"RSP ROOM {number}")
+              for number in range(1, 4)],
+        keypads=[Keypad(number=number, source="", location=f"KP ROOM {number}")
+                 for number in range(1, 5)],
+        splitters=[
+            Splitter("710-LX500-3", "LX", location="A CAFETERIA", outputs=[]),
+            Splitter("710-LX500-2", "LX", location="B EAST", outputs=[]),
+            Splitter("710-LX500-1", "LX", location="C MAIN", outputs=[]),
+            Splitter("710-KP-2", "KP", location="A CAFETERIA", outputs=[]),
+            Splitter("710-KP-1", "KP", location="C MAIN", outputs=[]),
+        ],
+    )
+
+    _auto_derive_splitter_io(design)
+
+    assert [splitter.id for splitter in design.splitters] == storage_order
+    by_id = {splitter.id: splitter for splitter in design.splitters}
+    assert by_id["710-LX500-1"].inputs == {
+        "LX-Bus In": "500 BUS IN FROM XR/550",
+    }
+    assert by_id["710-LX500-1"].outputs == [
+        "RSP 1", "To 710-LX500-2", "To 710-LX500-3",
+    ]
+    assert by_id["710-LX500-2"].inputs == {
+        "LX-Bus In": "From 710-LX500-1",
+    }
+    assert by_id["710-LX500-2"].outputs == ["RSP 2", "Spare", "Spare"]
+    assert by_id["710-LX500-3"].inputs == {
+        "LX-Bus In": "From 710-LX500-1",
+    }
+    assert by_id["710-LX500-3"].outputs == ["RSP 3", "Spare", "Spare"]
+    assert by_id["710-KP-1"].inputs == {
+        "KP-Bus In": "KEYPAD BUS IN FROM XR/550",
+    }
+    assert by_id["710-KP-1"].outputs == [
+        "KEYPAD #2", "KEYPAD #3", "To 710-KP-2",
+    ]
+    assert by_id["710-KP-2"].inputs == {
+        "KP-Bus In": "From 710-KP-1",
+    }
+    assert by_id["710-KP-2"].outputs == ["KEYPAD #4", "Spare", "Spare"]
 
 
 def test_phase3_completeness_rejects_two_roots_on_same_panel_port():

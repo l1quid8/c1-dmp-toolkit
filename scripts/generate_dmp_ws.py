@@ -390,8 +390,9 @@ def _auto_derive_splitter_io(design) -> None:
       710-KP-1: in='KEYPAD BUS IN FROM XR/550'; outputs=keypads + 'To 710-KP-N' links, padded
       710-KP-N (N>=2): in='From 710-KP-1'; outputs = remaining keypads round-robin, padded
     """
-    lx = [s for s in design.splitters if s.splitter_type == "LX"]
-    kp = [s for s in design.splitters if s.splitter_type == "KP"]
+    electrical_order = ordered_splitters(design.splitters)
+    lx = [s for s in electrical_order if s.splitter_type == "LX"]
+    kp = [s for s in electrical_order if s.splitter_type == "KP"]
     rsps = sorted(design.rsps, key=lambda r: r.number)
 
     if lx:
