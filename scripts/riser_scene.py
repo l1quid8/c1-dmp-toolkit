@@ -5,7 +5,7 @@ from __future__ import annotations
 import heapq
 import re
 import fitz
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 
 from riser_model import (
     RiserDocument,
@@ -497,9 +497,20 @@ def routing_obstacles(document: RiserDocument, design=None) -> list[RiserElement
     return obstacles
 
 
+INPUT_SIDES = ('top', 'right', 'bottom', 'left')
+INPUT_NORMALS = {'top': (0, -1), 'right': (1, 0), 'bottom': (0, 1), 'left': (-1, 0)}
+
+
+def input_side_point(element: RiserElement, side: str):
+    return {'top': (element.x + element.width / 2, element.y),
+            'right': (element.x + element.width, element.y + element.height / 2),
+            'bottom': (element.x + element.width / 2, element.y + element.height),
+            'left': (element.x, element.y + element.height / 2)}[side]
+
+
 def port_point(element: RiserElement, port_id: str, *, output: bool) -> tuple[float, float]:
-    if not output and element.input_side == 'right':
-        return element.x+element.width, element.y+element.height/2
+    if not output:
+        return input_side_point(element, element.input_side)
     if element.ref == "MSP":
         if port_id == 'KP BUS':
             return (element.x, element.y + element.height / 2)
@@ -827,8 +838,8 @@ def route_topology_connection(edge, source: RiserElement, target: RiserElement,
     else:
         start_lead = (start[0], start[1] + GRID)
 
-    right_input = target.input_side == 'right'
-    target_lead = (end[0]+GRID,end[1]) if right_input else (end[0], end[1] - GRID)
+    normal = INPUT_NORMALS[target.input_side]
+    target_lead = (end[0] + normal[0]*GRID, end[1] + normal[1]*GRID)
 
     def build(prefix, middle_start, middle_end, suffix):
         middle = route_connection(
@@ -934,7 +945,7 @@ def route_topology_connection(edge, source: RiserElement, target: RiserElement,
     if not left_output:
         prefixes.extend(side_leads(source, start, downward=True))
     suffixes = [([target_lead, end], target_lead)]
-    if not right_input:
+    if target.input_side == 'top':
         suffixes.extend(side_leads(target, end, downward=False))
     candidates = [(score(standard, 0), standard)]
     preference = 1
@@ -946,6 +957,35 @@ def route_topology_connection(edge, source: RiserElement, target: RiserElement,
             candidates.append((score(candidate, preference), candidate))
             preference += 1
     return min(candidates, key=lambda item: item[0])[1]
+
+
+def route_rsp_input(edge, source, target, obstacles, *, reserved_segments=(), old_points=()):
+    """Choose a drawing-side attachment without changing the logical IN port."""
+    sides = (target.input_side,) if target.input_side_locked else INPUT_SIDES
+    candidates = []
+    for side in sides:
+        candidate = replace(target, input_side=side)
+        points = route_topology_connection(edge, source, candidate, obstacles,
+                                           reserved_segments=reserved_segments)
+        crossings = sum(_segment_hits_rect(a, b, obstacle, clearance=0)
+                        for a, b in zip(points, points[1:]) for obstacle in obstacles)
+        overlap = sum(_collinear_overlap_length(segment, reserved)
+                      for segment in zip(points, points[1:]) for reserved in reserved_segments)
+        length = sum(abs(a[0]-b[0]) + abs(a[1]-b[1]) for a, b in zip(points, points[1:]))
+        candidates.append(((crossings, overlap, length, len(points), side != target.input_side), side, points))
+    _, side, points = min(candidates, key=lambda candidate: candidate[0])
+    if old_points and side == target.input_side:
+        # Keep hand-placed bends when reattachment still approaches from outside.
+        adapted = reattach_source_route(edge, source, old_points, obstacles)
+        adapted = reattach_route_endpoint(adapted, input_side_point(target, side), at_start=False)
+        normal = INPUT_NORMALS[side]
+        if len(adapted) >= 2:
+            previous, end = adapted[-2:]
+            outward = ((previous[0]-end[0])*normal[0] + (previous[1]-end[1])*normal[1]) > 0
+            if outward and not any(_segment_hits_rect(a, b, obstacle, clearance=0)
+                                   for a, b in zip(adapted, adapted[1:]) for obstacle in obstacles):
+                points = adapted
+    return side, points
 
 
 def _segments(points):

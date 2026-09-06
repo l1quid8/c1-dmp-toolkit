@@ -49,7 +49,7 @@ from topology_service import ensure_explicit_topology, project_legacy_topology
 from riser_render import generate_riser_bundle
 from riser_scene import layout_riser, sync_riser_document, validate_riser
 from editor_tabs import auto_hide_scrollbar
-from tk_compat import install_scrollbar_redraw_fix
+from tk_compat import install_scrollbar_redraw_fix, install_touchpad_scroll
 from rl_injector.account_doc import render_text
 from rl_injector.errors import InjectorError
 from rl_injector.rl_config import resolve_config
@@ -94,7 +94,7 @@ RemoteLink zone type.
    • SPLITTERS — splitter wiring and CAD conflicts. Tick "Wiring reviewed" once you've \
 checked it against the riser diagram (required before FINAL).
    • KEYPADS — location, source, RemoteLink device type, name, and displayed areas.
-   • POWER — RSP / power-supply locations; add or remove expanders here.
+   • RSP/POWER — RSP / power-supply locations; add or remove expanders here.
    • REMOTELINK — account, users, arming model, optional advanced settings, and a live \
 read-back receipt of the account that will be generated.
    • RISER — auto-layout the shared topology, adjust devices and orthogonal cable routes, \
@@ -214,6 +214,7 @@ class App:
         # so a later switch would leave the root window in the wrong palette.
         theme.set_mode(load_prefs().get("appearance_mode", "light"))
         self.root = CTkDnD()
+        install_touchpad_scroll(self.root)
         _version = _app_version()
         self.root.title(APP_NAME + (f"  v{_version}" if _version else ""))
         self.root.geometry("1000x680")
@@ -1510,12 +1511,68 @@ class App:
 
         self.editor.show_issues_dialog(proceed, proceed_label="Generate anyway")
 
+    def _choose_riser_outputs(self):
+        """Choose files while retaining the application's saved output folder."""
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title("Generate Riser")
+        dlg.geometry("520x340")
+        dlg.configure(fg_color=theme.APP_BG)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        result = None
+        saved = load_prefs().get("riser_formats", ["11x17"])
+        if not isinstance(saved, list) or not any(
+                fmt in saved for fmt in ("11x17", "24x36", "svg")):
+            saved = ["11x17"]
+        ctk.CTkLabel(dlg, text="Choose the files to generate",
+                     font=theme.ui_font(16, "bold")).pack(anchor="w", padx=20, pady=(20, 12))
+        choices = {}
+        for fmt, label in (("11x17", "11×17 PDF"), ("24x36", "24×36 PDF"),
+                           ("svg", "Editable SVG")):
+            var = tk.BooleanVar(master=dlg, value=fmt in saved)
+            choices[fmt] = var
+            ctk.CTkCheckBox(dlg, text=label, variable=var).pack(
+                anchor="w", padx=20, pady=6)
+        folder = ctk.CTkLabel(dlg, text=f"Save to: {self.output_dir}",
+                             wraplength=470, anchor="w", justify="left")
+        folder.pack(fill="x", padx=20, pady=(12, 0))
+
+        def change_folder():
+            self._choose_output_dir()
+            folder.configure(text=f"Save to: {self.output_dir}")
+            dlg.lift()
+
+        def generate():
+            nonlocal result
+            selected = [fmt for fmt, var in choices.items() if var.get()]
+            if not selected:
+                messagebox.showinfo("Choose an output", "Select at least one file format.", parent=dlg)
+                return
+            save_prefs({**load_prefs(), "riser_formats": selected})
+            result = selected
+            dlg.destroy()
+
+        buttons = ctk.CTkFrame(dlg, fg_color="transparent")
+        buttons.pack(fill="x", padx=20, pady=16)
+        ctk.CTkButton(buttons, text="Change folder…", width=130,
+                      command=change_folder).pack(side="left")
+        ctk.CTkButton(buttons, text="Generate", width=100,
+                      command=generate).pack(side="right")
+        ctk.CTkButton(buttons, text="Cancel", width=80,
+                      command=dlg.destroy).pack(side="right", padx=8)
+        dlg.bind("<Escape>", lambda _event: dlg.destroy())
+        self.root.wait_window(dlg)
+        return result
+
     def _generate_riser(self):
-        """Generate one revision-matched 24x36 PDF, 11x17 PDF, and SVG."""
+        """Generate only the selected riser files in the saved output folder."""
         if self.state != "editing" or not self.session or not self.editor \
                 or self._generating is not None:
             return
         if not getattr(self.editor, 'generation_allowed', lambda: True)():
+            return
+        formats = self._choose_riser_outputs()
+        if not formats:
             return
         self.editor.flush_design_refresh()
         if self.editor.dirty and messagebox.askyesno(
@@ -1547,17 +1604,18 @@ class App:
         def work():
             with contextlib.redirect_stdout(self._redirector), \
                  contextlib.redirect_stderr(self._redirector):
-                return generate_riser_bundle(render_design, document, out_dir)
+                return generate_riser_bundle(render_design, document, out_dir, formats=formats)
 
         def on_done(paths):
             self._set_generating(None)
-            master, small, svg = paths
-            revision = master.name.split("_riser_rev", 1)[-1].split("_", 1)[0]
+            first = paths[0]
+            revision = first.stem.split("_riser_rev", 1)[-1].split("_", 1)[0]
+            label = {"11x17": "11×17 PDF", "24x36": "24×36 PDF", "svg": "SVG"}[formats[0]]
             self._show_toast(
                 f"Riser rev {revision} ready",
-                action=("Open 24×36", lambda: open_file(master)),
-                meta=f"{master.name} · 11×17 PDF + editable SVG",
-                folder=svg)
+                action=(f"Open {label}", lambda: open_file(first)),
+                meta=" · ".join(path.name for path in paths),
+                folder=first)
 
         def on_error(exc):
             self._set_generating(None)

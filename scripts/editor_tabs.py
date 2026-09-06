@@ -1,4 +1,4 @@
-"""SPLITTERS / KEYPADS / POWER tabs of the project editor.
+"""SPLITTERS / KEYPADS / RSP/POWER tabs of the project editor.
 
 Form-style editors over the corresponding DMPDesign lists, including
 post-CAD hardware changes: each tab can add and remove its hardware
@@ -1192,7 +1192,7 @@ class SplittersTab(ctk.CTkFrame):
         if self.on_navigate is None:
             return None
         if node.kind == "rsp":
-            return lambda: self.on_navigate("POWER")
+            return lambda: self.on_navigate("RSP/POWER")
         if node.kind == "keypad":
             return lambda: self.on_navigate("KEYPADS")
         return None

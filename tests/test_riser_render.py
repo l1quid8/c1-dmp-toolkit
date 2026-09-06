@@ -208,3 +208,27 @@ def test_svg_respects_annotation_z_order(tmp_path):
     text = path.read_text()
 
     assert text.index('id="annotation-b"') < text.index('id="annotation-a"')
+
+
+@pytest.mark.parametrize('formats, suffixes', [
+    (('11x17',), ['_11x17.pdf']),
+    (('24x36', 'svg'), ['_24x36.pdf', '.svg']),
+])
+def test_selected_outputs_create_only_requested_files(tmp_path, formats, suffixes):
+    design = branched_design()
+    scene = layout_riser(design)
+    paths = generate_riser_bundle(design, scene, tmp_path, formats=formats)
+    assert sorted(tmp_path.iterdir()) == sorted(paths)
+    assert len(paths) == len(suffixes)
+    assert all(path.name.endswith(suffix) for path, suffix in zip(paths, suffixes))
+    if formats == ('11x17',):
+        with fitz.open(paths[0]) as pdf:
+            assert tuple(pdf[0].rect)[2:] == (1224, 792)
+
+
+@pytest.mark.parametrize('formats', [(), ('bogus',)])
+def test_invalid_output_choice_writes_nothing(tmp_path, formats):
+    design = branched_design()
+    with pytest.raises(ValueError):
+        generate_riser_bundle(design, layout_riser(design), tmp_path, formats=formats)
+    assert list(tmp_path.iterdir()) == []

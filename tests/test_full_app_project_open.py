@@ -43,7 +43,7 @@ def test_full_app_opens_seven_rsp_project_and_switches_to_riser(tmp_path):
         assert not errors, errors
         assert application.editor.tabs.get() == 'RISER'
         assert application.editor.riser_tab.canvas.winfo_ismapped()
-        assert not application.editor.tabs.tab('POWER').winfo_ismapped()
+        assert not application.editor.tabs.tab('RSP/POWER').winfo_ismapped()
         assert not application.editor.tabs.tab('SPLITTERS').winfo_ismapped()
         assert len(application.session.design.rsps) == 7
         print('PROJECT_OPEN_OK', flush=True)

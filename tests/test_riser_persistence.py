@@ -61,7 +61,7 @@ def test_current_schema_round_trip_preserves_connections_and_drawing(tmp_path):
     raw = json.loads(path.read_text())
     restored = load_session(path)
 
-    assert raw["schema_version"] == 7
+    assert raw["schema_version"] == 8
     assert restored.design.connections == [connection]
     assert restored.design.riser_document == document
 

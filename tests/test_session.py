@@ -193,7 +193,7 @@ def test_session_saves_combined_schema_and_top_level_remotelink_config(tmp_sessi
     path = save_session(session)
     raw = json.loads(path.read_text(encoding="utf-8"))
 
-    assert raw["schema_version"] == 7
+    assert raw["schema_version"] == 8
     assert raw["remotelink"]["account_num"] == "3141"
     assert raw["remotelink"]["receiver_num"] == "7"
 

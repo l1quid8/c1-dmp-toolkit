@@ -55,7 +55,7 @@ from topology_service import ensure_explicit_topology, project_legacy_topology
 
 # Schema 7 persists detailed symbol style, input side, panel port positions and
 # printed location-frame visibility. Older readers must not discard that state.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 SESSION_EXT = ".dmps"
 RECOVERY_SUFFIX = ".recovery"
 
