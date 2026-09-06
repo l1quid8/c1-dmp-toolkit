@@ -18,6 +18,7 @@ from riser_scene import (
     BRIDGE_HALF_WIDTH,
     GRID,
     TITLE_BLOCK_WIDTH,
+    device_location_element_ids,
     find_bridges,
     layout_riser,
     port_point,
@@ -44,6 +45,7 @@ class RiserEditorController:
         self.design.riser_document = document
         self._undo: list[tuple[tuple, tuple]] = []
         self._redo: list[tuple[tuple, tuple]] = []
+        self._observed_shared_state = self._shared_state()
 
     @property
     def can_undo(self) -> bool:
@@ -56,6 +58,30 @@ class RiserEditorController:
     def _snapshot(self):
         return (copy.deepcopy(self.design.connections), copy.deepcopy(self.document))
 
+    def _shared_state(self):
+        """State an old riser snapshot could overwrite or regroup."""
+        return copy.deepcopy((
+            self.design.connections,
+            [
+                (item.id, item.splitter_type, item.location,
+                 item.inputs, item.outputs)
+                for item in self.design.splitters
+            ],
+            [
+                (item.number, item.location, item.model)
+                for item in self.design.rsps
+            ],
+            [
+                (item.number, item.source, item.location, item.global_keypad)
+                for item in self.design.keypads
+            ],
+            self.design.site_info.xr550_location,
+            self.document,
+        ))
+
+    def _rebase_observed_state(self) -> None:
+        self._observed_shared_state = self._shared_state()
+
     def _restore(self, snapshot) -> None:
         connections, document = copy.deepcopy(snapshot)
         self.design.connections = connections
@@ -63,6 +89,7 @@ class RiserEditorController:
             setattr(self.document, field.name, getattr(document, field.name))
         self.design.riser_document = self.document
         project_legacy_topology(self.design)
+        self._rebase_observed_state()
 
     def _mutate(self, operation):
         before = self._snapshot()
@@ -75,12 +102,24 @@ class RiserEditorController:
         if before != after:
             self._undo.append((before, after))
             self._redo.clear()
+        self._rebase_observed_state()
         return result
 
     def clear_history(self) -> None:
         """Rebase undo/redo after another editor changes shared topology."""
         self._undo.clear()
         self._redo.clear()
+        self._rebase_observed_state()
+
+    def sync_from_design(self) -> bool:
+        """Synchronize external edits and invalidate only stale history."""
+        changed_externally = self._shared_state() != self._observed_shared_state
+        if changed_externally:
+            self._undo.clear()
+            self._redo.clear()
+        sync_riser_document(self.design, self.document)
+        self._rebase_observed_state()
+        return changed_externally
 
     def undo(self) -> bool:
         if not self._undo:
@@ -107,11 +146,11 @@ class RiserEditorController:
             members = []
             shared_routes = {}
             if element.kind == "location":
+                location_ids = device_location_element_ids(self.design)
                 members = [
                     candidate for candidate in self.document.elements.values()
                     if candidate.kind == "device"
-                    and element.x <= candidate.x + candidate.width / 2 <= element.x + element.width
-                    and element.y <= candidate.y + candidate.height / 2 <= element.y + element.height
+                    and location_ids.get(candidate.ref) == element.id
                 ]
                 member_refs = {member.ref for member in members}
                 shared_routes = {
@@ -1821,8 +1860,7 @@ class RiserTab(ctk.CTkFrame):
 
     def refresh(self):
         self.cancel(redraw=False)
-        sync_riser_document(self.design, self.controller.document)
-        self.controller.clear_history()
+        self.controller.sync_from_design()
         self._reconcile_selection()
         for name, variable in self._title_vars.items():
             value = getattr(self.controller.document.title_block, name)

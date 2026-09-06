@@ -11,9 +11,14 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from riser_editor import RiserEditorController  # noqa: E402
 from riser_model import DevicePortRef, RiserAnnotation  # noqa: E402
+from hardware import remove_expander  # noqa: E402
 from parse_dmp_worksheet import RSP  # noqa: E402
 from riser_scene import layout_riser, port_point, validate_riser  # noqa: E402
-from topology_service import TopologyError  # noqa: E402
+from topology_service import (  # noqa: E402
+    TopologyError,
+    prune_unknown_connections,
+    set_splitter_output,
+)
 from test_riser_scene import branched_design  # noqa: E402
 
 
@@ -353,6 +358,65 @@ def test_moving_location_module_moves_its_devices_and_attached_routes_together()
         (x + 36, y + 54) for x, y in before_route]
 
 
+def test_location_move_keeps_member_after_device_leaves_and_box_shrinks():
+    design, editor = controller()
+    location = editor.document.elements["location:MDF"]
+    member = editor.document.elements["device:RSP-1"]
+    edge = next(c for c in design.connections if c.target.device_id == "RSP-1")
+
+    editor.move_element(member.id, location.width + 180, 0)
+    editor.resize_element(location.id, 90, 54)
+    before_member = (member.x, member.y)
+    before_endpoint = editor.document.routes[edge.id].points[-1]
+
+    editor.move_element(location.id, 36, 54)
+
+    assert (member.x, member.y) == (before_member[0] + 36, before_member[1] + 54)
+    assert editor.document.routes[edge.id].points[-1] == (
+        before_endpoint[0] + 36, before_endpoint[1] + 54)
+
+
+def test_overlapping_location_box_moves_only_its_design_location_members():
+    _design, editor = controller()
+    mdf = editor.document.elements["location:MDF"]
+    office = editor.document.elements["location:OFFICE"]
+    mdf_device = editor.document.elements["device:RSP-1"]
+    office_device = editor.document.elements["device:KEYPAD-2"]
+    office.x, office.y = mdf_device.x - 10, mdf_device.y - 10
+    office.width = mdf_device.width + 20
+    office.height = mdf_device.height + 20
+    before_mdf = (mdf_device.x, mdf_device.y)
+    before_office = (office_device.x, office_device.y)
+
+    editor.move_element(office.id, 36, 0)
+
+    assert (mdf_device.x, mdf_device.y) == before_mdf
+    assert (office_device.x, office_device.y) == (before_office[0] + 36,
+                                                  before_office[1])
+
+    editor.move_element(mdf.id, 18, 0)
+
+    assert (mdf_device.x, mdf_device.y) == (before_mdf[0] + 18, before_mdf[1])
+
+
+def test_hardware_location_edit_switches_group_without_moving_device_geometry():
+    design, editor = controller()
+    mdf = editor.document.elements["location:MDF"]
+    office = editor.document.elements["location:OFFICE"]
+    member = editor.document.elements["device:RSP-1"]
+    before = (member.x, member.y)
+
+    design.rsps[0].location = "OFFICE"
+    editor.sync_from_design()
+    assert (member.x, member.y) == before
+
+    editor.move_element(mdf.id, 18, 0)
+    assert (member.x, member.y) == before
+
+    editor.move_element(office.id, 36, 0)
+    assert (member.x, member.y) == (before[0] + 36, before[1])
+
+
 def test_manual_route_bend_edit_remains_orthogonal_and_is_undoable():
     _design, editor = controller()
     edge_id = next(iter(editor.document.routes))
@@ -416,3 +480,58 @@ def test_reconnecting_to_current_endpoint_preserves_manual_route_without_history
         (100, 100), (100, 200), (300, 200), (300, 400)]
     assert editor.document.routes[edge.id].manual
     assert not editor.can_undo
+
+
+def test_sync_from_design_preserves_undo_and_redo_when_shared_state_is_unchanged():
+    _design, editor = controller()
+    element = editor.document.elements["device:MSP"]
+    original_x = element.x
+    editor.move_element(element.id, 18, 0)
+
+    editor.sync_from_design()
+
+    assert editor.can_undo
+    editor.undo()
+    assert editor.document.elements[element.id].x == original_x
+    assert editor.can_redo
+
+    editor.sync_from_design()
+
+    assert editor.can_redo
+    editor.redo()
+    assert editor.document.elements[element.id].x == original_x + 18
+
+
+def test_sync_from_design_clears_history_after_external_topology_change():
+    design, editor = controller()
+    editor.move_element("device:MSP", 18, 0)
+
+    set_splitter_output(design, "710-LX500-1", 0, "Spare")
+    editor.sync_from_design()
+
+    assert not editor.can_undo
+
+
+def test_sync_from_design_clears_history_after_external_hardware_change():
+    design, editor = controller()
+    editor.move_element("device:MSP", 18, 0)
+
+    remove_expander(design, 2)
+    prune_unknown_connections(design)
+    editor.sync_from_design()
+
+    assert not editor.can_undo
+    assert "device:RSP-2" not in editor.document.elements
+
+
+def test_sync_from_design_clears_history_after_external_legacy_field_change():
+    design, editor = controller()
+    editor.move_element("device:MSP", 18, 0)
+    splitter = next(item for item in design.splitters
+                    if item.id == "710-LX500-2")
+
+    splitter.outputs[2] = "LEGACY RISER NOTE"
+    editor.sync_from_design()
+
+    assert not editor.can_undo
+    assert splitter.outputs[2] == "LEGACY RISER NOTE"

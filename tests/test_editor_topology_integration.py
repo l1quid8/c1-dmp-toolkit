@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import sys
 from pathlib import Path
 
@@ -13,8 +14,9 @@ from editor_tabs import KeypadsTab, SplittersTab  # noqa: E402
 from editor_frame import EditorFrame  # noqa: E402
 from hardware import remove_expander, renumber_splitter  # noqa: E402
 from parse_dmp_worksheet import DMPDesign, Splitter  # noqa: E402
+from riser_model import DevicePortRef  # noqa: E402
 from riser_scene import layout_riser, port_point, sync_riser_document  # noqa: E402
-from topology_service import set_splitter_output  # noqa: E402
+from topology_service import prune_unknown_connections, set_splitter_output  # noqa: E402
 from session import Session  # noqa: E402
 from test_topology_service_regressions import connected_design  # noqa: E402
 
@@ -177,3 +179,44 @@ def test_external_reconnect_reattaches_existing_manual_route_to_new_endpoint():
     assert document.routes[edge.id].manual
     assert document.routes[edge.id].points[-1] == port_point(
         target, updated.target.port_id, output=False)
+
+
+def test_external_disconnect_prunes_only_the_removed_route():
+    design = connected_design()
+    document = layout_riser(design)
+    removed = next(
+        edge for edge in design.connections
+        if edge.source == DevicePortRef("710-LX500-1", "OUT1")
+    )
+    surviving = next(edge for edge in design.connections if edge.id != removed.id)
+    document.routes[surviving.id].manual = True
+    document.routes[surviving.id].label_offset = (42.0, -18.0)
+    surviving_route = copy.deepcopy(document.routes[surviving.id])
+
+    set_splitter_output(design, "710-LX500-1", 0, "Spare")
+    sync_riser_document(design, document)
+
+    assert removed.id not in document.routes
+    assert document.routes[surviving.id] == surviving_route
+
+
+def test_external_hardware_removal_prunes_device_routes_and_z_order_idempotently():
+    design = connected_design()
+    document = layout_riser(design)
+    removed_route_ids = {
+        edge.id for edge in design.connections
+        if "RSP-2" in {edge.source.device_id, edge.target.device_id}
+    }
+
+    remove_expander(design, 2)
+    prune_unknown_connections(design)
+    sync_riser_document(design, document)
+
+    assert "device:RSP-2" not in document.elements
+    assert "device:RSP-2" not in document.z_order
+    assert removed_route_ids.isdisjoint(document.routes)
+    synchronized = copy.deepcopy(document)
+
+    sync_riser_document(design, document)
+
+    assert document == synchronized

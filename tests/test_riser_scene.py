@@ -30,6 +30,7 @@ from riser_scene import (  # noqa: E402
     validate_riser,
 )
 from topology_service import connect  # noqa: E402
+import riser_scene  # noqa: E402
 
 
 def branched_design() -> DMPDesign:
@@ -55,6 +56,36 @@ def branched_design() -> DMPDesign:
     connect(d, DevicePortRef("710-LX500-1", "OUT2"), DevicePortRef("710-LX500-2", "IN"))
     connect(d, DevicePortRef("710-LX500-2", "OUT1"), DevicePortRef("RSP-2", "IN"))
     return d
+
+
+def test_device_location_element_ids_match_layout_location_frames():
+    design = branched_design()
+
+    location_ids = riser_scene.device_location_element_ids(design)
+
+    assert location_ids["RSP-1"] == "location:MDF"
+    assert location_ids["RSP-2"] == "location:CLASSROOM 27"
+    assert location_ids["KEYPAD-2"] == "location:OFFICE"
+
+
+def test_sync_does_not_offer_graph_only_endpoint_that_layout_cannot_place():
+    design = DMPDesign(
+        splitters=[Splitter("710-LX500-1", "LX", "MDF",
+                            outputs=["RSP-4", "Spare", "Spare"])]
+    )
+    connect(
+        design, DevicePortRef("MSP", "LX500"),
+        DevicePortRef("710-LX500-1", "IN"),
+    )
+    connect(
+        design, DevicePortRef("710-LX500-1", "OUT1"),
+        DevicePortRef("RSP-4", "IN"),
+    )
+    document = layout_riser(design)
+
+    sync_riser_document(design, document)
+
+    assert "RSP-4" not in document.unplaced
 
 
 def three_rsp_chain_design() -> DMPDesign:

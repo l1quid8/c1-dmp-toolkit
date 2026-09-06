@@ -82,6 +82,27 @@ def _normal_location(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def device_location_element_ids(design) -> dict[str, str]:
+    """Map every structured device to its canonical location-frame ID."""
+    device_ids = _device_ids(design)
+    raw_locations = {
+        device_id: _normal_location(_location(design, device_id))
+        for device_id in device_ids
+    }
+    known_locations = set(raw_locations.values())
+
+    def physical_location(key: str) -> str:
+        without_floor = re.sub(
+            r"\b\d+(?:ST|ND|RD|TH)\s+FLOOR\b", "", key)
+        without_floor = re.sub(r"\s+", " ", without_floor).strip()
+        return without_floor if without_floor in known_locations else key
+
+    return {
+        device_id: f"location:{physical_location(location)}"
+        for device_id, location in raw_locations.items()
+    }
+
+
 def _kind(design, device_id: str) -> str:
     if device_id == "MSP":
         return "msp"
@@ -157,21 +178,11 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
     branch, depth = _branch_and_depth(design)
 
     device_ids = _device_ids(design)
-    raw_locations = {device_id: _normal_location(_location(design, device_id))
-                     for device_id in device_ids}
-    known_locations = set(raw_locations.values())
-
-    def physical_location(key: str) -> str:
-        # If the only difference is an explicit floor qualifier, prefer the
-        # already-known room name. This joins e.g. "MAIN BUILDING 1ST FLOOR
-        # SUPPLY ROOM" to "MAIN BUILDING SUPPLY ROOM" without ever merging
-        # two distinct floor-qualified locations.
-        without_floor = re.sub(r"\b\d+(?:ST|ND|RD|TH)\s+FLOOR\b", "", key)
-        without_floor = re.sub(r"\s+", " ", without_floor).strip()
-        return without_floor if without_floor in known_locations else key
-
-    locations = {device_id: physical_location(key)
-                 for device_id, key in raw_locations.items()}
+    location_element_ids = device_location_element_ids(design)
+    locations = {
+        device_id: location_element_ids[device_id].removeprefix("location:")
+        for device_id in device_ids
+    }
     location_devices: dict[str, list[str]] = {}
     for device_id in device_ids:
         location_devices.setdefault(locations[device_id], []).append(device_id)
@@ -897,18 +908,42 @@ def find_bridges(routes: dict[str, list[tuple[float, float]]]) -> list[Bridge]:
 
 
 def sync_riser_document(design, document: RiserDocument) -> None:
-    live = set(_device_ids(design))
+    live_connection_ids = {edge.id for edge in design.connections}
+    document.routes = {
+        route_id: route for route_id, route in document.routes.items()
+        if route_id in live_connection_ids
+    }
+
+    placeable = set(_device_ids(design))
+    live = set(placeable)
+    for edge in design.connections:
+        live.add(edge.source.device_id)
+        live.add(edge.target.device_id)
+    removed_element_ids = {
+        element_id for element_id, element in document.elements.items()
+        if element.kind == "device" and element.ref not in live
+    }
+    for element_id in removed_element_ids:
+        document.elements.pop(element_id, None)
+    if removed_element_ids:
+        document.z_order = [
+            item_id for item_id in document.z_order
+            if item_id not in removed_element_ids
+        ]
+
     existing = {e.ref for e in document.elements.values() if e.kind == "device"}
     for element in document.elements.values():
         if element.kind == "device":
-            element.stale = element.ref not in live
-    for device_id in sorted(live - existing):
+            element.stale = False
+    for device_id in sorted(placeable - existing):
         if device_id not in document.unplaced:
             document.unplaced.append(device_id)
-    document.unplaced = [d for d in document.unplaced if d in live and d not in existing]
+    document.unplaced = [
+        device_id for device_id in document.unplaced
+        if device_id in placeable and device_id not in existing
+    ]
     obstacles = [e for e in document.elements.values()
                  if e.kind == "device" and not e.stale]
-    live_connection_ids = {edge.id for edge in design.connections}
     for edge in sorted(design.connections, key=_connection_sort_key):
         source = document.elements.get(f"device:{edge.source.device_id}")
         target = document.elements.get(f"device:{edge.target.device_id}")

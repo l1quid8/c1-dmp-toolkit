@@ -14,10 +14,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import riser_render  # noqa: E402
+from hardware import remove_expander  # noqa: E402
 from riser_render import generate_riser_bundle, render_pdf, render_svg  # noqa: E402
-from riser_scene import TITLE_BLOCK_WIDTH, layout_riser  # noqa: E402
+from riser_scene import TITLE_BLOCK_WIDTH, layout_riser, sync_riser_document  # noqa: E402
 from riser_model import RiserAnnotation  # noqa: E402
 from test_riser_scene import branched_design, legacy_named_splitter_design  # noqa: E402
+from test_topology_service_regressions import connected_design  # noqa: E402
+from topology_service import prune_unknown_connections, set_splitter_output  # noqa: E402
 
 
 def test_svg_is_standalone_searchable_and_contains_engineering_content(tmp_path):
@@ -35,6 +38,27 @@ def test_svg_is_standalone_searchable_and_contains_engineering_content(tmp_path)
     assert "710-LX500-1" in text
     assert "(N)(1)WP240R" in text
     assert "INT-5.0" in text
+
+
+def test_svg_omits_routes_and_hardware_removed_outside_the_riser(tmp_path):
+    design = connected_design()
+    scene = layout_riser(design)
+    disconnected = next(
+        edge for edge in design.connections
+        if edge.source.device_id == "710-LX500-1"
+        and edge.source.port_id == "OUT1"
+    )
+
+    set_splitter_output(design, "710-LX500-1", 0, "Spare")
+    remove_expander(design, 2)
+    prune_unknown_connections(design)
+    sync_riser_document(design, scene)
+    path = tmp_path / "synchronized.svg"
+    render_svg(design, scene, path)
+
+    text = path.read_text()
+    assert f'route-{disconnected.id}' not in text
+    assert "RSP-2" not in text
 
 
 def test_pdf_profiles_have_exact_pages_and_searchable_text(tmp_path):
