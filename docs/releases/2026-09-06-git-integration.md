@@ -10,8 +10,10 @@ Git cleanup. Publishing or pushing a release is separate.
 The older `feature/riser-editor` worktree contained six modified files.
 They are preserved in commit `bc47e32` on that branch. These synchronization,
 location-membership and regression-test edits have not been reconciled with
-the substantially newer v1.6.0 implementation. Keep the branch and worktree
-until that review is performed; do not treat them as safely merged.
+the substantially newer v1.6.0 implementation. During the subsequent branch
+consolidation, the commit was preserved locally and on GitHub under the tag
+`archive/riser-sync-followup-20260906`. The old branch and worktree were
+retired; do not treat this archived work as merged into main.
 
 ## Artifact preservation
 
@@ -23,4 +25,8 @@ Before removing the merged release worktree, preserve its ignored `build`,
 These include visual samples and local builds, not source files to commit.
 Keep the main checkout's input/output data, virtual environment, user tooling
 state and the installed application unchanged. Retain release tags and remote
-branches; only delete redundant, merged local branches.
+tags. The merged remote integration branch was retired as part of branch
+consolidation. Main is the sole active branch; no application code changed.
+
+The older riser worktree's build outputs are also preserved in the archive
+directory as `riser-editor-build` and `riser-editor-dist`.
