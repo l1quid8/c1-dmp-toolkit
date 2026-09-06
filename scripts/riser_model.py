@@ -74,6 +74,7 @@ class RiserElement:
     heading_height: float = 34.0
     symbol_style: str = "classic"
     input_side: str = "top"
+    input_side_locked: bool = False
     port_x: dict[str, float] = field(default_factory=dict)
 
 

@@ -1,7 +1,7 @@
 """The unified project editor — the working document of the field-edit workflow.
 
 EditorFrame hosts a tab per output sheet group (SITE / ZONES / SPLITTERS /
-KEYPADS / POWER / REMOTELINK / RISER) over a Session and fills the application's main
+KEYPADS / RSP/POWER / REMOTELINK / RISER) over a Session and fills the application's main
 area. Edits write straight onto the design; the session file only changes on
 an explicit Save, with a debounced background recovery file guarding against
 crashes.
@@ -73,7 +73,7 @@ def _format_install_date(d) -> str:
     suffix = "th" if 11 <= n % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
     return f"{d.strftime('%B').upper()} {n}{suffix} {d.year}"
 
-TAB_TITLES = ["SITE", "ZONES", "SPLITTERS", "KEYPADS", "POWER", "REMOTELINK", "RISER"]
+TAB_TITLES = ["SITE", "ZONES", "SPLITTERS", "KEYPADS", "RSP/POWER", "REMOTELINK", "RISER"]
 
 
 def _bind_click_tree(widget, command):
@@ -457,7 +457,7 @@ class EditorFrame(ctk.CTkFrame):
 
         for title, cls, attr in [("SPLITTERS", SplittersTab, "splitters_tab"),
                                  ("KEYPADS", KeypadsTab, "keypads_tab"),
-                                 ("POWER", PowerTab, "power_tab")]:
+                                 ("RSP/POWER", PowerTab, "power_tab")]:
             programming_options = (
                 {"on_programming_change": self._on_keypad_programming_edit}
                 if cls is KeypadsTab else {})
@@ -1125,9 +1125,13 @@ class EditorFrame(ctk.CTkFrame):
     ]
 
     def _build_site_tab(self, tab):
-        # The SITE form doesn't need the full height — a centered, fixed-width
-        # block reads better than fields stretched across a wide window.
-        holder = ctk.CTkFrame(tab, fg_color="transparent", width=560)
+        # Keep the centered form, but make its lower fields reachable on
+        # laptop windows and at larger UI scales.
+        body = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        body.grid(row=0, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        auto_hide_scrollbar(body)
+        holder = ctk.CTkFrame(body, fg_color="transparent", width=560)
         holder.grid(row=0, column=0, pady=(theme.PAD["lg"], 0))
         holder.columnconfigure(0, weight=1, minsize=270)
         holder.columnconfigure(1, weight=1, minsize=270)

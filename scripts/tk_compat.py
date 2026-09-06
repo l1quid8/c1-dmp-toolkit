@@ -1,8 +1,58 @@
 """Narrow runtime workarounds for the bundled Tk/CustomTkinter combination."""
 
 from functools import wraps
+import tkinter as tk
 
 import customtkinter as ctk
+
+
+def install_touchpad_scroll(root) -> None:
+    """Route Tk 8.7/9 precise gestures to the nearest scrolling canvas.
+
+    CustomTkinter 5.2 only binds MouseWheel. Tk on newer macOS sends
+    TouchpadScroll instead, with two signed pixel deltas packed into %D.
+    Bind once per interpreter so newly built forms and dialogs work too.
+    Native text/table widgets retain their own Tk class bindings.
+    Older Tk versions keep their existing MouseWheel handling.
+    """
+    if getattr(root, "_c1_touchpad_scroll", False):
+        return
+    if not root.tk.call("info", "commands", "::tk::PreciseScrollDeltas"):
+        return
+
+    def scroll(event):
+        widget = event.widget
+        while isinstance(widget, tk.Misc):
+            if widget.winfo_class() in ("Text", "Treeview", "Listbox"):
+                return
+            if isinstance(widget, tk.Canvas) and widget.cget("scrollregion"):
+                dx, dy = root.tk.call("::tk::PreciseScrollDeltas", event.delta)
+                region = [float(n) for n in root.tk.splitlist(widget.cget("scrollregion"))]
+                # Canvas 'units' default to a tenth of the viewport, not a
+                # pixel. Move by a fraction of the scrollregion instead, so
+                # gestures don't jump by a viewport-dependent distance.
+                pending = getattr(widget, "_c1_touchpad_pending", {})
+                for axis, delta, view, move, extent in (
+                    ("x", dx, widget.xview, widget.xview_moveto, region[2] - region[0]),
+                    ("y", dy, widget.yview, widget.yview_moveto, region[3] - region[1]),
+                ):
+                    if delta and extent > 0 and view() != (0.0, 1.0):
+                        current = view()
+                        previous, old_extent, remainder = pending.get(axis, (None, None, 0))
+                        if previous != current or old_extent != extent:
+                            remainder = 0
+                        # CTk uses eight-pixel increments on macOS. Retain
+                        # rounding loss so slow one-pixel gestures accumulate.
+                        target = current[0] * extent + remainder - int(delta)
+                        target = max(0, min(target, (1 - current[1] + current[0]) * extent))
+                        move(target / extent)
+                        pending[axis] = (view(), extent, target - view()[0] * extent)
+                widget._c1_touchpad_pending = pending
+                return "break"
+            widget = widget.master
+
+    root.bind_all("<TouchpadScroll>", scroll, add="+")
+    root._c1_touchpad_scroll = True
 
 
 def install_scrollbar_redraw_fix() -> None:

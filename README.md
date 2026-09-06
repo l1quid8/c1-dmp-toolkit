@@ -23,7 +23,7 @@ editor:
 - `school_door_chart_rev1.xlsx`, … — the Door Chart, built from the newest
   worksheet
 - `school_riser_rev1_24x36.pdf`, `school_riser_rev1_11x17.pdf`, and
-  `school_riser_rev1.svg` — one revision-matched vector riser bundle
+  `school_riser_rev1.svg` — selected riser outputs sharing one revision number
 
 Prior revisions are kept on disk, so the working loop is: **generate → print →
 review with the site superintendent → edit → regenerate.**
@@ -41,7 +41,7 @@ recent projects for one-click reopening across days and site visits.
 ### 2. Edit
 
 Parsing lands in a tabbed editor — **SITE / ZONES / SPLITTERS / KEYPADS /
-POWER / REMOTELINK / RISER** — which is the working document; generated files are
+RSP/POWER / REMOTELINK / RISER** — which is the working document; generated files are
 artifacts and are never re-imported.
 
 - **SITE** — school details plus RemoteLink panel connection, IP, port, and
@@ -96,8 +96,10 @@ Buttons at the bottom of the editor (also Worksheet menu / keyboard):
 - **Generate Door Chart** (`Cmd/Ctrl+D`) — builds the chart from the newest
   worksheet, warning if the design has changed since that worksheet was
   generated.
-- **Generate Riser** (`Cmd/Ctrl+R`) — writes searchable vector PDFs at 24×36
-  and 11×17 plus a standalone editable SVG from the same saved scene.
+- **Generate Riser** (`Cmd/Ctrl+R`) — choose 11×17 PDF (default), 24×36 PDF,
+  and/or editable SVG. Only selected files are generated. Format choices are
+  remembered, and the saved output folder is reused automatically; Change folder
+  is optional.
 - **Generate RemoteLink Account** — builds an encrypted RemoteLink `.xml`
   account export from the settings reviewed across **SITE, ZONES, KEYPADS, and
   REMOTELINK**. The final dialog is deliberately read-only: it shows the
@@ -155,12 +157,38 @@ remembers your choice for next launch.
 The combined release opens projects from the original app, the RemoteLink
 integration, and the riser integration. Saving keeps both RemoteLink settings
 and the editable riser (connections, layout, routes, and markup) together.
-Combined projects use **schema 7**, including stable shared equipment locations,
+Combined projects use **schema 8**, including stable shared equipment locations,
 versioned riser location ownership, independent cable-callout visibility, and
-detailed symbol/port geometry with printed location-frame visibility;
+detailed symbol/port geometry with printed location-frame visibility, and pinned RSP input sides;
 older builds will ask you to update
 instead of opening a project they cannot preserve. Keep a copy of the original
 `.dmps` if you need to continue using an older build.
+
+### Selecting items in RISER
+
+Use **Select** to click an item. **Command-click** on Mac (or **Ctrl-click** on
+Windows) adds or removes individual items. Drag from empty space to select items
+fully inside a box; hold the same modifier to add the boxed items to the selection.
+**Select All** or **Command-A / Ctrl-A** selects items on visible drawing layers,
+including items outside the current view. These shortcuts apply when the drawing
+has focus; text fields keep their normal text-selection shortcuts.
+
+Drag a selected item or use the arrow keys to move the whole selection. Locations
+and their selected devices move once, connected wires stay attached, and a group
+move takes one Undo. **Escape** cancels an active drag and clears the selection.
+Select one item for individual properties, deletion, or markup duplication.
+
+### RSP wire attachment in RISER
+
+RSP inputs can attach at the midpoint of any side. Moving an RSP in **Auto** mode
+chooses a clear approach and keeps its wire outside the symbol. Select the wire
+and drag its RSP endpoint onto a side marker to pin that side. These markers are
+four drawing positions for the same electrical input. Numbered splitter outputs
+keep their separate electrical connections.
+
+Select the RSP and use **Input side → Auto** to restore automatic placement, or
+choose Top, Right, Bottom, or Left. Side choices support Undo/Redo and are saved
+with the project; exports use the same attachment geometry.
 
 ### Hardware and cable callouts in RISER
 

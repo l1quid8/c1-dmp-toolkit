@@ -83,7 +83,7 @@ def editor(tmp_path):
 
 def test_both_tabs_and_four_independent_generation_actions(editor):
     frame, calls = editor
-    for title in ("SITE", "ZONES", "SPLITTERS", "KEYPADS", "POWER", "REMOTELINK", "RISER"):
+    for title in ("SITE", "ZONES", "SPLITTERS", "KEYPADS", "RSP/POWER", "REMOTELINK", "RISER"):
         frame.tabs.set(title)
         assert frame.tabs.get() == title
     assert frame.remotelink_tab.session is frame.riser_tab.session is frame.session

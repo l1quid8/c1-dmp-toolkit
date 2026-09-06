@@ -59,8 +59,8 @@ def test_moving_device_keeps_connected_route_attached_to_its_port():
 
     after = editor.document.routes[edge.id].points[-1]
     assert after != before
-    assert after[0] == before[0] + 36
-    assert after[1] == before[1] + 54
+    element = editor.document.elements['device:RSP-1']
+    assert after == port_point(element, edge.target.port_id, output=False)
 
 
 def test_moving_device_preserves_clear_generated_cable_label_position():

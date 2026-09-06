@@ -232,22 +232,25 @@ def _next_revision(output_dir: Path, slug: str) -> int:
     return max(revisions, default=0) + 1
 
 
-def generate_riser_bundle(design, document, output_dir: str | Path) -> list[Path]:
+def generate_riser_bundle(design, document, output_dir: str | Path, *,
+                          formats=("24x36", "11x17", "svg")) -> list[Path]:
+    formats = tuple(dict.fromkeys(formats))
+    if not formats or any(fmt not in {"24x36", "11x17", "svg"} for fmt in formats):
+        raise ValueError("Choose at least one supported riser output.")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     slug = _slug(design.site_info.school_name or "UNTITLED")
     revision = _next_revision(output_dir, slug)
-    names = [
-        f"{slug}_riser_rev{revision}_24x36.pdf",
-        f"{slug}_riser_rev{revision}_11x17.pdf",
-        f"{slug}_riser_rev{revision}.svg",
-    ]
+    names = [f"{slug}_riser_rev{revision}" +
+             (".svg" if fmt == "svg" else f"_{fmt}.pdf") for fmt in formats]
     with tempfile.TemporaryDirectory(prefix=f".{slug}_riser_", dir=output_dir) as staging:
         staging_dir = Path(staging)
         staged = [staging_dir / name for name in names]
-        render_pdf(design, document, staged[0], profile="24x36")
-        render_pdf(design, document, staged[1], profile="11x17")
-        render_svg(design, document, staged[2])
+        for fmt, path in zip(formats, staged):
+            if fmt == "svg":
+                render_svg(design, document, path)
+            else:
+                render_pdf(design, document, path, profile=fmt)
         final = [output_dir / name for name in names]
         for source, target in zip(staged, final):
             os.replace(source, target)

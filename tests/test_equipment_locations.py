@@ -87,7 +87,7 @@ def test_schema_five_roundtrip_and_schema_four_migration(tmp_path):
     path = tmp_path / 'new.dmps'
     save_session(Session(design=d), path)
     raw = json.loads(path.read_text())
-    assert raw['schema_version'] == 7
+    assert raw['schema_version'] == 8
     assert load_session(path).design == d
     for key in ('equipment_locations', 'device_location_ids', 'location_sync_values'):
         raw['design'].pop(key)

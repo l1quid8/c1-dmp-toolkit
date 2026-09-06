@@ -190,7 +190,7 @@ def test_over_capacity_errors():
                       for n in range(1, MAX_KEYPADS + 2)]
     issues = validate_design(design, topology_confirmed=True)
     caps = [i for i in issues if i.code == "capacity.exceeded"]
-    assert {i.tab for i in caps} == {"POWER", "SPLITTERS", "KEYPADS"}
+    assert {i.tab for i in caps} == {"RSP/POWER", "SPLITTERS", "KEYPADS"}
     assert not finalize_ok(issues)
 
 

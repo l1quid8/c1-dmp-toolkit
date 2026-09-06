@@ -9,7 +9,7 @@ import re
 import tkinter as tk
 import uuid
 from functools import wraps
-from dataclasses import fields
+from dataclasses import fields, replace
 from tkinter import messagebox, simpledialog
 from tkinter import font as tkfont
 
@@ -28,6 +28,9 @@ from riser_presentation import layout_presentation
 from riser_model import DevicePortRef, RiserAnnotation, RiserDocument
 from riser_scene import (
     GRID,
+    INPUT_SIDES,
+    input_side_point,
+    route_rsp_input,
     find_bridges,
     layout_riser,
     layout_clusters,
@@ -264,6 +267,65 @@ class RiserEditorController:
         self._mutate(operation)
         return True
 
+    def move_selection(self, selection, dx, dy):
+        """Move a group atomically; location descendants and shared wires move once."""
+        if not selection or (not dx and not dy):
+            return False
+        before = self._snapshot()
+        self._mutate(lambda: self._translate_selection(selection, dx, dy))
+        return before != self._snapshot()
+
+    def _translate_selection(self, selection, dx, dy):
+        doc = self.document
+        selected = set(selection)
+        element_ids = {ref for kind, ref in selected if kind == 'element' and ref in doc.elements}
+        owners = {key for key in element_ids if doc.elements[key].kind == 'location'}
+        element_ids.update(e.id for e in doc.elements.values()
+                           if e.kind == 'device' and e.location_id in owners)
+        refs = {doc.elements[key].ref for key in element_ids if doc.elements[key].kind == 'device'}
+        label_origins = {key: route_label_point(route.points) for key, route in doc.routes.items()
+                         if ('label', key) in selected}
+        for key in element_ids:
+            element = doc.elements[key]
+            element.x += dx
+            element.y += dy
+            element.manual = True
+        for edge in self.design.connections:
+            route = doc.routes.get(edge.id)
+            if route is None or len(route.points) < 2:
+                continue
+            source_moves = edge.source.device_id in refs
+            target_moves = edge.target.device_id in refs
+            if not (source_moves or target_moves or ('route', edge.id) in selected):
+                continue
+            if edge.target.device_id.startswith('RSP-') and not (source_moves and target_moves):
+                route.points = self._route_rsp(edge, old_points=route.points if route.manual else ())
+                route.manual = True
+                continue
+            points = list(route.points)
+            if (source_moves and target_moves) or ('route', edge.id) in selected:
+                points = [(x + dx, y + dy) for x, y in points]
+            for endpoint_ref, at_start in ((edge.source, True), (edge.target, False)):
+                element = doc.elements.get(f'device:{endpoint_ref.device_id}')
+                if element is not None:
+                    endpoint = port_point(element, endpoint_ref.port_id, output=at_start)
+                    # Pure group translation preserves the complete internal wire shape.
+                    if not (source_moves and target_moves):
+                        points = reattach_route_endpoint(points, endpoint, at_start=at_start)
+            route.points = points
+            route.manual = True
+        for key, origin in label_origins.items():
+            route = doc.routes[key]
+            new_origin = route_label_point(route.points)
+            anchor_delta = ((new_origin[0] - origin[0], new_origin[1] - origin[1])
+                            if origin is not None and new_origin is not None else (0, 0))
+            route.label_offset = (route.label_offset[0] + dx - anchor_delta[0],
+                                  route.label_offset[1] + dy - anchor_delta[1])
+            route.label_manual = True
+        for annotation in doc.annotations:
+            if ('annotation', annotation.id) in selected:
+                annotation.points = [(x + dx, y + dy) for x, y in annotation.points]
+
     def resize_element(self, element_id: str, width: float, height: float) -> bool:
         element = self.document.elements[element_id]
         minimum_height = 54.0 if element.kind == "location" else 28.0
@@ -284,6 +346,29 @@ class RiserEditorController:
         self._mutate(operation)
         return True
 
+    def set_input_side(self, element_id, side):
+        element = self.document.elements[element_id]
+        if not element.ref.startswith('RSP-') or side not in (*INPUT_SIDES, 'auto'):
+            raise ValueError('Choose Auto or an RSP input side')
+        def operation():
+            element.input_side_locked = side != 'auto'
+            if side != 'auto':
+                element.input_side = side
+            self._reattach_routes(element.ref)
+        self._mutate(operation)
+
+    def _route_rsp(self, edge, *, old_points=()):
+        source = self.document.elements[f'device:{edge.source.device_id}']
+        target = self.document.elements[f'device:{edge.target.device_id}']
+        side, points = route_rsp_input(
+            edge, source, target, routing_obstacles(self.document, self.design),
+            reserved_segments=reserved_route_segments(
+                self.document, exclude_id=edge.id,
+                live_ids={connection.id for connection in self.design.connections}),
+            old_points=old_points)
+        target.input_side = side
+        return points
+
     def _reattach_routes(self, device_id: str, *, skip_routes=()) -> None:
         for edge in self.design.connections:
             if edge.id in skip_routes:
@@ -291,6 +376,9 @@ class RiserEditorController:
             if device_id not in {edge.source.device_id, edge.target.device_id}:
                 continue
             route = self.document.routes.get(edge.id)
+            if route is not None and edge.target.device_id.startswith('RSP-'):
+                route.points = self._route_rsp(edge, old_points=route.points if route.manual else ())
+                continue
             if route is None or not route.manual or len(route.points) < 2:
                 self._reroute(edge.id)
                 continue
@@ -364,10 +452,12 @@ class RiserEditorController:
 
     def reconnect(self, connection_id: str, *, source: DevicePortRef | None = None,
                   target: DevicePortRef | None = None,
-                  replace_target: bool = False):
+                  replace_target: bool = False, input_side: str | None = None):
         current = next(c for c in self.design.connections if c.id == connection_id)
         if ((source is None or source == current.source)
                 and (target is None or target == current.target)):
+            if input_side is not None:
+                self.set_input_side(f'device:{current.target.device_id}', input_side)
             return current
 
         def operation():
@@ -380,14 +470,23 @@ class RiserEditorController:
             edge = topology_reconnect(self.design, connection_id, source=source, target=target)
             project_legacy_topology(self.design)
             sync_riser_document(self.design, self.document)
+            if input_side is not None:
+                element = self.document.elements[f'device:{edge.target.device_id}']
+                if not element.ref.startswith('RSP-') or input_side not in INPUT_SIDES:
+                    raise ValueError('Choose an RSP input side')
+                element.input_side = input_side
+                element.input_side_locked = True
+                self._reroute(edge.id)
             return edge
         return self._mutate(operation)
 
     def connect(self, source: DevicePortRef, target: DevicePortRef, *,
-                replace_target: bool = False):
+                replace_target: bool = False, input_side: str | None = None):
         existing = next((edge for edge in self.design.connections
                          if edge.source == source and edge.target == target), None)
         if existing is not None:
+            if input_side is not None:
+                self.set_input_side(f'device:{target.device_id}', input_side)
             return existing
 
         def operation():
@@ -400,6 +499,13 @@ class RiserEditorController:
             edge = topology_connect(self.design, source, target)
             project_legacy_topology(self.design)
             sync_riser_document(self.design, self.document)
+            if input_side is not None:
+                element = self.document.elements[f'device:{edge.target.device_id}']
+                if not element.ref.startswith('RSP-') or input_side not in INPUT_SIDES:
+                    raise ValueError('Choose an RSP input side')
+                element.input_side = input_side
+                element.input_side_locked = True
+                self._reroute(edge.id)
             return edge
         return self._mutate(operation)
 
@@ -476,6 +582,8 @@ class RiserEditorController:
                 live_ids={connection.id for connection in self.design.connections},
             ),
         )
+        if target.ref.startswith('RSP-'):
+            points = self._route_rsp(edge)
         from riser_model import RiserRoute
         previous = self.document.routes.get(connection_id)
         label_offset = previous.label_offset if previous is not None else (0.0, 0.0)
@@ -692,6 +800,15 @@ class RiserTab(ctk.CTkFrame):
     TOOLS = ("Select", "Connect", "Route", "Text", "Polyline",
              "Rectangle", "Ellipse", "Arrow")
 
+    @property
+    def selected(self):
+        """Single-object actions are available only for a single selection."""
+        return self.selection[0] if len(self.selection) == 1 else None
+
+    @selected.setter
+    def selected(self, value):
+        self.selection = [value] if value is not None else []
+
     def __init__(self, master, session, on_edit, on_generate=None, on_remove_hardware=None,
                  on_add_hardware=None, on_edit_hardware=None):
         super().__init__(master, fg_color=theme.APP_BG, corner_radius=0)
@@ -774,7 +891,8 @@ class RiserTab(ctk.CTkFrame):
 
         ctk.CTkFrame(tools_row, width=1, height=26, fg_color=theme.BORDER,
                      corner_radius=0).pack(side="left", padx=8, pady=8)
-        for text, command in (("Duplicate", self.duplicate_selected),
+        for text, command in (("Select All", self.select_all),
+                              ("Duplicate", self.duplicate_selected),
                               ("Delete", self.delete_selected)):
             ctk.CTkButton(
                 tools_row, text=text, width=72, height=28,
@@ -957,7 +1075,9 @@ class RiserTab(ctk.CTkFrame):
         self.unplaced_frame.columnconfigure(0, weight=1)
 
     def _bind_keys(self):
-        self.canvas.bind("<Escape>", lambda _e: self._run_key_command(self.cancel))
+        for shortcut in ("<Control-a>", "<Command-a>"):
+            self.canvas.bind(shortcut, lambda _e: self._run_key_command(self.select_all))
+        self.canvas.bind("<Escape>", lambda _e: self._run_key_command(self.clear_selection))
         self.canvas.bind("<Delete>", lambda _e: self._run_key_command(self.delete_selected))
         self.canvas.bind("<BackSpace>", lambda _e: self._run_key_command(self.delete_selected))
         self.canvas.bind("<Control-z>", lambda _e: self._run_key_command(self.undo))
@@ -1071,7 +1191,7 @@ class RiserTab(ctk.CTkFrame):
         x2, y2 = self._xy((element.x + element.width, element.y + element.height))
         tag = f"element|{element.id}"
         visual_tag = f"visual|{element.id}"
-        selected = self.selected == ("element", element.id)
+        selected = ("element", element.id) in self.selection
         if element.kind == "location":
             self.canvas.create_rectangle(
                 x1, y1, x2, y2, fill="", outline="#8b949e",
@@ -1098,6 +1218,17 @@ class RiserTab(ctk.CTkFrame):
         show_detail = self.zoom >= 0.50 or selected or self.tool == "Connect"
         for run in device_text(self.design, element):
             self._draw_text_run(run, (tag, "selectable", visual_tag))
+        if element.ref.startswith('RSP-') and (self.tool in {'Connect', 'Route'} or
+                self.selected and self.selected[0] == 'route' or
+                self._gesture and self._gesture[0] == 'route'):
+            for side in INPUT_SIDES:
+                if side == element.input_side:
+                    continue
+                px, py = self._xy(input_side_point(element, side))
+                self.canvas.create_oval(px-5, py-5, px+5, py+5,
+                    fill='#ffffff', outline='#4a7bb8', dash=(2, 2),
+                    tags=(f'port|{element.ref}|IN|in', f'input-side|{element.id}|{side}',
+                          'port', visual_tag))
         for ref, output in self._ports_for(element.ref):
             px, py = self._xy(port_point(element, ref.port_id, output=output))
             port_tag = f"port|{ref.device_id}|{ref.port_id}|{'out' if output else 'in'}"
@@ -1108,7 +1239,8 @@ class RiserTab(ctk.CTkFrame):
                                     outline=("#d96524" if ref == self._connect_source
                                              else "#1b2430"),
                                     width=3 if ref == self._connect_source else 1,
-                                    tags=(port_tag, "port", visual_tag))
+                                    tags=(port_tag, "port", visual_tag,
+                          f'input-side|{element.id}|{element.input_side}' if element.ref.startswith('RSP-') and not output else ''))
             unused = not any(e.source == ref for e in self.design.connections)
             if (element.ref == "MSP" and (element.symbol_style != 'detailed' or self.tool == 'Connect' and unused) and
                     ref.port_id != 'KP BUS' and
@@ -1146,12 +1278,12 @@ class RiserTab(ctk.CTkFrame):
 
     def _draw_routes(self):
         edges = {edge.id: edge for edge in self.design.connections}
-        selected_id = self.selected[1] if self.selected and self.selected[0] == "route" else None
+        selected_ids = {ref for kind, ref in self.selection if kind == "route"}
         routes = (self._layout_preview or self.controller.document).routes
         bridges = find_bridges({key: route.points for key, route in routes.items()})
         for route_id, route in routes.items():
             tag = f"route|{route_id}"
-            width = 3 if route_id == selected_id else max(.35, 1.2 * self.zoom)
+            width = 3 if route_id in selected_ids else max(.35, 1.2 * self.zoom)
             for segment in wire_segments(route_id, route.points, bridges):
                 if segment[0] == "L":
                     points = segment[1:]
@@ -1230,6 +1362,14 @@ class RiserTab(ctk.CTkFrame):
             self._draw_text_run(run, ("titleblock",))
 
     def _draw_selection(self):
+        if len(self.selection) > 1 and self._layout_preview is None:
+            for kind, ref in self.selection:
+                box = self.canvas.bbox(f'{"visual" if kind == "element" else kind}|{ref}')
+                if box:
+                    self.canvas.create_rectangle(
+                        box[0]-4, box[1]-4, box[2]+4, box[3]+4,
+                        outline='#4a7bb8', dash=(3, 2), tags=('selection',))
+            return
         if not self.selected or self._layout_preview is not None:
             return
         kind, ref = self.selected
@@ -1291,6 +1431,23 @@ class RiserTab(ctk.CTkFrame):
         items = self.canvas.find_overlapping(x - 3, y - 3, x + 3, y + 3)
         return [tag for item in reversed(items) for tag in self.canvas.gettags(item)]
 
+    def _rsp_side_at_event(self, event):
+        if not self.layer_visibility['Devices']:
+            return None
+        point = self._world(event)
+        candidates = []
+        for element in self.controller.document.elements.values():
+            if element.kind == 'device' and element.ref.startswith('RSP-'):
+                for side in INPUT_SIDES:
+                    x, y = input_side_point(element, side)
+                    distance = math.hypot(point[0]-x, point[1]-y) * self.zoom
+                    if distance <= 10:
+                        candidates.append((distance, element.id, side))
+        if candidates:
+            _, element_id, side = min(candidates)
+            return element_id, side
+        return None
+
     def _parse_port(self, tags):
         token = next((tag for tag in tags if tag.startswith("port|")), None)
         if not token:
@@ -1306,20 +1463,43 @@ class RiserTab(ctk.CTkFrame):
                 return prefixes[prefix], ref
         return None
 
+    def _visible_selectables(self):
+        doc = self.controller.document
+        result = [('element', key) for key, element in doc.elements.items()
+                  if self.layer_visibility['Devices' if element.kind == 'device' else 'Locations']]
+        if self.layer_visibility['Cables']:
+            result.extend(('route', key) for key in doc.routes)
+            result.extend(('label', key) for key, route in doc.routes.items() if not route.label_hidden)
+        if self.layer_visibility['Markup']:
+            result.extend(('annotation', a.id) for a in doc.annotations)
+        return result
+
     def _reconcile_selection(self):
-        if not self.selected:
-            return
-        kind, ref = self.selected
-        exists = (
-            (kind == "element" and ref in self.controller.document.elements)
-            or (kind == "route" and ref in self.controller.document.routes)
-            or (kind == "label" and ref in self.controller.document.routes
-                and not self.controller.document.routes[ref].label_hidden)
-            or (kind == "annotation" and any(
-                item.id == ref for item in self.controller.document.annotations))
-        )
-        if not exists:
-            self.selected = None
+        visible = set(self._visible_selectables())
+        self.selection = [item for item in self.selection if item in visible]
+
+    @live_edit_only
+    def select_all(self):
+        self.cancel(redraw=False)
+        self.set_tool('Select')
+        self.selection = self._visible_selectables()
+        self.canvas.focus_set()
+        self.redraw(inspector=False)
+        self._refresh_selection_properties()
+
+    def clear_selection(self):
+        self.cancel(redraw=False)
+        self.selected = None
+        self.redraw()
+
+    def _extend_selection(self, event):
+        mask = 8 if self.tk.call('tk', 'windowingsystem') == 'aqua' else 4
+        return bool(getattr(event, 'state', 0) & mask)
+
+    def _restore_group_preview(self, document):
+        # Restore only drawing state; topology and history are untouched during a drag.
+        for name in ('elements', 'routes', 'annotations'):
+            setattr(self.controller.document, name, copy.deepcopy(getattr(document, name)))
 
     def _annotation_at_point(self, point):
         """Return the topmost markup hit, including unfilled shape interiors."""
@@ -1376,7 +1556,10 @@ class RiserTab(ctk.CTkFrame):
         tags = self._tags_at_event(event)
         port = self._parse_port(tags)
         if self.tool == "Connect":
-            self._connect_click(port)
+            side_hit = self._rsp_side_at_event(event)
+            if side_hit:
+                port = (DevicePortRef(self.controller.document.elements[side_hit[0]].ref, 'IN'), False)
+            self._connect_click(port, input_side=side_hit[1] if side_hit else None)
             return
         if self.tool == "Text":
             text = simpledialog.askstring("Add text", "Text:", parent=self.winfo_toplevel())
@@ -1400,6 +1583,8 @@ class RiserTab(ctk.CTkFrame):
             return
         handle = next((tag for tag in tags if tag == "resize-handle" or
                        tag.startswith("route-handle|")), None)
+        if self.tool == 'Select' and self._extend_selection(event):
+            handle = None
         if handle == "resize-handle" and self.selected and self.selected[0] == "element":
             element = self.controller.document.elements[self.selected[1]]
             self._gesture = ("resize", self.selected[1], point, element.width, element.height)
@@ -1413,6 +1598,27 @@ class RiserTab(ctk.CTkFrame):
         annotation_id = self._annotation_at_point(self._world(event))
         picked = (("annotation", annotation_id) if annotation_id
                   else self._parse_selectable(tags))
+        if self.tool == 'Select':
+            if self._extend_selection(event) and picked:
+                if picked in self.selection:
+                    self.selection.remove(picked)
+                else:
+                    self.selection.append(picked)
+                self._gesture = None
+                self.redraw(inspector=False)
+                self._refresh_selection_properties()
+                return
+            if not picked:
+                base = list(self.selection) if self._extend_selection(event) else []
+                self.selection = base
+                self._gesture = ('marquee', self._world(event), base)
+                self.redraw(inspector=False)
+                self._refresh_selection_properties()
+                return
+            if picked in self.selection and len(self.selection) > 1:
+                self._gesture = ('move-group', point, copy.deepcopy(self.controller.document),
+                                 list(self.selection))
+                return
         self.selected = picked
         if picked and picked[0] == "element" and self.tool == "Select":
             element = self.controller.document.elements[picked[1]]
@@ -1425,7 +1631,9 @@ class RiserTab(ctk.CTkFrame):
                 {edge.id: list(self.controller.document.routes[edge.id].points)
                  for edge in self.design.connections
                  if (edge.source.device_id in refs or edge.target.device_id in refs)
-                 and edge.id in self.controller.document.routes}, refs)
+                 and edge.id in self.controller.document.routes}, refs,
+                {key: e.input_side for key, e in self.controller.document.elements.items()
+                 if e.ref.startswith('RSP-')})
         elif picked and picked[0] == "label" and self.tool == "Select":
             route = self.controller.document.routes[picked[1]]
             self._gesture = ('move-label', picked[1], point, route.label_offset)
@@ -1465,7 +1673,37 @@ class RiserTab(ctk.CTkFrame):
             return
         point = self._snap(self._world(event))
         kind = self._gesture[0]
-        if kind == "draw":
+        if kind == 'marquee':
+            start = self._gesture[1]
+            self.canvas.delete('marquee')
+            self.canvas.create_rectangle(*self._xy(start), *self._xy(self._world(event)),
+                                         outline='#4a7bb8', dash=(4, 3), tags=('marquee',))
+        elif kind == 'move-group':
+            _, start, original, selection = self._gesture
+            previous = self.controller.document
+            positions = {key: (e.x, e.y) for key, e in previous.elements.items()}
+            annotations = {a.id: list(a.points) for a in previous.annotations}
+            routes = previous.routes
+            self._restore_group_preview(original)
+            self.controller._translate_selection(selection, point[0]-start[0], point[1]-start[1])
+            doc = self.controller.document
+            for key, element in doc.elements.items():
+                x, y = positions[key]
+                if (element.x, element.y) != (x, y):
+                    self.canvas.move(f'visual|{key}', (element.x-x)*self.zoom, (element.y-y)*self.zoom)
+            for annotation in doc.annotations:
+                old_points = annotations[annotation.id]
+                if old_points and annotation.points != old_points:
+                    self.canvas.move(f'annotation|{annotation.id}',
+                                     (annotation.points[0][0]-old_points[0][0])*self.zoom,
+                                     (annotation.points[0][1]-old_points[0][1])*self.zoom)
+            for key, route in doc.routes.items():
+                if route.points != routes[key].points or route.label_offset != routes[key].label_offset:
+                    self._preview_route_canvas(key)
+            self._preview_rsp_ports()
+            self.canvas.delete('selection')
+            self._draw_selection()
+        elif kind == "draw":
             start = self._gesture[1]
             coords = (*self._xy(start), *self._xy(point))
             if self._preview_item:
@@ -1490,6 +1728,7 @@ class RiserTab(ctk.CTkFrame):
             for key in members | {element_id}:
                 self.canvas.move(f"visual|{key}", dx * self.zoom, dy * self.zoom)
             self.canvas.move("selection", dx * self.zoom, dy * self.zoom)
+            self._preview_rsp_ports()
             if self._move_preview:
                 for route_id in self._move_preview[1]:
                     self._preview_route_canvas(route_id)
@@ -1538,12 +1777,40 @@ class RiserTab(ctk.CTkFrame):
             if index in {0, len(old_points) - 1}:
                 route.points = list(old_points)
                 route.points[index] = point
+                side_hit = self._rsp_side_at_event(event) if index == len(old_points)-1 else None
+                if side_hit:
+                    element_id, side = side_hit
+                    target = replace(self.controller.document.elements[element_id],
+                                     input_side=side, input_side_locked=True)
+                    edge = next(edge for edge in self.design.connections if edge.id == route_id)
+                    preview_edge = replace(edge, target=DevicePortRef(target.ref, 'IN'))
+                    source = self.controller.document.elements[f'device:{edge.source.device_id}']
+                    _, route.points = route_rsp_input(preview_edge, source, target,
+                        routing_obstacles(self.controller.document, self.design),
+                        reserved_segments=reserved_route_segments(self.controller.document, exclude_id=route_id))
             else:
                 route.points = self.controller.adjusted_route_points(
                     old_points, index, point)
             self._preview_route_canvas(route_id)
             self.canvas.delete("selection")
             self._draw_selection()
+
+    def _preview_rsp_ports(self):
+        for element in self.controller.document.elements.values():
+            if not element.ref.startswith('RSP-'):
+                continue
+            for item in self.canvas.find_withtag(f'port|{element.ref}|IN|in'):
+                tags = self.canvas.gettags(item)
+                # Alternate snap points have a dashed outline and stay on their own side.
+                if self.canvas.itemcget(item, 'dash'):
+                    continue
+                x, y = self._xy(input_side_point(element, element.input_side))
+                coords = self.canvas.coords(item)
+                radius = (coords[2]-coords[0])/2
+                self.canvas.coords(item, x-radius, y-radius, x+radius, y+radius)
+                self.canvas.itemconfigure(item, tags=tuple(
+                    tag for tag in tags if not tag.startswith('input-side|')) +
+                    (f'input-side|{element.id}|{element.input_side}',))
 
     def _preview_route_canvas(self, route_id):
         """Update one cable in-place; compute bridge hops once at mouse-up.
@@ -1571,7 +1838,7 @@ class RiserTab(ctk.CTkFrame):
     def _preview_move(self, dx, dy):
         if self._move_preview is None:
             return
-        positions, routes, refs = self._move_preview
+        positions, routes, refs, sides = self._move_preview
         doc = self.controller.document
         for key, (x, y) in positions.items():
             doc.elements[key].x, doc.elements[key].y = x + dx, y + dy
@@ -1581,6 +1848,10 @@ class RiserTab(ctk.CTkFrame):
             points = routes[edge.id]
             if edge.source.device_id in refs and edge.target.device_id in refs:
                 points = [(x + dx, y + dy) for x, y in points]
+            elif edge.target.device_id.startswith('RSP-'):
+                target = doc.elements[f'device:{edge.target.device_id}']
+                target.input_side = sides[target.id]
+                points = self.controller._route_rsp(edge, old_points=points if doc.routes[edge.id].manual else ())
             else:
                 for ref, at_start in ((edge.source, True), (edge.target, False)):
                     if ref.device_id in refs:
@@ -1590,7 +1861,7 @@ class RiserTab(ctk.CTkFrame):
 
     def _restore_move_preview(self):
         if self._move_preview is not None:
-            positions, routes, _refs = self._move_preview
+            positions, routes, _refs, sides = self._move_preview
             doc = self.controller.document
             for key, (x, y) in positions.items():
                 if key in doc.elements:
@@ -1598,6 +1869,9 @@ class RiserTab(ctk.CTkFrame):
             for key, points in routes.items():
                 if key in doc.routes:
                     doc.routes[key].points = points
+            for key, side in sides.items():
+                if key in doc.elements:
+                    doc.elements[key].input_side = side
         self._move_preview = None
 
     def _on_release(self, event):
@@ -1611,7 +1885,27 @@ class RiserTab(ctk.CTkFrame):
         gesture, self._gesture = self._gesture, None
         point = self._snap(self._world(event))
         kind = gesture[0]
-        if kind == "draw":
+        if kind == 'marquee':
+            _, start, base = gesture
+            end = self._world(event)
+            left, right = sorted((self._xy(start)[0], self._xy(end)[0]))
+            top, bottom = sorted((self._xy(start)[1], self._xy(end)[1]))
+            self.selection = list(base)
+            if right-left > 3 or bottom-top > 3:
+                for item in self._visible_selectables():
+                    kind_name, ref = item
+                    tag = f'{"visual" if kind_name == "element" else kind_name}|{ref}'
+                    box = self.canvas.bbox(tag)
+                    if box and left <= box[0] and top <= box[1] and right >= box[2] and bottom >= box[3]:
+                        if item not in self.selection:
+                            self.selection.append(item)
+            self.canvas.delete('marquee')
+        elif kind == 'move-group':
+            _, start, original, selection = gesture
+            self._restore_group_preview(original)
+            if self.controller.move_selection(selection, point[0]-start[0], point[1]-start[1]):
+                self.on_edit()
+        elif kind == "draw":
             start = gesture[1]
             if start != point:
                 annotation_kind = self.tool.lower()
@@ -1661,7 +1955,16 @@ class RiserTab(ctk.CTkFrame):
             route.points = old_points
             is_endpoint = index in {0, len(old_points) - 1}
             if is_endpoint:
+                side_hit = self._rsp_side_at_event(event) if index == len(old_points)-1 else None
+                edge = next(edge for edge in self.design.connections if edge.id == route_id)
+                if side_hit and side_hit[0] == f'device:{edge.target.device_id}':
+                    self.controller.set_input_side(*side_hit)
+                    self.on_edit()
+                    self.redraw()
+                    return
                 port = self._parse_port(self._tags_at_event(event))
+                if side_hit:
+                    port = (DevicePortRef(self.controller.document.elements[side_hit[0]].ref, 'IN'), False)
                 if port:
                     ref, is_output = port
                     edge = next(edge for edge in self.design.connections
@@ -1675,7 +1978,8 @@ class RiserTab(ctk.CTkFrame):
                             if ref == edge.target:
                                 self.redraw()
                                 return
-                            self.controller.reconnect(route_id, target=ref)
+                            self.controller.reconnect(route_id, target=ref,
+                                input_side=side_hit[1] if side_hit else None)
                             self.on_edit()
                     except TopologyError as exc:
                         messagebox.showwarning("Connection not allowed", str(exc))
@@ -1685,7 +1989,7 @@ class RiserTab(ctk.CTkFrame):
         self._preview_item = None
         self.redraw()
 
-    def _connect_click(self, port):
+    def _connect_click(self, port, input_side=None):
         if not port:
             return
         ref, is_output = port
@@ -1704,11 +2008,14 @@ class RiserTab(ctk.CTkFrame):
             existing = next((edge for edge in self.design.connections
                              if edge.source == self._connect_source and edge.target == ref), None)
             if existing is not None:
+                if input_side is not None:
+                    self.controller.set_input_side(f'device:{ref.device_id}', input_side)
+                    self.on_edit()
                 self.selected = ("route", existing.id)
                 self._connect_source = None
                 self.redraw()
                 return
-            edge = self.controller.connect(self._connect_source, ref)
+            edge = self.controller.connect(self._connect_source, ref, input_side=input_side)
             self.selected = ("route", edge.id)
             self._connect_source = None
             self._changed()
@@ -1717,6 +2024,10 @@ class RiserTab(ctk.CTkFrame):
 
     @live_edit_only
     def _on_double_click(self, event):
+        # Tk dispatches a rapid second press here instead of the single-click handler.
+        if self.tool == 'Select' and self._extend_selection(event):
+            self._on_press(event)
+            return 'break'
         if self.tool == "Polyline" and self._gesture and self._gesture[0] == "polyline":
             self._finish_polyline()
             return "break"
@@ -1875,8 +2186,11 @@ class RiserTab(ctk.CTkFrame):
                 entry.configure(state='normal')
         self._cancel_drag_frame()
         self._restore_move_preview()
+        self.canvas.delete('marquee')
         if self._gesture:
-            if self._gesture[0] == 'move-label':
+            if self._gesture[0] == 'move-group':
+                self._restore_group_preview(self._gesture[2])
+            elif self._gesture[0] == 'move-label':
                 _, key, _start, offset = self._gesture
                 if key in self.controller.document.routes:
                     self.controller.document.routes[key].label_offset = offset
@@ -1927,6 +2241,10 @@ class RiserTab(ctk.CTkFrame):
     def delete_selected(self):
         self.cancel(redraw=False)
         self._reconcile_selection()
+        if len(self.selection) > 1:
+            messagebox.showinfo("Select one item", "Select one item to delete or disconnect it.",
+                                parent=self.winfo_toplevel())
+            return
         if not self.selected:
             messagebox.showinfo("Nothing selected", "Select a device, cable, callout, or markup object.",
                                 parent=self.winfo_toplevel())
@@ -1977,6 +2295,11 @@ class RiserTab(ctk.CTkFrame):
     @live_edit_only
     def nudge(self, dx, dy):
         self.cancel(redraw=False)
+        self._reconcile_selection()
+        if len(self.selection) > 1:
+            if self.controller.move_selection(self.selection, dx, dy):
+                self._changed()
+            return
         if not self.selected:
             return
         kind, ref = self.selected
@@ -2139,6 +2462,13 @@ class RiserTab(ctk.CTkFrame):
             ctk.CTkLabel(self.properties, text='Preview only. Apply or cancel to resume editing.',
                          wraplength=250, justify='left').grid(row=0, column=0, padx=10, pady=10)
             return
+        if len(self.selection) > 1:
+            ctk.CTkLabel(self.properties, text=f"{len(self.selection)} items selected",
+                         wraplength=250, justify='left').grid(row=0, column=0, padx=10, pady=10)
+            ctk.CTkLabel(self.properties,
+                         text="Drag or use arrow keys to move the group. Command-click (Mac) or Ctrl-click (Windows) to change selection. Escape clears it.",
+                         wraplength=250, justify='left').grid(row=1, column=0, padx=10, pady=4)
+            return
         if not self.selected:
             ctk.CTkLabel(self.properties, text="Select a device, cable, or markup object.",
                          wraplength=250, justify="left", text_color=theme.TEXT_SECOND,
@@ -2173,6 +2503,15 @@ class RiserTab(ctk.CTkFrame):
                         text='This legacy box includes different location records. Preview layout to review them separately.',
                         wraplength=250, justify='left').grid(row=2, column=0, padx=10, pady=6)
             elif element and element.kind == 'device':
+                if element.ref.startswith('RSP-'):
+                    ctk.CTkLabel(self.properties, text='Input side', anchor='w').grid(
+                        row=6, column=0, sticky='w', padx=10, pady=(8, 0))
+                    side_value = element.input_side.title() if element.input_side_locked else 'Auto'
+                    variable = tk.StringVar(value=side_value)
+                    ctk.CTkOptionMenu(self.properties,
+                        values=['Auto', 'Top', 'Right', 'Bottom', 'Left'], variable=variable,
+                        command=lambda value: self._set_input_side(element.id, value.lower())).grid(
+                            row=7, column=0, sticky='ew', padx=10, pady=6)
                 self._build_location_assignment(element.ref)
                 ctk.CTkButton(self.properties, text='Edit Device',
                              command=self.edit_device).grid(
@@ -2181,6 +2520,12 @@ class RiserTab(ctk.CTkFrame):
                     ctk.CTkButton(self.properties, text='Remove from Project',
                                  command=self.delete_selected).grid(
                         row=5, column=0, sticky='ew', padx=10, pady=6)
+
+    @live_edit_only
+    def _set_input_side(self, element_id, side):
+        self.cancel(redraw=False)
+        self.controller.set_input_side(element_id, side)
+        self._changed()
 
     def _build_location_fields(self, identity):
         record = self.design.equipment_locations[identity]
