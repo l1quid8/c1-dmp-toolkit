@@ -92,8 +92,9 @@ def test_legacy_refresh_cannot_discard_canonical_duplicate_port_draft():
         rsps=[RSP(1), RSP(2)],
     )
     for number in (1, 2):
-        connect(design, DevicePortRef("710-LX500-1", "OUT1"),
-                DevicePortRef(f"RSP-{number}", "IN"), custom_label=f"DRAFT {number}")
+        design.connections.append(TopologyConnection(
+            f"import-{number}", DevicePortRef("710-LX500-1", "OUT1"),
+            DevicePortRef(f"RSP-{number}", "IN"), custom_label=f"DRAFT {number}"))
     design.riser_document = layout_riser(design)
     for edge in design.connections:
         design.riser_document.routes[edge.id] = RiserRoute(

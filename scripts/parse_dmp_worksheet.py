@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 from riser_model import RiserDocument, TopologyConnection
+from location_model import EquipmentLocation
 
 import re
 
@@ -117,6 +118,9 @@ class DMPDesign:
     dmp_status: str = ""                                     # "DRAFT" | "FINAL" | "" (DMPStatus doc prop)
     connections: list[TopologyConnection] = field(default_factory=list)
     riser_document: Optional[RiserDocument] = None
+    equipment_locations: dict[str, EquipmentLocation] = field(default_factory=dict)
+    device_location_ids: dict[str, str] = field(default_factory=dict)
+    location_sync_values: dict[str, Optional[str]] = field(default_factory=dict)
 
 
 # -------- parsing helpers --------

@@ -17,7 +17,7 @@ import app as app_module
 from editor_frame import EditorFrame, TAB_TITLES, TabBar
 from hardware import remove_keypad, renumber_splitter
 from parse_dmp_worksheet import ZoneInfo
-from riser_model import DevicePortRef
+from riser_model import DevicePortRef, TopologyConnection
 from rl_injector.rl_config import RLKeypad, RemoteLinkConfig
 from session import Session, sync_master_zones
 from test_riser_scene import branched_design
@@ -52,6 +52,10 @@ def editor(tmp_path):
         raise
     root.withdraw()
     design = branched_design()
+    # This fixture models an existing saved version-1 drawing. New scenes are
+    # covered separately by the cluster workflow tests.
+    from riser_scene import layout_riser
+    design.riser_document = layout_riser(design)
     design.zones = [ZoneInfo(501, "OFFICE", "Motion", 1, "EX")]
     sync_master_zones(design)
     session = Session(
@@ -145,8 +149,8 @@ def test_site_zone_and_keypad_programming_updates_live_receipt(editor):
 def test_generation_warning_sheet_combines_remotelink_and_topology_issues(editor):
     frame, _calls = editor
     frame._rl_comm_vars["port"].set("invalid")
-    connect(frame.session.design, DevicePortRef("710-LX500-1", "OUT3"),
-            DevicePortRef("RSP-2", "IN"))
+    frame.session.design.connections.append(TopologyConnection(
+        "import-conflict", DevicePortRef("710-LX500-1", "OUT3"), DevicePortRef("RSP-2", "IN")))
     proceeded = []
 
     frame.show_issues_dialog(lambda: proceeded.append(True), proceed_label="Generate anyway")

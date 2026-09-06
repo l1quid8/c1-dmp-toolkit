@@ -36,7 +36,7 @@ def test_riser_is_a_normal_production_tab():
     assert TAB_TITLES[-1] == "RISER"
 
 
-def test_connecting_to_occupied_port_waits_for_generation_validation(monkeypatch):
+def test_connecting_to_occupied_port_is_rejected_in_editor(monkeypatch):
     try:
         root = ctk.CTk()
     except tk.TclError:
@@ -47,12 +47,15 @@ def test_connecting_to_occupied_port_waits_for_generation_validation(monkeypatch
         tab.pack(fill="both", expand=True)
         root.update()
         monkeypatch.setattr(messagebox, "askyesno", lambda *args, **kwargs: False)
+        warnings = []
+        monkeypatch.setattr(messagebox, "showwarning", lambda *args, **kwargs: warnings.append(args))
 
         target = DevicePortRef("RSP-2", "IN")
         tab._connect_source = DevicePortRef("710-LX500-1", "OUT3")
         tab._connect_click((target, False))
 
-        assert sum(edge.target == target for edge in design.connections) == 2
+        assert sum(edge.target == target for edge in design.connections) == 1
+        assert warnings and "occupied" in warnings[0][1]
     finally:
         root.destroy()
 
@@ -336,11 +339,14 @@ def test_canvas_draws_vertical_hop_for_independent_endpoint_contact():
 
         tab.redraw()
 
-        assert any(
-            tab.canvas.type(item) == "arc"
-            and f"route|{vertical}" in tab.canvas.gettags(item)
-            for item in tab.canvas.find_all()
-        )
+        crossing_x, _ = tab._xy((300.0, 200.0))
+        curves = [tab.canvas.coords(item) for item in tab.canvas.find_all()
+                  if tab.canvas.type(item) == "line"
+                  and f"route|{vertical}" in tab.canvas.gettags(item)
+                  and len(tab.canvas.coords(item)) > 4]
+        assert curves and max(curves[0][::2]) > crossing_x
+        assert curves[0][0] == pytest.approx(crossing_x)
+        assert curves[0][-2] == pytest.approx(crossing_x)
     finally:
         root.destroy()
 

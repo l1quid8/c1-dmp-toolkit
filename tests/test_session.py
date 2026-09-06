@@ -162,8 +162,9 @@ def test_forward_compat_missing_and_extra_keys():
 
 
 def test_empty_design_round_trip():
-    restored = design_from_dict(json.loads(json.dumps(design_to_dict(DMPDesign()))))
-    assert restored == DMPDesign()
+    original = DMPDesign()
+    restored = design_from_dict(json.loads(json.dumps(design_to_dict(original))))
+    assert restored == original
 
 
 # -------- save / load / list --------
@@ -192,7 +193,7 @@ def test_session_saves_combined_schema_and_top_level_remotelink_config(tmp_sessi
     path = save_session(session)
     raw = json.loads(path.read_text(encoding="utf-8"))
 
-    assert raw["schema_version"] == 3
+    assert raw["schema_version"] == 7
     assert raw["remotelink"]["account_num"] == "3141"
     assert raw["remotelink"]["receiver_num"] == "7"
 

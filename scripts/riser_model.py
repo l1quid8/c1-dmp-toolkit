@@ -67,6 +67,14 @@ class RiserElement:
     label_offset: tuple[float, float] = (0.0, 0.0)
     manual: bool = False
     stale: bool = False
+    # Drawing ownership is independent of overlapping rectangles and labels.
+    location_id: str | None = None
+    physical_location_id: str | None = None
+    heading_lines: list[str] = field(default_factory=list)
+    heading_height: float = 34.0
+    symbol_style: str = "classic"
+    input_side: str = "top"
+    port_x: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -75,6 +83,8 @@ class RiserRoute:
     points: list[tuple[float, float]] = field(default_factory=list)
     label_offset: tuple[float, float] = (0.0, 0.0)
     manual: bool = False
+    label_hidden: bool = False
+    label_manual: bool = False
 
 
 @dataclass
@@ -101,6 +111,8 @@ class RiserDocument:
     unplaced: list[str] = field(default_factory=list)
     page_width: float = 36 * 72
     page_height: float = 24 * 72
+    layout_version: int = 1
+    show_location_frames: bool = True
 
 
 _NAMESPACE = uuid.UUID("5de56b6e-4ae2-4b45-b2a6-31f8e1729898")

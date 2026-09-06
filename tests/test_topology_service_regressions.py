@@ -234,15 +234,12 @@ def test_splitter_output_rejects_incompatible_target_atomically():
     assert _state(design) == before
 
 
-def test_splitter_output_allows_occupied_target_until_generation_validation():
+def test_splitter_output_rejects_occupied_target_without_mutation():
     design = connected_design()
-
-    topology.set_splitter_output(design, "710-LX500-1", 2, "RSP-2")
-
-    target = DevicePortRef("RSP-2", "IN")
-    assert sum(edge.target == target for edge in design.connections) == 2
-    splitter = next(s for s in design.splitters if s.id == "710-LX500-1")
-    assert splitter.outputs[2] == "RSP-2"
+    before = _state(design)
+    with pytest.raises(topology.TopologyError, match="occupied"):
+        topology.set_splitter_output(design, "710-LX500-1", 2, "RSP-2")
+    assert _state(design) == before
 
 
 def test_splitter_input_reconnects_exact_port_and_preserves_metadata():
@@ -300,14 +297,12 @@ def test_keypad_source_reconnect_uses_free_output_and_preserves_metadata():
     assert next(k for k in design.keypads if k.number == 2).source == "710-KP-2"
 
 
-def test_keypad_source_allows_occupied_msp_bus_until_generation_validation():
+def test_keypad_source_rejects_occupied_msp_bus_without_mutation():
     design = connected_design()
-
-    topology.set_keypad_source(design, 2, "MSP")
-
-    source = DevicePortRef("MSP", "KP BUS")
-    assert sum(edge.source == source for edge in design.connections) == 2
-    assert next(k for k in design.keypads if k.number == 2).source == "MSP"
+    before = _state(design)
+    with pytest.raises(topology.TopologyError, match="occupied"):
+        topology.set_keypad_source(design, 2, "MSP")
+    assert _state(design) == before
 
 
 def test_prune_unknown_connections_removes_edges_incident_to_deleted_expander():

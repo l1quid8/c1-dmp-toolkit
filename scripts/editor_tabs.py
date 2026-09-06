@@ -435,7 +435,7 @@ def _dialog_buttons(win, confirm_text: str, on_confirm) -> None:
                    ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
 
-def prompt_add_expander(root, session: Session, on_done) -> None:
+def prompt_add_expander(root, session: Session, on_done) -> ctk.CTkToplevel:
     win = _dialog_shell(root, "Add expander")
     _dialog_title(win, "Add a 714 expander (RSP + power supply + zone block)")
 
@@ -461,9 +461,10 @@ def prompt_add_expander(root, session: Session, on_done) -> None:
         on_done()
 
     _dialog_buttons(win, "Add expander", confirm)
+    return win
 
 
-def prompt_add_splitter(root, session: Session, on_done) -> None:
+def prompt_add_splitter(root, session: Session, on_done) -> ctk.CTkToplevel:
     win = _dialog_shell(root, "Add splitter")
     _dialog_title(win, "Add a 710 splitter-repeater")
 
@@ -488,6 +489,7 @@ def prompt_add_splitter(root, session: Session, on_done) -> None:
         on_done()
 
     _dialog_buttons(win, "Add splitter", confirm)
+    return win
 
 
 def _keypad_source_choices(session: Session) -> list[str]:
@@ -519,7 +521,7 @@ def _wiring_device_numbers(design, pattern: re.Pattern) -> set[int]:
     return numbers
 
 
-def prompt_add_keypad(root, session: Session, on_done) -> None:
+def prompt_add_keypad(root, session: Session, on_done) -> ctk.CTkToplevel:
     win = _dialog_shell(root, "Add keypad")
     _dialog_title(win, "Add a keypad")
 
@@ -553,6 +555,7 @@ def prompt_add_keypad(root, session: Session, on_done) -> None:
         on_done()
 
     _dialog_buttons(win, "Add keypad", confirm)
+    return win
 
 
 # ------------------------------------------------------------------ #
@@ -790,7 +793,7 @@ class SplittersTab(ctk.CTkFrame):
         return frame
 
     def _add_clicked(self):
-        prompt_add_splitter(self.winfo_toplevel(), self.session,
+        return prompt_add_splitter(self.winfo_toplevel(), self.session,
                             self.on_structure_change)
 
     def _remove_clicked(self, splitter):
@@ -865,8 +868,8 @@ class SplittersTab(ctk.CTkFrame):
                         if other.id != splitter.id and other.splitter_type == "KP"]
         return bus + upstream
 
-    def _build_splitter_card(self, splitter) -> ctk.CTkFrame:
-        card = Card(self.body)
+    def _build_splitter_card(self, splitter, parent=None) -> ctk.CTkFrame:
+        card = Card(self.body if parent is None else parent)
         card.columnconfigure(1, weight=1)
 
         id_row = ctk.CTkFrame(card, fg_color="transparent")
@@ -885,6 +888,7 @@ class SplittersTab(ctk.CTkFrame):
                        lambda _e, s=splitter, w=num_entry: self._renumber_clicked(s, w))
         num_entry.bind("<FocusOut>",
                        lambda _e, s=splitter, w=num_entry: self._renumber_clicked(s, w))
+        card.commit_pending = lambda: self._renumber_clicked(splitter, num_entry)
 
         loc_var = tk.StringVar(value=splitter.location or "")
 
@@ -950,7 +954,7 @@ class SplittersTab(ctk.CTkFrame):
                 out_row, values, None, tone=_menu_tone(current))
             menu.configure(
                 command=lambda value, s=splitter, idx=i, h=holder, m=menu:
-                (_style_menu(h, m, _menu_tone(value)), self._set_output(s, idx, value)))
+                self._commit_output(s, idx, value, h, m))
             menu.set(current)
             holder.grid(row=i, column=1, sticky="ew",
                         padx=(theme.PAD["xs"], 0), pady=(0 if i == 0 else 4, 0))
@@ -973,7 +977,15 @@ class SplittersTab(ctk.CTkFrame):
     def _commit_input(self, splitter, value: str, combo=None):
         self._set_input(splitter, value)
         if combo is not None and combo.winfo_exists():
+            combo.set(_first_input(splitter))
             self._tone_input(combo, _first_input(splitter))
+
+    def _commit_output(self, splitter, index, value, holder, menu):
+        self._set_output(splitter, index, value)
+        if menu.winfo_exists():
+            actual = splitter.outputs[index] if index < len(splitter.outputs or []) else 'Spare'
+            menu.set(actual)
+            _style_menu(holder, menu, _menu_tone(actual))
 
     def _set_input(self, splitter, value: str):
         val = value.strip()
@@ -1254,7 +1266,7 @@ class KeypadsTab(ctk.CTkFrame):
                                              sticky="ew", pady=4)
 
     def _add_clicked(self):
-        prompt_add_keypad(self.winfo_toplevel(), self.session,
+        return prompt_add_keypad(self.winfo_toplevel(), self.session,
                           self.on_structure_change)
 
     def _remove_clicked(self, kp):
@@ -1267,8 +1279,8 @@ class KeypadsTab(ctk.CTkFrame):
         self.on_hardware_change(
             lambda: remove_keypad(self.session.design, kp.number))
 
-    def _build_keypad_card(self, kp) -> ctk.CTkFrame:
-        card = Card(self.body)
+    def _build_keypad_card(self, kp, parent=None) -> ctk.CTkFrame:
+        card = Card(self.body if parent is None else parent)
         card.columnconfigure(1, weight=1)
 
         ctk.CTkLabel(card, text=f"KEYPAD #{kp.number}", text_color=theme.TEXT,
@@ -1304,8 +1316,14 @@ class KeypadsTab(ctk.CTkFrame):
         values = choices if not current or current in choices \
             else [current] + choices
         holder, menu = _bordered_menu(
-            src_row, values, lambda value, k=kp: self._set_source(k, value),
+            src_row, values, None,
             tone=_menu_tone(current), width=200)
+        def commit_source(value, menu=menu, holder=holder):
+            self._set_source(kp, value)
+            if menu.winfo_exists():
+                menu.set(kp.source or '— select source —')
+                _style_menu(holder, menu, _menu_tone(kp.source or ''))
+        menu.configure(command=commit_source)
         menu.set(current or "— select source —")
         holder.pack(side="left", padx=(theme.PAD["sm"], 0))
 
@@ -1383,6 +1401,10 @@ class KeypadsTab(ctk.CTkFrame):
         )
 
         areas_var = tk.StringVar(value=rl.disp_areas)
+        def commit_device_type(value):
+            self._set_rl_field(kp, 'device_type', device_labels[value])
+            areas_var.set(effective_keypad(self.session.remotelink, kp).disp_areas)
+        menu.configure(command=commit_device_type)
         areas_var.trace_add(
             "write", lambda *_a, k=kp, v=areas_var:
             self._set_rl_field(k, "disp_areas", v.get()))
@@ -1500,7 +1522,7 @@ class PowerTab(ctk.CTkFrame):
             self._syncing_locations = False
 
     def _add_clicked(self):
-        prompt_add_expander(self.winfo_toplevel(), self.session,
+        return prompt_add_expander(self.winfo_toplevel(), self.session,
                             self.on_structure_change)
 
     def _remove_clicked(self, rsp):
@@ -1517,8 +1539,8 @@ class PowerTab(ctk.CTkFrame):
         self.on_hardware_change(
             lambda: remove_expander(self.session.design, rsp.number))
 
-    def _build_rsp_card(self, rsp, ps_by_number) -> ctk.CTkFrame:
-        card = Card(self.body)
+    def _build_rsp_card(self, rsp, ps_by_number, parent=None) -> ctk.CTkFrame:
+        card = Card(self.body if parent is None else parent)
         card.columnconfigure(1, weight=1)
 
         zr = f"Z{min(rsp.zones)}–Z{max(rsp.zones)}" if rsp.zones else "no zones"
@@ -1534,7 +1556,8 @@ class PowerTab(ctk.CTkFrame):
             side="left", padx=(theme.PAD["xs"], 0))
 
         loc_var = tk.StringVar(value=rsp.location or "")
-        self._location_vars[rsp.number] = loc_var
+        if parent is None:
+            self._location_vars[rsp.number] = loc_var
 
         def loc_edited(*_a, r=rsp):
             if self._syncing_locations:

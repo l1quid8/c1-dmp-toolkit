@@ -4,35 +4,61 @@ from __future__ import annotations
 
 import copy
 import contextlib
+import math
 import re
 import tkinter as tk
 import uuid
+from functools import wraps
 from dataclasses import fields
 from tkinter import messagebox, simpledialog
+from tkinter import font as tkfont
 
 import customtkinter as ctk
+from PIL import Image, ImageTk
 
 import theme
+from paths import resource_path
+from project_locations import (location_values, plan_location_rename, restore_locations,
+                               sync_project_locations, edit_location, assign_location,
+                               rename_equipment_location)
+from riser_drawing import (TextRun, device_shape, device_text, location_text_runs,
+                           title_bounds, logo_bounds, title_text)
+from riser_symbols import symbol_parts, modern_title, detailed_size
+from riser_presentation import layout_presentation
 from riser_model import DevicePortRef, RiserAnnotation, RiserDocument
 from riser_scene import (
-    BRIDGE_HALF_WIDTH,
     GRID,
-    TITLE_BLOCK_WIDTH,
     find_bridges,
     layout_riser,
+    layout_clusters,
+    repair_generated_scene,
+    _normal_location,
     port_point,
     reattach_route_endpoint,
+    reattach_source_route,
     reserved_route_segments,
+    routing_obstacles,
     route_label_point,
     route_topology_connection,
     sync_riser_document,
+    sync_location_ownership,
     validate_riser,
+    wire_segments,
 )
 from topology_service import TopologyError
 from topology_service import connect as topology_connect
 from topology_service import disconnect as topology_disconnect
 from topology_service import reconnect as topology_reconnect
 from topology_service import project_legacy_topology
+
+
+def live_edit_only(method):
+    """Preview is read-only, including toolbar and keyboard command paths."""
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        if self._layout_preview is None:
+            return method(self, *args, **kwargs)
+    return guarded
 
 
 class RiserEditorController:
@@ -42,8 +68,44 @@ class RiserEditorController:
         self.design = design
         self.document = document
         self.design.riser_document = document
+        sync_project_locations(self.design)
         self._undo: list[tuple[tuple, tuple]] = []
         self._redo: list[tuple[tuple, tuple]] = []
+        self._external_signature = self._topology_signature()
+        self._external_locations = location_values(self.design)
+        self._external_registry = self._registry_snapshot()
+        self._preview_basis = None
+
+    def _registry_snapshot(self):
+        return (copy.deepcopy(self.design.equipment_locations),
+                dict(self.design.device_location_ids), dict(self.design.location_sync_values))
+
+    def _topology_signature(self):
+        return (tuple(sorted((e.id, e.source.device_id, e.source.port_id,
+                              e.target.device_id, e.target.port_id) for e in self.design.connections)),
+                tuple(sorted(s.id for s in self.design.splitters)),
+                tuple(sorted(r.number for r in self.design.rsps)),
+                tuple(sorted(k.number for k in self.design.keypads)))
+
+    def sync_external(self):
+        self._rebase_external_history()
+        sync_riser_document(self.design, self.document)
+
+    def _rebase_external_history(self):
+        """Guard commands even before another tab's debounced redraw fires."""
+        signature = self._topology_signature()
+        locations = location_values(self.design)
+        sync_project_locations(self.design)
+        registry = self._registry_snapshot()
+        has_location_history = any(before[2:] != after[2:]
+                                   for before, after in self._undo + self._redo)
+        if (signature != self._external_signature or
+                (has_location_history and (locations != self._external_locations or
+                                          registry != self._external_registry))):
+            self.clear_history()
+        self._external_signature = signature
+        self._external_locations = locations
+        self._external_registry = registry
 
     @property
     def can_undo(self) -> bool:
@@ -54,24 +116,39 @@ class RiserEditorController:
         return bool(self._redo)
 
     def _snapshot(self):
-        return (copy.deepcopy(self.design.connections), copy.deepcopy(self.document))
+        return (copy.deepcopy(self.design.connections), copy.deepcopy(self.document),
+                location_values(self.design), self._registry_snapshot())
 
-    def _restore(self, snapshot) -> None:
-        connections, document = copy.deepcopy(snapshot)
+    def _restore(self, snapshot, location_refs=(), restore_registry=False) -> None:
+        connections, document, locations, registry = copy.deepcopy(snapshot)
+        restore_locations(self.design, locations, location_refs)
+        if restore_registry:
+            (self.design.equipment_locations, self.design.device_location_ids,
+             self.design.location_sync_values) = registry
+        topology_changed = self.design.connections != connections
         self.design.connections = connections
         for field in fields(RiserDocument):
             setattr(self.document, field.name, getattr(document, field.name))
         self.design.riser_document = self.document
-        project_legacy_topology(self.design)
+        if topology_changed:
+            project_legacy_topology(self.design)
+        sync_location_ownership(self.design, self.document)
+        self._external_signature = self._topology_signature()
+        self._external_locations = location_values(self.design)
+        self._external_registry = self._registry_snapshot()
 
     def _mutate(self, operation):
+        self._rebase_external_history()
         before = self._snapshot()
         try:
             result = operation()
         except Exception:
-            self._restore(before)
+            self._restore(before, before[2], True)
             raise
         after = self._snapshot()
+        self._external_signature = self._topology_signature()
+        self._external_locations = location_values(self.design)
+        self._external_registry = self._registry_snapshot()
         if before != after:
             self._undo.append((before, after))
             self._redo.clear()
@@ -83,20 +160,67 @@ class RiserEditorController:
         self._redo.clear()
 
     def undo(self) -> bool:
+        self._rebase_external_history()
         if not self._undo:
             return False
         before, after = self._undo.pop()
-        self._restore(before)
+        self._restore(before, [ref for ref in before[2] if before[2][ref] != after[2].get(ref)], before[3] != after[3])
         self._redo.append((before, after))
         return True
 
     def redo(self) -> bool:
+        self._rebase_external_history()
         if not self._redo:
             return False
         before, after = self._redo.pop()
-        self._restore(after)
+        self._restore(after, [ref for ref in after[2] if after[2][ref] != before[2].get(ref)], before[3] != after[3])
         self._undo.append((before, after))
         return True
+
+    def rename_location(self, element_id: str, new_name: str, *, allow_merge=False) -> bool:
+        updates, merging = plan_location_rename(self.design, self.document, element_id, new_name)
+        if merging and not allow_merge:
+            raise ValueError('That location already exists; confirm combining the location groups.')
+        if not updates:
+            return False
+
+        def operation():
+            frame = self.document.elements[element_id]
+            primary = 'MSP' if 'MSP' in updates else next(iter(updates))
+            identity = frame.physical_location_id or self.design.device_location_ids[primary]
+            identity = rename_equipment_location(self.design, identity, new_name, allow_merge=allow_merge)
+            for ref in updates:
+                assign_location(self.design, ref, identity)
+            sync_location_ownership(self.design, self.document)
+        self._mutate(operation)
+        return True
+
+    def edit_location(self, identity, **values):
+        def operation():
+            edit_location(self.design, identity, **values)
+            sync_location_ownership(self.design, self.document)
+        self._mutate(operation)
+
+    def assign_location(self, device_id, identity):
+        def operation():
+            assign_location(self.design, device_id, identity)
+            sync_location_ownership(self.design, self.document)
+        self._mutate(operation)
+
+    def preview_layout(self):
+        preview = layout_presentation(self.design, title_source=self.document)
+        self._preview_basis = (copy.deepcopy(self.design), copy.deepcopy(preview))
+        return preview
+
+    def apply_layout(self, preview):
+        if (self._preview_basis is None or self.design != self._preview_basis[0]
+                or preview != self._preview_basis[1]):
+            raise ValueError('The project changed. Preview the layout again before applying.')
+        def operation():
+            for field in fields(RiserDocument):
+                setattr(self.document, field.name, copy.deepcopy(getattr(preview, field.name)))
+        self._mutate(operation)
+        self._preview_basis = None
 
     def move_element(self, element_id: str, dx: float, dy: float) -> bool:
         if not dx and not dy:
@@ -110,8 +234,7 @@ class RiserEditorController:
                 members = [
                     candidate for candidate in self.document.elements.values()
                     if candidate.kind == "device"
-                    and element.x <= candidate.x + candidate.width / 2 <= element.x + element.width
-                    and element.y <= candidate.y + candidate.height / 2 <= element.y + element.height
+                    and candidate.location_id == element.id
                 ]
                 member_refs = {member.ref for member in members}
                 shared_routes = {
@@ -131,13 +254,13 @@ class RiserEditorController:
                     member.x += dx
                     member.y += dy
                     member.manual = True
-                for member in members:
-                    self._reattach_routes(member.ref)
                 for route_id, points in shared_routes.items():
                     route = self.document.routes.get(route_id)
                     if route is not None:
                         route.points = [(x + dx, y + dy) for x, y in points]
                         route.manual = True
+                for member in members:
+                    self._reattach_routes(member.ref, skip_routes=shared_routes)
         self._mutate(operation)
         return True
 
@@ -145,6 +268,9 @@ class RiserEditorController:
         element = self.document.elements[element_id]
         minimum_height = 54.0 if element.kind == "location" else 28.0
         width, height = max(36.0, width), max(minimum_height, height)
+        if element.kind == 'device' and element.symbol_style == 'detailed':
+            minimum_width, minimum_height = detailed_size(self.design, element.ref)
+            width, height = max(width,minimum_width), max(height,minimum_height)
         if element.width == width and element.height == height:
             return False
 
@@ -158,8 +284,10 @@ class RiserEditorController:
         self._mutate(operation)
         return True
 
-    def _reattach_routes(self, device_id: str) -> None:
+    def _reattach_routes(self, device_id: str, *, skip_routes=()) -> None:
         for edge in self.design.connections:
+            if edge.id in skip_routes:
+                continue
             if device_id not in {edge.source.device_id, edge.target.device_id}:
                 continue
             route = self.document.routes.get(edge.id)
@@ -168,9 +296,8 @@ class RiserEditorController:
                 continue
             if edge.source.device_id == device_id:
                 element = self.document.elements[f"device:{device_id}"]
-                new = port_point(element, edge.source.port_id, output=True)
-                route.points = reattach_route_endpoint(
-                    route.points, new, at_start=True)
+                route.points = reattach_source_route(
+                    edge, element, route.points, routing_obstacles(self.document,self.design))
             if edge.target.device_id == device_id:
                 element = self.document.elements[f"device:{device_id}"]
                 new = port_point(element, edge.target.port_id, output=False)
@@ -302,6 +429,21 @@ class RiserEditorController:
                 setattr(edge, name, value)
         self._mutate(operation)
 
+    def update_label(self, connection_id, *, offset=None, hidden=None, reset=False):
+        """Drawing-only callout change; never remove cable data or connectivity."""
+        if offset is not None and (len(offset) != 2 or
+                                   not all(math.isfinite(v) for v in offset)):
+            raise ValueError('Label position must contain two finite coordinates')
+
+        def operation():
+            route = self.document.routes[connection_id]
+            if offset is not None or reset:
+                route.label_offset = (0.0, 0.0) if reset else tuple(offset)
+                route.label_manual = not reset
+            if hidden is not None:
+                route.label_hidden = bool(hidden)
+        self._mutate(operation)
+
     def update_title_block(self, **changes) -> None:
         allowed = {field.name for field in fields(type(self.document.title_block))}
         if set(changes) - allowed:
@@ -322,7 +464,7 @@ class RiserEditorController:
         if source is None or target is None:
             self.document.routes.pop(connection_id, None)
             return
-        obstacles = [e for e in self.document.elements.values() if e.kind == "device"]
+        obstacles = routing_obstacles(self.document,self.design)
         points = route_topology_connection(
             edge,
             source,
@@ -338,7 +480,9 @@ class RiserEditorController:
         previous = self.document.routes.get(connection_id)
         label_offset = previous.label_offset if previous is not None else (0.0, 0.0)
         self.document.routes[connection_id] = RiserRoute(
-            connection_id, points, label_offset=label_offset)
+            connection_id, points, label_offset=label_offset,
+            label_hidden=previous.label_hidden if previous else False,
+            label_manual=previous.label_manual if previous else False)
 
     def add_annotation(self, annotation: RiserAnnotation) -> None:
         def operation():
@@ -374,8 +518,8 @@ class RiserEditorController:
         if "font_weight" in changes and changes["font_weight"] not in {"normal", "bold"}:
             raise ValueError("Annotation font weight must be normal or bold")
         for name in ("stroke_width", "font_size"):
-            if name in changes and float(changes[name]) <= 0:
-                raise ValueError(f"{name.replace('_', ' ').title()} must be positive")
+            if name in changes and (not math.isfinite(float(changes[name])) or float(changes[name]) <= 0):
+                raise ValueError(f"{name.replace('_', ' ').title()} must be a finite positive number")
         for name in ("stroke", "fill"):
             value = changes.get(name)
             if value is None or (name == "fill" and value == ""):
@@ -416,33 +560,118 @@ class RiserEditorController:
         def operation():
             if device_id not in self.document.unplaced:
                 raise ValueError(f"Device is not unplaced: {device_id}")
-            template = layout_riser(self.design).elements[f"device:{device_id}"]
+            template = self._layout().elements[f"device:{device_id}"]
             template.x, template.y, template.manual = x, y, True
             self.document.elements[template.id] = template
             self.document.z_order.append(template.id)
             self.document.unplaced.remove(device_id)
+            sync_location_ownership(self.design, self.document)
             for edge in self.design.connections:
                 if device_id in {edge.source.device_id, edge.target.device_id}:
                     self._reroute(edge.id)
             return template
         return self._mutate(operation)
 
+    def _layout(self):
+        builder = (layout_presentation if self.document.layout_version >= 3 else
+                   layout_clusters if self.document.layout_version >= 2 else layout_riser)
+        return builder(self.design, title_source=self.document)
+
     def relayout(self) -> None:
         def operation():
-            replacement = layout_riser(self.design, title_source=self.document)
+            replacement = self._layout()
             for field in fields(RiserDocument):
                 setattr(self.document, field.name, getattr(replacement, field.name))
             self.design.riser_document = self.document
         self._mutate(operation)
 
+    def _insert_missing_clusters(self, replacement):
+        """Fit only new equipment into clear space; retain everything else."""
+        from riser_scene import PAGE_MARGIN, TITLE_BLOCK_WIDTH, _boxes_overlap
+
+        def box(item):
+            return (item.x, item.y, item.x + item.width, item.y + item.height)
+
+        def position(item, bounds, obstacles):
+            left, top, right, bottom = bounds
+            right -= item.width
+            bottom -= item.height
+            if right < left or bottom < top:
+                return None
+            candidates = [(item.x, item.y)] + [
+                (x, y) for y in range(math.ceil(top / GRID), math.floor(bottom / GRID) + 1)
+                for x in range(math.ceil(left / GRID), math.floor(right / GRID) + 1)]
+            candidates[1:] = [(x * GRID, y * GRID) for x, y in candidates[1:]]
+            candidates.sort(key=lambda p: (abs(p[0] - item.x) + abs(p[1] - item.y), p[1], p[0]))
+            for x, y in candidates:
+                candidate = (x - 8, y - 8, x + item.width + 8, y + item.height + 8)
+                if (left <= x <= right and top <= y <= bottom
+                        and not any(_boxes_overlap(candidate, rect) for rect in obstacles)):
+                    return x, y
+            return None
+
+        page = (PAGE_MARGIN, PAGE_MARGIN,
+                self.document.page_width - TITLE_BLOCK_WIDTH - PAGE_MARGIN,
+                self.document.page_height - PAGE_MARGIN)
+        # Existing manual cables are protected too, not rerouted for new items.
+        cable_boxes = [(min(a[0], b[0])-4, min(a[1], b[1])-4,
+                        max(a[0], b[0])+4, max(a[1], b[1])+4)
+                       for route in self.document.routes.values()
+                       for a, b in zip(route.points, route.points[1:])]
+        existing_frames = {e.physical_location_id: e for e in self.document.elements.values()
+                           if e.kind == 'location'}
+        for frame in (e for e in replacement.elements.values() if e.kind == 'location'):
+            missing = [e for e in replacement.elements.values()
+                       if e.kind == 'device' and e.location_id == frame.id
+                       and e.id not in self.document.elements]
+            if not missing:
+                continue
+            owner = existing_frames.get(frame.physical_location_id)
+            if owner is None:
+                obstacles = [box(e) for e in self.document.elements.values()] + cable_boxes
+                found = position(frame, page, obstacles)
+                if found is None:
+                    continue
+                dx, dy = found[0] - frame.x, found[1] - frame.y
+                frame.x, frame.y = found
+                self.document.elements[frame.id] = frame
+                self.document.z_order.insert(0, frame.id)
+                for item in missing:
+                    item.x += dx
+                    item.y += dy
+                    self.document.elements[item.id] = item
+                    self.document.z_order.append(item.id)
+            else:
+                bounds = (max(page[0], owner.x + 16), max(page[1], owner.y + owner.heading_height + 24),
+                          min(page[2], owner.x + owner.width - 16), min(page[3], owner.y + owner.height - 16))
+                for item in missing:
+                    obstacles = [box(e) for e in self.document.elements.values()
+                                 if e.kind == 'device'] + cable_boxes
+                    found = position(item, bounds, obstacles)
+                    if found is not None:
+                        item.x, item.y = found
+                        item.location_id = owner.id
+                        self.document.elements[item.id] = item
+                        self.document.z_order.append(item.id)
+
     def auto_layout(self) -> None:
         """Place only missing items while retaining every existing object/route."""
         def operation():
-            replacement = layout_riser(self.design, title_source=self.document)
-            for element_id, element in replacement.elements.items():
+            repair_generated_scene(self.design, self.document)
+            sync_riser_document(self.design, self.document)
+            replacement = self._layout()
+            existing_locations = {_normal_location(e.ref) for e in self.document.elements.values()
+                                  if e.kind == "location"}
+            if self.document.layout_version >= 2:
+                self._insert_missing_clusters(replacement)
+            for element_id, element in (replacement.elements.items()
+                                        if self.document.layout_version < 2 else ()):
                 if element_id not in self.document.elements:
+                    if element.kind == "location" and _normal_location(element.ref) in existing_locations:
+                        continue  # renamed frames keep stable IDs
                     self.document.elements[element_id] = element
                     self.document.z_order.append(element_id)
+            sync_location_ownership(self.design, self.document)
             for route_id in replacement.routes:
                 if route_id not in self.document.routes:
                     # Replacement routes terminate at replacement geometry.
@@ -463,26 +692,37 @@ class RiserTab(ctk.CTkFrame):
     TOOLS = ("Select", "Connect", "Route", "Text", "Polyline",
              "Rectangle", "Ellipse", "Arrow")
 
-    def __init__(self, master, session, on_edit, on_generate=None):
+    def __init__(self, master, session, on_edit, on_generate=None, on_remove_hardware=None,
+                 on_add_hardware=None, on_edit_hardware=None):
         super().__init__(master, fg_color=theme.APP_BG, corner_radius=0)
         self.session = session
         self.design = session.design
         if self.design.riser_document is None:
-            self.design.riser_document = layout_riser(self.design)
+            self.design.riser_document = layout_presentation(self.design)
         elif not self.design.riser_document.elements:
-            self.design.riser_document = layout_riser(
+            self.design.riser_document = layout_presentation(
                 self.design, title_source=self.design.riser_document)
+        before_sync = copy.deepcopy(self.design.riser_document)
+        repair_generated_scene(self.design, self.design.riser_document)
         sync_riser_document(self.design, self.design.riser_document)
+        scene_recovered = self.design.riser_document != before_sync
         self.controller = RiserEditorController(
             self.design, self.design.riser_document)
         self.on_edit = on_edit
         self.on_generate = on_generate or (lambda: None)
+        self.on_remove_hardware = on_remove_hardware
+        self.on_add_hardware = on_add_hardware
+        self.on_edit_hardware = on_edit_hardware
+        self._layout_preview = None
         self.tool = "Select"
         self.zoom = 0.42
         self.snap_enabled = True
         self.grid_enabled = True
         self.selected: tuple[str, str] | None = None
         self._gesture = None
+        self._drag_job = None
+        self._pending_drag = None
+        self._move_preview = None
         self._connect_source: DevicePortRef | None = None
         self._preview_item = None
         self._initial_fit_done = False
@@ -501,7 +741,13 @@ class RiserTab(ctk.CTkFrame):
         self._build_toolbar()
         self._build_workspace()
         self._bind_keys()
+        self.bind("<Destroy>", self._cancel_drag_frame, add="+")
         self.redraw()
+
+        if scene_recovered:
+            # The parent editor must finish construction before mark_dirty
+            # touches its footer. Opening repairs memory, never the source file.
+            self.after_idle(self.on_edit)
 
     # ---- construction -------------------------------------------------
 
@@ -535,6 +781,9 @@ class RiserTab(ctk.CTkFrame):
                 fg_color="transparent", hover_color=theme.HOVER_SUBTLE,
                 text_color=theme.TEXT, command=command).pack(side="left", padx=1)
 
+        ctk.CTkButton(tools_row, text='Add Device', width=96, height=28,
+                     command=self.add_device).pack(side='left', padx=(8, 4))
+
         actions_row = ctk.CTkFrame(bar, fg_color="transparent", corner_radius=0,
                                    height=42)
         actions_row.pack(side="top", fill="x")
@@ -561,7 +810,7 @@ class RiserTab(ctk.CTkFrame):
             fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
             text_color="#ffffff", command=self.on_generate).pack(
                 side="right", padx=(2, 8), pady=7)
-        ctk.CTkButton(actions_row, text="Re-layout All", width=96, height=28,
+        ctk.CTkButton(actions_row, text="Preview layout", width=104, height=28,
                       fg_color="transparent", hover_color=theme.HOVER_SUBTLE,
                       text_color=theme.TEXT, command=self.relayout).pack(
                           side="right", padx=(0, 2), pady=7)
@@ -591,10 +840,18 @@ class RiserTab(ctk.CTkFrame):
         body = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
         body.grid(row=1, column=0, sticky="nsew")
         body.columnconfigure(0, weight=1)
-        body.rowconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
+        self._preview_bar = ctk.CTkFrame(body, fg_color=theme.ACCENT_TINT)
+        self._preview_bar.grid(row=0, column=0, columnspan=2, sticky='ew')
+        ctk.CTkLabel(self._preview_bar, text='LAYOUT PREVIEW — project unchanged').pack(side='left', padx=12)
+        ctk.CTkButton(self._preview_bar, text='Apply layout', width=105,
+                     command=self.apply_preview).pack(side='right', padx=6, pady=6)
+        ctk.CTkButton(self._preview_bar, text='Cancel preview', width=110,
+                     command=self.cancel).pack(side='right', padx=6)
+        self._preview_bar.grid_remove()
         canvas_wrap = ctk.CTkFrame(body, fg_color=theme.SURFACE_CHIP,
                                    corner_radius=0)
-        canvas_wrap.grid(row=0, column=0, sticky="nsew")
+        canvas_wrap.grid(row=1, column=0, sticky="nsew")
         canvas_wrap.columnconfigure(0, weight=1)
         canvas_wrap.rowconfigure(0, weight=1)
         self.canvas = tk.Canvas(
@@ -612,12 +869,12 @@ class RiserTab(ctk.CTkFrame):
         self.inspector = ctk.CTkScrollableFrame(
             body, width=302, fg_color=theme.SURFACE, corner_radius=0,
             scrollbar_button_color=theme.BORDER_STRONG)
-        self.inspector.grid(row=0, column=1, sticky="nsew")
+        self.inspector.grid(row=1, column=1, sticky="nsew")
         self.inspector.columnconfigure(0, weight=1)
         self._build_inspector()
 
         self.canvas.bind("<ButtonPress-1>", self._on_press)
-        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<B1-Motion>", self._queue_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Double-Button-1>", self._on_double_click)
         self.canvas.bind("<Motion>", self._on_pointer_motion)
@@ -649,12 +906,14 @@ class RiserTab(ctk.CTkFrame):
         self._section("Layers", 2)
         layers = ctk.CTkFrame(self.inspector, fg_color="transparent")
         layers.grid(row=3, column=0, sticky="ew", padx=10)
+        self._layer_switches = {}
         for column, name in enumerate(self.layer_visibility):
             switch = ctk.CTkSwitch(
                 layers, text=name, width=82,
                 font=theme.ui_font(theme.SIZE["meta"]),
                 command=lambda n=name: self._toggle_layer(n))
             switch.select()
+            self._layer_switches[name] = switch
             switch.grid(row=column // 2, column=column % 2, sticky="w", pady=2)
 
         self._section("Title block", 4)
@@ -747,7 +1006,11 @@ class RiserTab(ctk.CTkFrame):
     def redraw(self, *, inspector: bool = True):
         self._reconcile_selection()
         self.canvas.delete("all")
-        doc = self.controller.document
+        doc = self._layout_preview or self.controller.document
+        self.layer_visibility['Locations'] = doc.show_location_frames
+        switch = self._layer_switches.get('Locations')
+        if switch:
+            switch.select() if doc.show_location_frames else switch.deselect()
         width, height = doc.page_width * self.zoom, doc.page_height * self.zoom
         origin_x, origin_y = self._page_origin()
         self.canvas.create_rectangle(origin_x, origin_y,
@@ -767,18 +1030,13 @@ class RiserTab(ctk.CTkFrame):
                                         fill="#edf0f2", tags=("grid",))
                 y += step
 
-        if self.layer_visibility["Locations"]:
-            for element_id in doc.z_order:
-                element = doc.elements.get(element_id)
-                if element and element.kind == "location":
-                    self._draw_element(element)
+        for element_id in doc.z_order:
+            element = doc.elements.get(element_id)
+            if element and ((element.kind == "location" and self.layer_visibility["Locations"])
+                            or (element.kind == "device" and self.layer_visibility["Devices"])):
+                self._draw_element(element)
         if self.layer_visibility["Cables"]:
             self._draw_routes()
-        if self.layer_visibility["Devices"]:
-            for element_id in doc.z_order:
-                element = doc.elements.get(element_id)
-                if element and element.kind == "device":
-                    self._draw_element(element)
         if self.layer_visibility["Markup"]:
             for annotation in sorted(
                     doc.annotations,
@@ -793,41 +1051,53 @@ class RiserTab(ctk.CTkFrame):
         if inspector:
             self._refresh_inspector()
 
+    def _draw_text_run(self, run, tags, color="#111111"):
+        size = max(1, round(run.size * self.zoom))
+        weight = "bold" if run.bold else "normal"
+        if not hasattr(self, "_canvas_fonts"):
+            self._canvas_fonts = {}
+        key = (size, weight)
+        if key not in self._canvas_fonts:
+            self._canvas_fonts[key] = tkfont.Font(root=self.canvas, family="Helvetica",
+                                                  size=-size, weight=weight)
+        font = self._canvas_fonts[key]
+        x, baseline = self._xy((run.x, run.y))
+        return self.canvas.create_text(
+            x, baseline - font.metrics("ascent"), text=run.text, fill=color, font=font,
+            anchor={"start": "nw", "middle": "n", "end": "ne"}[run.anchor], tags=tags)
+
     def _draw_element(self, element):
         x1, y1 = self._xy((element.x, element.y))
         x2, y2 = self._xy((element.x + element.width, element.y + element.height))
         tag = f"element|{element.id}"
+        visual_tag = f"visual|{element.id}"
         selected = self.selected == ("element", element.id)
         if element.kind == "location":
             self.canvas.create_rectangle(
-                x1, y1, x2, y2, fill="#fbfcfd", outline="#99a6b2",
-                dash=(5, 4), width=2 if selected else 1,
-                tags=(tag, "selectable"))
+                x1, y1, x2, y2, fill="", outline="#8b949e",
+                dash=(8, 5), width=2 if selected else max(.35, self.zoom),
+                tags=(tag, "selectable", visual_tag))
             self.canvas.create_line(
-                x1, y1 + 34 * self.zoom, x2, y1 + 34 * self.zoom,
-                fill="#d7dde3", width=1, tags=(tag, "selectable"))
-            self.canvas.create_text(x1 + 8, y1 + 7, text=element.ref,
-                                    anchor="nw", fill="#4f5964",
-                                    font=("TkDefaultFont", max(5, round(8 * self.zoom))),
-                                    tags=(tag, "selectable"))
+                x1, y1 + element.heading_height * self.zoom, x2, y1 + element.heading_height * self.zoom,
+                fill="#d7dde3", width=1, tags=(tag, "selectable", visual_tag))
+            for run in location_text_runs(element):
+                self._draw_text_run(run, (tag, "selectable", visual_tag))
             return
         fill = "#fff7e8" if element.stale else "#ffffff"
-        self.canvas.create_rectangle(
-            x1, y1, x2, y2, fill=fill,
-            outline="#4a7bb8" if selected else "#1b2430",
-            width=3 if selected else 1.4, tags=(tag, "selectable"))
+        for part in symbol_parts(self.design,element):
+            coords = [v for point in zip(part.coords[::2],part.coords[1::2]) for v in self._xy(point)]
+            color = '#4a7bb8' if selected else '#1b2430'
+            options = dict(width=3 if selected and part.fill else max(.35,part.width*self.zoom),
+                           tags=(tag,'selectable',visual_tag))
+            if part.kind == 'line':
+                self.canvas.create_line(*coords,fill=color,**options)
+            else:
+                draw = {'ellipse':self.canvas.create_oval,'rectangle':self.canvas.create_rectangle,
+                        'polygon':self.canvas.create_polygon}[part.kind]
+                draw(*coords,fill=fill if part.fill else '',outline=color,**options)
         show_detail = self.zoom >= 0.50 or selected or self.tool == "Connect"
-        if show_detail:
-            kind = self._device_kind_label(element.ref)
-            self.canvas.create_text((x1 + x2) / 2, y1 + 12 * self.zoom,
-                                    text=kind, fill="#5c6570",
-                                    font=("TkDefaultFont", max(6, round(8 * self.zoom))),
-                                    tags=(tag, "selectable"))
-        ref_y = ((y1 + y2) / 2 + 5 * self.zoom) if show_detail else (y1 + y2) / 2
-        self.canvas.create_text((x1 + x2) / 2, ref_y,
-                                text=element.ref, fill="#111111",
-                                font=("TkDefaultFont", max(7, round(13 * self.zoom)), "bold"),
-                                tags=(tag, "selectable"))
+        for run in device_text(self.design, element):
+            self._draw_text_run(run, (tag, "selectable", visual_tag))
         for ref, output in self._ports_for(element.ref):
             px, py = self._xy(port_point(element, ref.port_id, output=output))
             port_tag = f"port|{ref.device_id}|{ref.port_id}|{'out' if output else 'in'}"
@@ -838,13 +1108,15 @@ class RiserTab(ctk.CTkFrame):
                                     outline=("#d96524" if ref == self._connect_source
                                              else "#1b2430"),
                                     width=3 if ref == self._connect_source else 1,
-                                    tags=(port_tag, "port"))
-            if (element.ref == "MSP" and
+                                    tags=(port_tag, "port", visual_tag))
+            unused = not any(e.source == ref for e in self.design.connections)
+            if (element.ref == "MSP" and (element.symbol_style != 'detailed' or self.tool == 'Connect' and unused) and
+                    ref.port_id != 'KP BUS' and
                     (self.zoom >= 0.55 or selected or self.tool == "Connect")):
                 self.canvas.create_text(
-                    px, py - 6, text=ref.port_id, anchor="s", fill="#4f5964",
+                    px, py - 6, text=ref.port_id, anchor='s', fill="#4f5964",
                     font=("TkDefaultFont", max(5, round(6 * self.zoom))),
-                    tags=(port_tag, "port"))
+                    tags=(port_tag, "port", visual_tag))
 
     def _device_kind_label(self, device_id):
         if device_id == "MSP":
@@ -875,89 +1147,30 @@ class RiserTab(ctk.CTkFrame):
     def _draw_routes(self):
         edges = {edge.id: edge for edge in self.design.connections}
         selected_id = self.selected[1] if self.selected and self.selected[0] == "route" else None
-        bridges = find_bridges({key: value.points for key, value
-                                in self.controller.document.routes.items()})
-        for route_id, route in self.controller.document.routes.items():
-            if len(route.points) < 2:
-                continue
+        routes = (self._layout_preview or self.controller.document).routes
+        bridges = find_bridges({key: route.points for key, route in routes.items()})
+        for route_id, route in routes.items():
             tag = f"route|{route_id}"
-            width = 3 if route_id == selected_id else 1.5
-            route_bridges = [bridge for bridge in bridges
-                             if bridge.connection_id == route_id]
-            for start, end in zip(route.points, route.points[1:]):
-                if start[1] == end[1]:
-                    forward = end[0] >= start[0]
-                    crossings = [bridge for bridge in route_bridges
-                                 if bridge.orientation == "horizontal"
-                                 and min(start[0], end[0]) + BRIDGE_HALF_WIDTH <= bridge.x
-                                 <= max(start[0], end[0]) - BRIDGE_HALF_WIDTH
-                                 and abs(bridge.y - start[1]) < 0.01]
-                    crossings.sort(key=lambda bridge: bridge.x, reverse=not forward)
-                    cursor = start
-                    for bridge in crossings:
-                        before_x = (bridge.x - BRIDGE_HALF_WIDTH if forward
-                                    else bridge.x + BRIDGE_HALF_WIDTH)
-                        after_x = (bridge.x + BRIDGE_HALF_WIDTH if forward
-                                   else bridge.x - BRIDGE_HALF_WIDTH)
-                        before = (before_x, start[1])
-                        self.canvas.create_line(
-                            *self._xy(cursor), *self._xy(before), fill="#111111",
-                            width=width, tags=(tag, "selectable"))
-                        center_x, center_y = self._xy((bridge.x, bridge.y))
-                        radius = max(3, BRIDGE_HALF_WIDTH * self.zoom)
-                        self.canvas.create_arc(
-                            center_x - radius, center_y - radius,
-                            center_x + radius, center_y + radius,
-                            start=0, extent=180, style="arc", outline="#111111",
-                            width=width, tags=(tag, "selectable"))
-                        cursor = (after_x, start[1])
-                    self.canvas.create_line(
-                        *self._xy(cursor), *self._xy(end), fill="#111111",
-                        width=width, tags=(tag, "selectable"))
-                elif start[0] == end[0]:
-                    forward = end[1] >= start[1]
-                    crossings = [bridge for bridge in route_bridges
-                                 if bridge.orientation == "vertical"
-                                 and min(start[1], end[1]) + BRIDGE_HALF_WIDTH <= bridge.y
-                                 <= max(start[1], end[1]) - BRIDGE_HALF_WIDTH
-                                 and abs(bridge.x - start[0]) < 0.01]
-                    crossings.sort(key=lambda bridge: bridge.y, reverse=not forward)
-                    cursor = start
-                    for bridge in crossings:
-                        before_y = (bridge.y - BRIDGE_HALF_WIDTH if forward
-                                    else bridge.y + BRIDGE_HALF_WIDTH)
-                        after_y = (bridge.y + BRIDGE_HALF_WIDTH if forward
-                                   else bridge.y - BRIDGE_HALF_WIDTH)
-                        before = (start[0], before_y)
-                        self.canvas.create_line(
-                            *self._xy(cursor), *self._xy(before), fill="#111111",
-                            width=width, tags=(tag, "selectable"))
-                        center_x, center_y = self._xy((bridge.x, bridge.y))
-                        radius = max(3, BRIDGE_HALF_WIDTH * self.zoom)
-                        self.canvas.create_arc(
-                            center_x - radius, center_y - radius,
-                            center_x + radius, center_y + radius,
-                            start=270, extent=180, style="arc", outline="#111111",
-                            width=width, tags=(tag, "selectable"))
-                        cursor = (start[0], after_y)
-                    self.canvas.create_line(
-                        *self._xy(cursor), *self._xy(end), fill="#111111",
-                        width=width, tags=(tag, "selectable"))
+            width = 3 if route_id == selected_id else max(.35, 1.2 * self.zoom)
+            for segment in wire_segments(route_id, route.points, bridges):
+                if segment[0] == "L":
+                    points = segment[1:]
                 else:
-                    self.canvas.create_line(
-                        *self._xy(start), *self._xy(end), fill="#111111",
-                        width=width, tags=(tag, "selectable"))
+                    start, control, end = segment[1:]
+                    points = [
+                        tuple((1-t)**2 * a + 2*(1-t)*t * b + t*t*c
+                              for a, b, c in zip(start, control, end))
+                        for t in (i / 16 for i in range(17))
+                    ]
+                self.canvas.create_line(
+                    *[coordinate for point in points for coordinate in self._xy(point)],
+                    fill="#111111", width=width, tags=(tag, "selectable"))
             edge = edges.get(route_id)
-            if edge and self.zoom >= 0.45:
-                label_point = route_label_point(route.points)
-                if label_point is None:
-                    continue
-                lx, ly = self._xy((label_point[0] + route.label_offset[0],
-                                   label_point[1] + route.label_offset[1]))
-                self.canvas.create_text(
-                    lx, ly - 5, text=edge.label, anchor="s", fill="#111111",
-                    font=("TkDefaultFont", max(6, round(9 * self.zoom))),
-                    tags=(tag, "selectable"))
+            point = route_label_point(route.points)
+            if edge and point is not None and not route.label_hidden:
+                self._draw_text_run(TextRun(point[0] + route.label_offset[0],
+                                            point[1] + route.label_offset[1],
+                                            edge.label, 14, True), (f"label|{route_id}", "selectable"))
 
     def _draw_annotation(self, annotation):
         if not annotation.points:
@@ -969,12 +1182,10 @@ class RiserTab(ctk.CTkFrame):
         fill = annotation.fill or ""
         width = max(1, annotation.stroke_width * self.zoom)
         if annotation.kind == "text":
-            anchor = {"left": "w", "center": "center", "right": "e"}[annotation.alignment]
-            self.canvas.create_text(
-                *points[0], text=annotation.text, anchor=anchor, fill=stroke,
-                font=("TkDefaultFont", max(6, round(annotation.font_size * self.zoom)),
-                      "bold" if annotation.font_weight == "bold" else "normal"),
-                tags=(tag, "selectable"))
+            anchor = {"left": "start", "center": "middle", "right": "end"}[annotation.alignment]
+            self._draw_text_run(TextRun(*annotation.points[0], annotation.text,
+                                       annotation.font_size, annotation.font_weight == "bold", anchor),
+                                (tag, "selectable"), color=stroke)
         elif annotation.kind == "rectangle" and len(points) > 1:
             self.canvas.create_rectangle(*coords[:4], outline=stroke, fill=fill,
                                          width=width, tags=(tag, "selectable"))
@@ -987,31 +1198,39 @@ class RiserTab(ctk.CTkFrame):
                                     tags=(tag, "selectable"))
 
     def _draw_title_block(self):
-        doc = self.controller.document
-        left = doc.page_width - TITLE_BLOCK_WIDTH
-        x1, y1 = self._xy((left, 0))
-        x2, y2 = self._xy((doc.page_width, doc.page_height))
+        doc = self._layout_preview or self.controller.document
+        left, top, right, bottom = title_bounds(doc)
+        x1, y1 = self._xy((left, top))
+        x2, y2 = self._xy((right, bottom))
         self.canvas.create_rectangle(x1, y1, x2, y2, fill="#ffffff",
-                                     outline="#111111", width=1.2,
+                                     outline="#111111", width=max(.35, 2 * self.zoom),
                                      tags=("titleblock",))
-        title = doc.title_block
-        values = ["C1", title.school_name, f"LOCAL CODE  {title.local_code}",
-                  title.address, title.project_title,
-                  title.drawing_title, title.system, f"SHEET  {title.sheet_number}",
-                  f"DRAWN  {title.drawn_by}", f"CHECKED  {title.checked_by}",
-                  f"ISSUE  {title.issue_date}",
-                  *(f"REV  {revision}" for revision in title.revisions[-6:])]
-        y = y1 + 22
-        for index, value in enumerate(values):
-            self.canvas.create_text(
-                (x1 + x2) / 2, y, text=value, width=max(20, x2 - x1 - 12),
-                fill="#111111", justify="center",
-                font=("TkDefaultFont", max(7, round((18 if index == 0 else 9) * self.zoom)),
-                      "bold" if index in {0, 1, 4, 5} else "normal"), tags=("titleblock",))
-            y += (50 if index in {0, 1, 2, 3, 4, 5} else 35) * self.zoom
+        if doc.layout_version >= 3:
+            self.canvas.create_rectangle(*self._xy((36,36)),
+                *self._xy((doc.page_width-36,doc.page_height-36)),outline='#111111',
+                width=max(.35,2*self.zoom),tags=('titleblock',))
+            for a,b in modern_title(doc)[1]:
+                self.canvas.create_line(*self._xy(a),*self._xy(b),fill='#111111',
+                    width=max(.35,1.2*self.zoom),tags=('titleblock',))
+        lx, ly, lr, lb = logo_bounds(doc)
+        logo_size = (max(1, round((lr-lx) * self.zoom)), max(1, round((lb-ly) * self.zoom)))
+        if getattr(self, "_logo_size", None) != logo_size:
+            try:
+                with Image.open(resource_path("logos/c1_logo.png")) as source:
+                    logo = source.copy()
+                logo.thumbnail(logo_size, Image.Resampling.LANCZOS)
+                self._logo_image = ImageTk.PhotoImage(logo, master=self.canvas)
+            except OSError:
+                self._logo_image = None
+            self._logo_size = logo_size
+        if self._logo_image is not None:
+            self.canvas.create_image(*self._xy(((lx+lr)/2, (ly+lb)/2)),
+                                     image=self._logo_image, tags=("titleblock",))
+        for run in title_text(doc):
+            self._draw_text_run(run, ("titleblock",))
 
     def _draw_selection(self):
-        if not self.selected:
+        if not self.selected or self._layout_preview is not None:
             return
         kind, ref = self.selected
         if kind == "element":
@@ -1023,7 +1242,15 @@ class RiserTab(ctk.CTkFrame):
             x, y = self._xy((element.x + element.width, element.y + element.height))
             self.canvas.create_rectangle(x - 5, y - 5, x + 5, y + 5,
                                          fill="#ffffff", outline="#4a7bb8", width=2,
-                                         tags=("resize-handle",))
+                                         tags=("resize-handle", "selection"))
+        elif kind == "label":
+            if not self.layer_visibility['Cables']:
+                return
+            box = self.canvas.bbox(f'label|{ref}')
+            if box:
+                self.canvas.create_rectangle(
+                    box[0]-4, box[1]-4, box[2]+4, box[3]+4,
+                    outline='#4a7bb8', dash=(3, 2), tags=('selection',))
         elif kind == "route":
             if not self.layer_visibility["Cables"]:
                 return
@@ -1034,7 +1261,7 @@ class RiserTab(ctk.CTkFrame):
                     self.canvas.create_rectangle(
                         x - 4, y - 4, x + 4, y + 4, fill="#ffffff",
                         outline="#4a7bb8", width=2,
-                        tags=(f"route-handle|{ref}|{index}",))
+                        tags=(f"route-handle|{ref}|{index}", "selection"))
         elif kind == "annotation" and self.layer_visibility["Markup"]:
             annotation = next((item for item in self.controller.document.annotations
                                if item.id == ref), None)
@@ -1045,17 +1272,19 @@ class RiserTab(ctk.CTkFrame):
             self.canvas.create_rectangle(
                 min(xs) - 5, min(ys) - 5, max(xs) + 5, max(ys) + 5,
                 outline="#4a7bb8", dash=(3, 2), width=1,
-                tags=("annotation-selection",))
+                tags=("annotation-selection", "selection"))
 
     # ---- interaction --------------------------------------------------
 
+    @live_edit_only
     def set_tool(self, name):
-        self.cancel()
+        self.cancel(redraw=False)
         self.tool = name
         for tool, button in self._tool_buttons.items():
             button.configure(fg_color=theme.ACCENT_TINT if tool == name else "transparent")
         self.canvas.configure(cursor={"Connect": "crosshair", "Route": "crosshair",
                                       "Text": "xterm"}.get(name, "arrow"))
+        self.redraw(inspector=False)
 
     def _tags_at_event(self, event):
         x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
@@ -1070,7 +1299,7 @@ class RiserTab(ctk.CTkFrame):
         return DevicePortRef(device, port), direction == "out"
 
     def _parse_selectable(self, tags):
-        prefixes = {"annotation": "annotation", "element": "element", "route": "route"}
+        prefixes = {"annotation": "annotation", "element": "element", "route": "route", "label": "label"}
         for token in tags:
             prefix, separator, ref = token.partition("|")
             if separator and prefix in prefixes:
@@ -1084,6 +1313,8 @@ class RiserTab(ctk.CTkFrame):
         exists = (
             (kind == "element" and ref in self.controller.document.elements)
             or (kind == "route" and ref in self.controller.document.routes)
+            or (kind == "label" and ref in self.controller.document.routes
+                and not self.controller.document.routes[ref].label_hidden)
             or (kind == "annotation" and any(
                 item.id == ref for item in self.controller.document.annotations))
         )
@@ -1137,7 +1368,9 @@ class RiserTab(ctk.CTkFrame):
                 return annotation.id
         return None
 
+    @live_edit_only
     def _on_press(self, event):
+        self._cancel_drag_frame()
         self.canvas.focus_set()
         point = self._snap(self._world(event))
         tags = self._tags_at_event(event)
@@ -1184,12 +1417,48 @@ class RiserTab(ctk.CTkFrame):
         if picked and picked[0] == "element" and self.tool == "Select":
             element = self.controller.document.elements[picked[1]]
             self._gesture = ("move", picked[1], point, element.x, element.y)
+            members = [e for e in self.controller.document.elements.values()
+                       if e.kind == "device" and (e.id == element.id or e.location_id == element.id)]
+            refs = {e.ref for e in members}
+            self._move_preview = (
+                {e.id: (e.x, e.y) for e in members},
+                {edge.id: list(self.controller.document.routes[edge.id].points)
+                 for edge in self.design.connections
+                 if (edge.source.device_id in refs or edge.target.device_id in refs)
+                 and edge.id in self.controller.document.routes}, refs)
+        elif picked and picked[0] == "label" and self.tool == "Select":
+            route = self.controller.document.routes[picked[1]]
+            self._gesture = ('move-label', picked[1], point, route.label_offset)
         elif picked and picked[0] == "annotation" and self.tool == "Select":
             annotation = next(item for item in self.controller.document.annotations
                               if item.id == picked[1])
             self._gesture = ("move-annotation", picked[1], point,
                              copy.deepcopy(annotation.points))
-        self.redraw()
+        # Selection changes do not change validation or the Unplaced tray.
+        self.redraw(inspector=False)
+        self._refresh_selection_properties()
+
+    def _queue_drag(self, event):
+        """Render at most one pending frame, always at the latest pointer."""
+        if not self._gesture:
+            return
+        self._pending_drag = event
+        if self._drag_job is None:
+            self._drag_job = self.after(16, self._flush_drag)
+
+    def _flush_drag(self):
+        self._drag_job = None
+        event, self._pending_drag = self._pending_drag, None
+        if event is not None and self._gesture:
+            self._on_drag(event)
+
+    def _cancel_drag_frame(self, event=None):
+        if event is not None and event.widget is not self:
+            return
+        if self._drag_job is not None:
+            self.after_cancel(self._drag_job)
+            self._drag_job = None
+        self._pending_drag = None
 
     def _on_drag(self, event):
         if not self._gesture:
@@ -1198,10 +1467,10 @@ class RiserTab(ctk.CTkFrame):
         kind = self._gesture[0]
         if kind == "draw":
             start = self._gesture[1]
-            if self._preview_item:
-                self.canvas.delete(self._preview_item)
             coords = (*self._xy(start), *self._xy(point))
-            if self.tool == "Rectangle":
+            if self._preview_item:
+                self.canvas.coords(self._preview_item, *coords)
+            elif self.tool == "Rectangle":
                 self._preview_item = self.canvas.create_rectangle(*coords, outline="#4a7bb8")
             elif self.tool == "Ellipse":
                 self._preview_item = self.canvas.create_oval(*coords, outline="#4a7bb8")
@@ -1211,22 +1480,58 @@ class RiserTab(ctk.CTkFrame):
         elif kind == "move":
             _, element_id, start, old_x, old_y = self._gesture
             element = self.controller.document.elements[element_id]
-            element.x, element.y = old_x + point[0] - start[0], old_y + point[1] - start[1]
-            self.redraw(inspector=False)
+            new_x, new_y = old_x + point[0] - start[0], old_y + point[1] - start[1]
+            dx, dy = new_x - element.x, new_y - element.y
+            if not dx and not dy:
+                return
+            element.x, element.y = new_x, new_y
+            self._preview_move(point[0] - start[0], point[1] - start[1])
+            members = set(self._move_preview[0]) if self._move_preview else set()
+            for key in members | {element_id}:
+                self.canvas.move(f"visual|{key}", dx * self.zoom, dy * self.zoom)
+            self.canvas.move("selection", dx * self.zoom, dy * self.zoom)
+            if self._move_preview:
+                for route_id in self._move_preview[1]:
+                    self._preview_route_canvas(route_id)
+        elif kind == "move-label":
+            _, key, start, old_offset = self._gesture
+            route = self.controller.document.routes[key]
+            offset = tuple(old_offset[i] + point[i] - start[i] for i in (0, 1))
+            delta = tuple((offset[i] - route.label_offset[i]) * self.zoom for i in (0, 1))
+            route.label_offset = offset
+            self.canvas.move(f'label|{key}', *delta)
+            self.canvas.move('selection', *delta)
         elif kind == "move-annotation":
             _, annotation_id, start, old_points = self._gesture
             annotation = next(item for item in self.controller.document.annotations
                               if item.id == annotation_id)
             dx, dy = point[0] - start[0], point[1] - start[1]
-            annotation.points = [(x + dx, y + dy) for x, y in old_points]
-            self.redraw(inspector=False)
+            new_points = [(x + dx, y + dy) for x, y in old_points]
+            if annotation.points == new_points:
+                return
+            delta = tuple((new_points[0][i] - annotation.points[0][i]) * self.zoom for i in (0, 1))
+            annotation.points = new_points
+            self.canvas.move(f"annotation|{annotation_id}", *delta)
+            self.canvas.move("selection", *delta)
         elif kind == "resize":
             _, element_id, start, old_w, old_h = self._gesture
             element = self.controller.document.elements[element_id]
-            element.width = max(36, old_w + point[0] - start[0])
+            width = max(36, old_w + point[0] - start[0])
             minimum_height = 54 if element.kind == "location" else 28
-            element.height = max(minimum_height, old_h + point[1] - start[1])
-            self.redraw(inspector=False)
+            height = max(minimum_height, old_h + point[1] - start[1])
+            if (element.width, element.height) == (width, height):
+                return
+            element.width, element.height = width, height
+            tag = f"visual|{element_id}"
+            items = self.canvas.find_withtag(tag)
+            above = self.canvas.find_above(items[-1]) if items else ()
+            self.canvas.delete(tag)
+            if items:
+                self._draw_element(element)
+                if above:
+                    self.canvas.tag_lower(tag, above[0])
+            self.canvas.delete("selection")
+            self._draw_selection()
         elif kind == "route":
             _, route_id, index, old_points = self._gesture
             route = self.controller.document.routes[route_id]
@@ -1236,13 +1541,73 @@ class RiserTab(ctk.CTkFrame):
             else:
                 route.points = self.controller.adjusted_route_points(
                     old_points, index, point)
-            self.redraw(inspector=False)
+            self._preview_route_canvas(route_id)
+            self.canvas.delete("selection")
+            self._draw_selection()
+
+    def _preview_route_canvas(self, route_id):
+        """Update one cable in-place; compute bridge hops once at mouse-up.
+
+        Reuse its first line and hide any additional bridge segments during
+        the gesture. A normal redraw restores final bridges on release/Esc.
+        Stationary sheet objects and all unrelated cable items are untouched.
+        """
+        route = self.controller.document.routes[route_id]
+        items = self.canvas.find_withtag(f"route|{route_id}")
+        lines = [item for item in items if self.canvas.type(item) == "line"]
+        if lines and len(route.points) >= 2:
+            self.canvas.coords(lines[0], *[v for p in route.points for v in self._xy(p)])
+            self.canvas.itemconfigure(lines[0], state="normal")
+            for item in lines[1:]:
+                self.canvas.itemconfigure(item, state="hidden")
+        point = route_label_point(route.points)
+        if point is not None:
+            x, y = self._xy((point[0]+route.label_offset[0], point[1]+route.label_offset[1]))
+            for item in self.canvas.find_withtag(f'label|{route_id}'):
+                if self.canvas.type(item) == "text":
+                    font = tkfont.nametofont(self.canvas.itemcget(item, "font"), root=self.canvas)
+                    self.canvas.coords(item, x, y-font.metrics("ascent"))
+
+    def _preview_move(self, dx, dy):
+        if self._move_preview is None:
+            return
+        positions, routes, refs = self._move_preview
+        doc = self.controller.document
+        for key, (x, y) in positions.items():
+            doc.elements[key].x, doc.elements[key].y = x + dx, y + dy
+        for edge in self.design.connections:
+            if edge.id not in routes:
+                continue
+            points = routes[edge.id]
+            if edge.source.device_id in refs and edge.target.device_id in refs:
+                points = [(x + dx, y + dy) for x, y in points]
+            else:
+                for ref, at_start in ((edge.source, True), (edge.target, False)):
+                    if ref.device_id in refs:
+                        endpoint = port_point(doc.elements[f"device:{ref.device_id}"], ref.port_id, output=at_start)
+                        points = reattach_route_endpoint(points, endpoint, at_start=at_start)
+            doc.routes[edge.id].points = points
+
+    def _restore_move_preview(self):
+        if self._move_preview is not None:
+            positions, routes, _refs = self._move_preview
+            doc = self.controller.document
+            for key, (x, y) in positions.items():
+                if key in doc.elements:
+                    doc.elements[key].x, doc.elements[key].y = x, y
+            for key, points in routes.items():
+                if key in doc.routes:
+                    doc.routes[key].points = points
+        self._move_preview = None
 
     def _on_release(self, event):
+        self._cancel_drag_frame()
         if not self._gesture:
             return
         if self._gesture[0] == "polyline":
             return
+        # Mouse-up can be newer than the last delivered motion event.
+        self._on_drag(event)
         gesture, self._gesture = self._gesture, None
         point = self._snap(self._world(event))
         kind = gesture[0]
@@ -1255,14 +1620,23 @@ class RiserTab(ctk.CTkFrame):
                     [start, point])
                 self.controller.add_annotation(annotation)
                 self.selected = ("annotation", annotation.id)
-                self._changed()
+                self.on_edit()
         elif kind == "move":
             _, element_id, _start, old_x, old_y = gesture
             element = self.controller.document.elements[element_id]
             new_x, new_y = element.x, element.y
+            self._restore_move_preview()
             element.x, element.y = old_x, old_y
             if self.controller.move_element(element_id, new_x - old_x, new_y - old_y):
-                self._changed()
+                self.on_edit()
+        elif kind == "move-label":
+            _, key, _start, old_offset = gesture
+            route = self.controller.document.routes[key]
+            offset = route.label_offset
+            route.label_offset = old_offset
+            if offset != old_offset:
+                self.controller.update_label(key, offset=offset)
+                self.on_edit()
         elif kind == "move-annotation":
             _, annotation_id, _start, old_points = gesture
             annotation = next(item for item in self.controller.document.annotations
@@ -1271,14 +1645,14 @@ class RiserTab(ctk.CTkFrame):
             annotation.points = old_points
             if new_points != old_points:
                 self.controller.update_annotation(annotation_id, points=new_points)
-                self._changed()
+                self.on_edit()
         elif kind == "resize":
             _, element_id, _start, old_w, old_h = gesture
             element = self.controller.document.elements[element_id]
             new_w, new_h = element.width, element.height
             element.width, element.height = old_w, old_h
             if self.controller.resize_element(element_id, new_w, new_h):
-                self._changed()
+                self.on_edit()
         elif kind == "route":
             _, route_id, index, old_points = gesture
             route = self.controller.document.routes[route_id]
@@ -1296,18 +1670,18 @@ class RiserTab(ctk.CTkFrame):
                         if index == 0 and is_output:
                             if ref != edge.source:
                                 self.controller.reconnect(route_id, source=ref)
-                                self._changed()
+                                self.on_edit()
                         elif index == len(old_points) - 1 and not is_output:
                             if ref == edge.target:
                                 self.redraw()
                                 return
                             self.controller.reconnect(route_id, target=ref)
-                            self._changed()
+                            self.on_edit()
                     except TopologyError as exc:
                         messagebox.showwarning("Connection not allowed", str(exc))
             else:
                 if self.controller.move_route_point(route_id, index, point):
-                    self._changed()
+                    self.on_edit()
         self._preview_item = None
         self.redraw()
 
@@ -1341,6 +1715,7 @@ class RiserTab(ctk.CTkFrame):
         except TopologyError as exc:
             messagebox.showwarning("Connection not allowed", str(exc))
 
+    @live_edit_only
     def _on_double_click(self, event):
         if self.tool == "Polyline" and self._gesture and self._gesture[0] == "polyline":
             self._finish_polyline()
@@ -1349,7 +1724,7 @@ class RiserTab(ctk.CTkFrame):
         if not picked:
             return
         kind, ref = picked
-        if kind == "route":
+        if kind in {"route", "label"}:
             edge = next((edge for edge in self.design.connections if edge.id == ref), None)
             if edge:
                 text = simpledialog.askstring("Cable label", "Custom label (blank = automatic):",
@@ -1366,6 +1741,44 @@ class RiserTab(ctk.CTkFrame):
                 if text is not None:
                     self.controller.update_annotation(ref, text=text)
                     self._changed()
+        elif kind == "element":
+            element = self.controller.document.elements.get(ref)
+            if element and element.kind == "location":
+                self.rename_location(ref)
+            elif element and element.kind == 'device':
+                self.selected = ('element', ref)
+                self.edit_device()
+
+    @live_edit_only
+    def rename_location(self, element_id):
+        self.cancel(redraw=False)
+        self.controller.sync_external()
+        frame = self.controller.document.elements.get(element_id)
+        if frame is None:
+            return
+        value = simpledialog.askstring(
+            "Rename location globally", "New equipment location:", initialvalue=frame.ref,
+            parent=self.winfo_toplevel())
+        if value is None:
+            return
+        try:
+            updates, merging = plan_location_rename(
+                self.design, self.controller.document, element_id, value)
+            if not updates:
+                return
+            message = (f'Rename to “{value.strip()}” for {len(updates)} equipment items?\n\n'
+                       + ', '.join(updates) + '\n\n'
+                       'This updates the shared project and future exports. '
+                       'Zone descriptions and electrical connections stay unchanged. '
+                       'You can Undo this change.')
+            if merging:
+                message += '\n\nThis location already exists. Its location groups will be combined; equipment will not move.'
+            if messagebox.askyesno("Rename location globally?", message,
+                                   parent=self.winfo_toplevel()):
+                self.controller.rename_location(element_id, value, allow_merge=merging)
+                self._changed()
+        except ValueError as exc:
+            messagebox.showwarning("Location not changed", str(exc), parent=self.winfo_toplevel())
 
     def _on_pointer_motion(self, event):
         if self._gesture and self._gesture[0] == "polyline":
@@ -1431,17 +1844,43 @@ class RiserTab(ctk.CTkFrame):
         self.on_edit()
         self.redraw()
 
+    @live_edit_only
     def undo(self):
+        self.cancel(redraw=False)
         if self.controller.undo():
+            self._sync_title_fields()
             self._changed()
+        else:
+            self.redraw()
 
+    @live_edit_only
     def redo(self):
+        self.cancel(redraw=False)
         if self.controller.redo():
+            self._sync_title_fields()
             self._changed()
+        else:
+            self.redraw()
+
+    def _sync_title_fields(self):
+        for name, variable in self._title_vars.items():
+            value = getattr(self.controller.document.title_block, name)
+            variable.set(" | ".join(value) if name == "revisions" else value)
 
     def cancel(self, redraw=True):
+        if self._layout_preview is not None:
+            self._layout_preview = None
+            self._preview_bar.grid_remove()
+            for entry in self._title_entries.values():
+                entry.configure(state='normal')
+        self._cancel_drag_frame()
+        self._restore_move_preview()
         if self._gesture:
-            if self._gesture[0] == "route":
+            if self._gesture[0] == 'move-label':
+                _, key, _start, offset = self._gesture
+                if key in self.controller.document.routes:
+                    self.controller.document.routes[key].label_offset = offset
+            elif self._gesture[0] == "route":
                 _, route_id, _index, old_points = self._gesture
                 route = self.controller.document.routes.get(route_id)
                 if route:
@@ -1470,32 +1909,82 @@ class RiserTab(ctk.CTkFrame):
         if redraw:
             self.redraw()
 
+    @live_edit_only
+    def add_device(self):
+        self.cancel(redraw=False)
+        if self.on_add_hardware:
+            self.on_add_hardware()
+
+    @live_edit_only
+    def edit_device(self):
+        self.cancel(redraw=False)
+        if self.selected and self.selected[0] == 'element':
+            element = self.controller.document.elements.get(self.selected[1])
+            if element and element.kind == 'device' and self.on_edit_hardware:
+                self.on_edit_hardware(element.ref)
+
+    @live_edit_only
     def delete_selected(self):
+        self.cancel(redraw=False)
+        self._reconcile_selection()
         if not self.selected:
+            messagebox.showinfo("Nothing selected", "Select a device, cable, callout, or markup object.",
+                                parent=self.winfo_toplevel())
             return
         kind, ref = self.selected
         if kind == "annotation":
             self.controller.delete_annotation(ref)
+        elif kind == "label":
+            self.controller.update_label(ref, hidden=True)
         elif kind == "route" and messagebox.askyesno(
-                "Disconnect cable?", "Remove this electrical connection?"):
+                "Disconnect cable?", "Remove this electrical connection?",
+                parent=self.winfo_toplevel()):
             self.controller.disconnect(ref)
+        elif kind == "element":
+            element = self.controller.document.elements[ref]
+            if element.kind == "location":
+                messagebox.showinfo("Location module", "This box groups project hardware by location. "
+                    "Change device locations or remove hardware in SPLITTERS, KEYPADS, or POWER; "
+                    "the location box cannot be deleted independently.", parent=self.winfo_toplevel())
+            elif element.ref == "MSP":
+                messagebox.showinfo("Control panel required", "The MSP is the project's control panel "
+                                    "and cannot be deleted from the riser.", parent=self.winfo_toplevel())
+            elif self.on_remove_hardware:
+                self.on_remove_hardware(element.ref)
+            else:
+                messagebox.showinfo("Remove project hardware", "Remove this device in SPLITTERS, "
+                                    "KEYPADS, or POWER so zone and wiring changes are confirmed together.",
+                                    parent=self.winfo_toplevel())
+            return
         else:
             return
         self.selected = None
         self._changed()
 
+    @live_edit_only
     def duplicate_selected(self):
+        self.cancel(redraw=False)
+        self._reconcile_selection()
         if self.selected and self.selected[0] == "annotation":
             duplicate = self.controller.duplicate_annotation(self.selected[1])
             self.selected = ("annotation", duplicate.id)
             self._changed()
+        else:
+            messagebox.showinfo("Duplicate markup", "Select text or a markup shape to duplicate. "
+                                "Add hardware through SPLITTERS, KEYPADS, or POWER so capacity "
+                                "and wiring rules are checked.", parent=self.winfo_toplevel())
 
+    @live_edit_only
     def nudge(self, dx, dy):
+        self.cancel(redraw=False)
         if not self.selected:
             return
         kind, ref = self.selected
         if kind == "element":
             self.controller.move_element(ref, dx, dy)
+        elif kind == 'label':
+            offset = self.controller.document.routes[ref].label_offset
+            self.controller.update_label(ref, offset=(offset[0] + dx, offset[1] + dy))
         elif kind == "annotation":
             annotation = next(a for a in self.controller.document.annotations if a.id == ref)
             self.controller.update_annotation(
@@ -1505,14 +1994,32 @@ class RiserTab(ctk.CTkFrame):
         self._changed()
 
     def relayout(self):
-        if not messagebox.askyesno(
-                "Re-layout all?", "This discards manual device geometry and cable routes.\n\n"
-                "Markup and title-block data will be preserved."):
-            return
-        self.controller.relayout()
+        self.cancel(redraw=False)
+        self._layout_preview = self.controller.preview_layout()
         self.selected = None
+        self._preview_bar.grid()
+        for entry in self._title_entries.values():
+            entry.configure(state='disabled')
+        self.fit_to_view()
+
+    def apply_preview(self):
+        if self._layout_preview is None:
+            return
+        if not messagebox.askyesno('Apply layout?',
+                'Replace device positions and cable routes with this preview?\n\n'
+                'Manual geometry will be replaced. Title data and markup remain. You can Undo.',
+                parent=self.winfo_toplevel()):
+            return
+        try:
+            self.controller.apply_layout(self._layout_preview)
+        except ValueError as exc:
+            messagebox.showwarning('Preview out of date', str(exc), parent=self.winfo_toplevel())
+            self.cancel()
+            return
+        self.cancel(redraw=False)
         self._changed()
 
+    @live_edit_only
     def auto_layout(self):
         self.controller.auto_layout()
         self._changed()
@@ -1601,9 +2108,19 @@ class RiserTab(ctk.CTkFrame):
         self.redraw()
 
     def _toggle_layer(self, name):
+        if name == 'Locations':
+            if self._layout_preview is not None:
+                self.redraw()
+                return
+            self.controller._mutate(lambda: setattr(self.controller.document,
+                'show_location_frames',not self.controller.document.show_location_frames))
+            self.on_edit()
+            self.redraw()
+            return
         self.layer_visibility[name] = not self.layer_visibility[name]
         self.redraw()
 
+    @live_edit_only
     def _save_title(self, name, variable):
         value = variable.get()
         if name == "revisions":
@@ -1616,8 +2133,12 @@ class RiserTab(ctk.CTkFrame):
         for child in frame.winfo_children():
             child.destroy()
 
-    def _refresh_inspector(self):
+    def _refresh_selection_properties(self):
         self._clear_frame(self.properties)
+        if self._layout_preview is not None:
+            ctk.CTkLabel(self.properties, text='Preview only. Apply or cancel to resume editing.',
+                         wraplength=250, justify='left').grid(row=0, column=0, padx=10, pady=10)
+            return
         if not self.selected:
             ctk.CTkLabel(self.properties, text="Select a device, cable, or markup object.",
                          wraplength=250, justify="left", text_color=theme.TEXT_SECOND,
@@ -1625,17 +2146,105 @@ class RiserTab(ctk.CTkFrame):
                 row=0, column=0, sticky="w", padx=10, pady=10)
         else:
             kind, ref = self.selected
-            ctk.CTkLabel(self.properties, text=ref, anchor="w",
+            element = self.controller.document.elements.get(ref) if kind == "element" else None
+            label = element.ref if element and element.kind == "location" else ref
+            ctk.CTkLabel(self.properties, text=label, anchor="w", wraplength=260, justify="left",
                          text_color=theme.TEXT,
                          font=theme.mono_font(theme.SIZE["meta"], "bold")).grid(
                 row=0, column=0, sticky="ew", padx=10, pady=(9, 3))
-            if kind == "route":
+            if kind in {"route", "label"}:
                 self._build_cable_properties(ref)
             elif kind == "annotation":
                 self._build_markup_properties(ref)
+            elif element and element.kind == "location":
+                ctk.CTkButton(
+                    self.properties, text="Rename location globally…", height=28,
+                    command=lambda: self.rename_location(ref)).grid(
+                        row=1, column=0, sticky="ew", padx=10, pady=(6, 10))
+                identities = {self.design.device_location_ids.get(e.ref)
+                              for e in self.controller.document.elements.values()
+                              if e.kind == 'device' and e.location_id == element.id and not e.stale}
+                identities.discard(None)
+                identity = element.physical_location_id or (next(iter(identities)) if len(identities) == 1 else None)
+                if identity in self.design.equipment_locations:
+                    self._build_location_fields(identity)
+                else:
+                    ctk.CTkLabel(self.properties,
+                        text='This legacy box includes different location records. Preview layout to review them separately.',
+                        wraplength=250, justify='left').grid(row=2, column=0, padx=10, pady=6)
+            elif element and element.kind == 'device':
+                self._build_location_assignment(element.ref)
+                ctk.CTkButton(self.properties, text='Edit Device',
+                             command=self.edit_device).grid(
+                    row=4, column=0, sticky='ew', padx=10, pady=6)
+                if element.ref != 'MSP':
+                    ctk.CTkButton(self.properties, text='Remove from Project',
+                                 command=self.delete_selected).grid(
+                        row=5, column=0, sticky='ew', padx=10, pady=6)
 
+    def _build_location_fields(self, identity):
+        record = self.design.equipment_locations[identity]
+        variables = {}
+        for row, name in enumerate(('building', 'floor', 'room')):
+            ctk.CTkLabel(self.properties, text=name.title(), anchor='w').grid(
+                row=2 + row * 2, column=0, sticky='w', padx=10)
+            variables[name] = tk.StringVar(value=getattr(record, name))
+            ctk.CTkEntry(self.properties, textvariable=variables[name]).grid(
+                row=3 + row * 2, column=0, sticky='ew', padx=10, pady=(0, 6))
+        self._structured_location_vars = variables
+        ctk.CTkButton(self.properties, text='Apply location fields',
+                     command=lambda: self._apply_location_fields(identity, variables)).grid(
+                         row=8, column=0, sticky='ew', padx=10, pady=(6, 10))
+
+    @live_edit_only
+    def _apply_location_fields(self, identity, variables):
+        values = {name: variable.get() for name, variable in variables.items()}
+        members = [ref for ref, key in self.design.device_location_ids.items() if key == identity]
+        from location_model import location_key
+        label = ' '.join(value.strip() for value in values.values() if value.strip())
+        merging = any(key != identity and location_key(record.full_label) == location_key(label)
+                      for key, record in self.design.equipment_locations.items())
+        message = ('Update the shared location for:\n\n' + ', '.join(members)
+                   + '\n\nThis changes future exports, not wiring or device positions.')
+        if merging:
+            message += '\n\nThis location exists; combine these location groups?'
+        if not messagebox.askyesno('Apply location fields?', message, parent=self.winfo_toplevel()):
+            return
+        try:
+            self.controller.edit_location(identity, **values, allow_merge=merging)
+            self._changed()
+        except ValueError as exc:
+            messagebox.showwarning('Location not changed', str(exc), parent=self.winfo_toplevel())
+
+    def _build_location_assignment(self, device_id):
+        choices = {f'{record.full_label or "LOCATION UNCONFIRMED"} [{identity[:8]}]': identity
+                   for identity, record in sorted(self.design.equipment_locations.items(),
+                                                 key=lambda item: (item[1].full_label, item[0]))}
+        current = self.design.device_location_ids.get(device_id)
+        ctk.CTkLabel(self.properties, text='Assign equipment location', anchor='w').grid(
+            row=1, column=0, sticky='w', padx=10)
+        variable = tk.StringVar(value=next((label for label, identity in choices.items() if identity == current), ''))
+        ctk.CTkOptionMenu(self.properties, values=list(choices), variable=variable).grid(
+            row=2, column=0, sticky='ew', padx=10, pady=4)
+        ctk.CTkButton(self.properties, text='Assign location',
+                     command=lambda: self._assign_equipment_location(device_id, choices.get(variable.get()))).grid(
+                         row=3, column=0, sticky='ew', padx=10, pady=6)
+
+    @live_edit_only
+    def _assign_equipment_location(self, device_id, identity):
+        if identity is None or self.design.device_location_ids.get(device_id) == identity:
+            return
+        if messagebox.askyesno('Assign location?',
+                f'Change the assigned room for {device_id}? Paired RSP power supplies follow. '
+                'Other occupants of its previous room stay there; drawing geometry does not move.',
+                parent=self.winfo_toplevel()):
+            self.controller.assign_location(device_id, identity)
+            self._changed()
+
+    def _refresh_inspector(self):
+        self._refresh_selection_properties()
         self._clear_frame(self.validation_frame)
-        issues = validate_riser(self.design, self.controller.document)
+        issues = validate_riser(self.design, self._layout_preview or self.controller.document)
         if not issues:
             ctk.CTkLabel(self.validation_frame, text="✓ No riser warnings",
                          anchor="w", text_color=theme.SUCCESS).grid(
@@ -1688,6 +2297,27 @@ class RiserTab(ctk.CTkFrame):
             command=lambda value: self._set_edge(edge_id, status=value)).grid(
                 row=row, column=0, sticky="ew", padx=10, pady=(4, 10))
 
+        route = self.controller.document.routes.get(edge_id)
+        if route:
+            ctk.CTkButton(self.properties,
+                text='Restore Label' if route.label_hidden else 'Hide Label',
+                command=lambda: self._set_label(edge_id, hidden=not route.label_hidden)).grid(
+                    row=row+1, column=0, sticky='ew', padx=10, pady=4)
+            ctk.CTkButton(self.properties, text='Reset Label Position',
+                command=lambda: self._set_label(edge_id, reset=True)).grid(
+                    row=row+2, column=0, sticky='ew', padx=10, pady=4)
+            ctk.CTkLabel(self.properties,
+                text='Drag the callout to move it. Hiding a label keeps the wire and its metadata.',
+                wraplength=250, justify='left').grid(row=row+3, column=0, padx=10, pady=6)
+
+    @live_edit_only
+    def _set_label(self, edge_id, **changes):
+        self.cancel(redraw=False)
+        self.controller.update_label(edge_id, **changes)
+        self._reconcile_selection()
+        self._changed()
+
+    @live_edit_only
     def _set_edge(self, edge_id, **changes):
         try:
             self.controller.update_connection(edge_id, **changes)
@@ -1741,6 +2371,7 @@ class RiserTab(ctk.CTkFrame):
                 text_color=theme.TEXT, command=lambda w=where: self._arrange(annotation_id, w)
             ).pack(side="left", padx=1)
 
+    @live_edit_only
     def _set_annotation(self, annotation_id, **changes):
         try:
             self.controller.update_annotation(annotation_id, **changes)
@@ -1755,10 +2386,12 @@ class RiserTab(ctk.CTkFrame):
             messagebox.showwarning("Invalid markup", f"{name.replace('_', ' ').title()} must be a number")
             self.redraw()
 
+    @live_edit_only
     def _arrange(self, annotation_id, where):
         self.controller.arrange_annotation(annotation_id, where)
         self._changed()
 
+    @live_edit_only
     def _place_unplaced(self, device_id):
         x = self.controller.document.page_width / 2
         y = self.controller.document.page_height / 2
@@ -1793,14 +2426,15 @@ class RiserTab(ctk.CTkFrame):
 
     def _center_ref_in_view(self, ref):
         points = []
-        element = self.controller.document.elements.get(ref)
+        doc = self._layout_preview or self.controller.document
+        element = doc.elements.get(ref)
         if element:
             points = [(element.x, element.y),
                       (element.x + element.width, element.y + element.height)]
-        route = self.controller.document.routes.get(ref)
+        route = doc.routes.get(ref)
         if route:
             points = route.points
-        annotation = next((item for item in self.controller.document.annotations
+        annotation = next((item for item in doc.annotations
                            if item.id == ref), None)
         if annotation:
             points = annotation.points
@@ -1821,8 +2455,7 @@ class RiserTab(ctk.CTkFrame):
 
     def refresh(self):
         self.cancel(redraw=False)
-        sync_riser_document(self.design, self.controller.document)
-        self.controller.clear_history()
+        self.controller.sync_external()
         self._reconcile_selection()
         for name, variable in self._title_vars.items():
             value = getattr(self.controller.document.title_block, name)

@@ -53,9 +53,9 @@ from riser_model import (
 )
 from topology_service import ensure_explicit_topology, project_legacy_topology
 
-# RemoteLink-only and riser-only builds both used schema 2. Schema 3 prevents
-# either older reader from accepting a combined project and discarding fields.
-SCHEMA_VERSION = 3
+# Schema 7 persists detailed symbol style, input side, panel port positions and
+# printed location-frame visibility. Older readers must not discard that state.
+SCHEMA_VERSION = 7
 SESSION_EXT = ".dmps"
 RECOVERY_SUFFIX = ".recovery"
 
@@ -131,6 +131,8 @@ def recovery_path(session_path: Path) -> Path:
 # -------- DMPDesign <-> dict --------
 
 def design_to_dict(design: DMPDesign) -> dict:
+    from project_locations import sync_project_locations
+    sync_project_locations(design)
     # asdict handles every nested dataclass. LocationConflict objects in
     # design.conflicts are also dataclasses; their (value, source) option
     # tuples become JSON lists and are re-tupled on load.
@@ -245,6 +247,8 @@ def _riser_document_from_dict(d: dict | None) -> RiserDocument | None:
             points=[tuple(p) for p in value.get("points", [])],
             label_offset=tuple(value.get("label_offset", (0.0, 0.0))),
             manual=bool(value.get("manual", False)),
+            label_hidden=bool(value.get("label_hidden", False)),
+            label_manual=bool(value.get("label_manual", False)),
         )
         for key, value in (d.get("routes") or {}).items()
     }
@@ -261,11 +265,15 @@ def _riser_document_from_dict(d: dict | None) -> RiserDocument | None:
         unplaced=list(d.get("unplaced") or []),
         page_width=float(d.get("page_width", 36 * 72)),
         page_height=float(d.get("page_height", 24 * 72)),
+        layout_version=int(d.get('layout_version', 1)),
+        show_location_frames=bool(d.get('show_location_frames', True)),
     )
 
 
 def design_from_dict(d: dict) -> DMPDesign:
-    return DMPDesign(
+    from location_model import EquipmentLocation
+    from project_locations import sync_project_locations
+    design = DMPDesign(
         site_info=_site_info_from_dict(d.get("site_info") or {}),
         splitters=[_splitter_from_dict(x) for x in d.get("splitters") or []],
         rsps=[_rsp_from_dict(x) for x in d.get("rsps") or []],
@@ -279,7 +287,13 @@ def design_from_dict(d: dict) -> DMPDesign:
         dmp_status=d.get("dmp_status", ""),
         connections=[_connection_from_dict(x) for x in d.get("connections") or []],
         riser_document=_riser_document_from_dict(d.get("riser_document")),
+        equipment_locations={key: EquipmentLocation(**value)
+                             for key, value in (d.get('equipment_locations') or {}).items()},
+        device_location_ids=dict(d.get('device_location_ids') or {}),
+        location_sync_values=dict(d.get('location_sync_values') or {}),
     )
+    sync_project_locations(design)
+    return design
 
 
 # -------- zone sync (the dual-representation contract) --------

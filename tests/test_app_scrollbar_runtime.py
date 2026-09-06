@@ -68,3 +68,17 @@ def test_deferred_scrollbar_still_tracks_the_scrolled_canvas(application):
     canvas.yview_moveto(0)
     application.root.update_idletasks()
     assert bar.get()[0] == 0
+
+
+def test_option_menu_redraw_does_not_reenter_layout_callbacks(application):
+    menu = ctk.CTkOptionMenu(application.root, values=['ALL', 'LX', 'KP'])
+    callbacks = []
+    application.root.after_idle(lambda: callbacks.append('idle'))
+    menu.configure(fg_color='#abcdef')
+    assert callbacks == [], 'dropdown repaint recursively drained layout callbacks'
+    application.root.update_idletasks()
+    assert callbacks == ['idle']
+    menu.set('LX')
+    assert menu.get() == 'LX'
+    assert menu._text_label.cget('text') == 'LX'
+    assert menu._canvas.find_withtag('dropdown_arrow')

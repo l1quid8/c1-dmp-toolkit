@@ -27,6 +27,7 @@ from validation import validate_design, badge_counts, badge_counts_by_severity
 from editor_zones import ZonesTab
 from editor_remotelink import RemoteLinkTab
 from riser_editor import RiserTab
+from project_locations import location_values, sync_project_locations
 from editor_tabs import (
     KeypadsTab,
     PowerTab,
@@ -34,6 +35,8 @@ from editor_tabs import (
     _graph_signature,
     auto_hide_scrollbar,
     prompt_add_expander,
+    _dialog_shell,
+    _dialog_title,
 )
 from rl_injector.rl_config import CONNECT_TYPES
 from ui_widgets import (
@@ -140,6 +143,7 @@ class TabBar(ctk.CTkFrame):
     def add(self, title: str) -> ctk.CTkFrame:
         page = ctk.CTkFrame(self._body, fg_color="transparent")
         page.grid(row=0, column=0, sticky="nsew")
+        page.grid_remove()
         self._pages[title] = page
 
         col = len(self._order)
@@ -184,6 +188,15 @@ class TabBar(ctk.CTkFrame):
         if title not in self._pages:
             return
         self._current = title
+        # tkraise() alone leaves every tab's native widgets mapped. On Tk 9,
+        # exposing a full project then churns through the hidden grids before
+        # returning to input/timer events. Keep the widgets and their state,
+        # but only map the page the user is actually viewing.
+        for name, page in self._pages.items():
+            if name == title:
+                page.grid()
+            else:
+                page.grid_remove()
         self._pages[title].tkraise()
         for name, item in self._items.items():
             active = name == title
@@ -301,15 +314,17 @@ class EditorFrame(ctk.CTkFrame):
         self.root = root
         self.session = session
         self._topology_signature = _graph_signature(session.design)
+        self._location_signature = location_values(session.design)
         self.dirty = False
         # Bumped on every edit; the app snapshots it after a worksheet generate
         # to warn when a door chart would be built from a stale worksheet.
         self.edit_epoch = 0
         self._recovery_job: str | None = None
-        self._on_generate_worksheet = on_generate_worksheet or (lambda: None)
-        self._on_generate_chart = on_generate_chart or (lambda: None)
-        self._on_generate_remotelink = on_generate_remotelink or (lambda: None)
-        self._on_generate_riser = on_generate_riser or (lambda: None)
+        self._design_refresh_job: str | None = None
+        self._on_generate_worksheet = self._guard_generation(on_generate_worksheet)
+        self._on_generate_chart = self._guard_generation(on_generate_chart)
+        self._on_generate_remotelink = self._guard_generation(on_generate_remotelink)
+        self._on_generate_riser = self._guard_generation(on_generate_riser)
         self.on_status_change = on_status_change or (lambda text, dirty: None)
         self.on_validation_change = on_validation_change or (lambda text, ok: None)
         self._site_vars: dict[str, ctk.StringVar] = {}
@@ -324,6 +339,7 @@ class EditorFrame(ctk.CTkFrame):
         # Closing the project with the sheet open would strand its Escape
         # binding on the root window.
         self.bind("<Destroy>", lambda _e: self._close_sheet(), add="+")
+        self.bind("<Destroy>", self._cancel_design_refresh, add="+")
         self._build_tabs()
         self.refresh_validation()
 
@@ -357,6 +373,7 @@ class EditorFrame(ctk.CTkFrame):
             write_recovery(self.session)
 
     def save(self) -> bool:
+        self.flush_design_refresh()
         if hasattr(self, "riser_tab"):
             self.riser_tab.cancel(redraw=False)
         try:
@@ -458,10 +475,107 @@ class EditorFrame(ctk.CTkFrame):
 
         self.riser_tab = RiserTab(
             self.tabs.tab("RISER"), self.session, self._on_riser_edit,
-            on_generate=self._on_generate_riser)
+            on_generate=self._on_generate_riser,
+            on_remove_hardware=self._remove_riser_hardware,
+            on_add_hardware=self._add_riser_hardware,
+            on_edit_hardware=self._edit_riser_hardware)
         self.riser_tab.grid(row=0, column=0, sticky="nsew")
 
         self._build_footer()
+
+    def _close_hardware_dialog(self):
+        win = getattr(self, '_hardware_dialog', None)
+        self._hardware_dialog = None
+        if win is not None and win.winfo_exists():
+            win.grab_release()
+            win.destroy()
+
+    def destroy(self):
+        # CTkFrame.bind targets its internal canvas, not the frame itself.
+        # Own the modal lifetime explicitly before callbacks/widgets disappear.
+        self._close_hardware_dialog()
+        super().destroy()
+
+    def _add_riser_hardware(self):
+        """Launch the same capacity-checked creation dialogs from the canvas."""
+        self._close_hardware_dialog()
+        win = self._hardware_dialog = _dialog_shell(self.root, 'Add Device')
+        _dialog_title(win, 'Add hardware to the shared project')
+        ctk.CTkLabel(win, text='New devices appear in the RISER Unplaced tray.',
+                     wraplength=330).pack(padx=20, pady=6)
+
+        def choose(callback):
+            self._close_hardware_dialog()
+            self._hardware_dialog = callback()
+
+        for title, callback in [('710 Splitter', self.splitters_tab._add_clicked),
+                                ('Keypad', self.keypads_tab._add_clicked),
+                                ('RSP + Power Supply', self.power_tab._add_clicked)]:
+            ctk.CTkButton(win, text=title, command=lambda cb=callback: choose(cb)).pack(
+                fill='x', padx=20, pady=5)
+        ctk.CTkButton(win, text='Cancel', command=self._close_hardware_dialog).pack(
+            fill='x', padx=20, pady=(10, 16))
+        win.protocol('WM_DELETE_WINDOW', self._close_hardware_dialog)
+
+    def _edit_riser_hardware(self, device_id):
+        """Reuse domain cards inside a modal; editing remains on the RISER tab."""
+        design = self.session.design
+        splitter = next((s for s in design.splitters if s.id == device_id), None)
+        keypad = next((k for k in design.keypads if f'KEYPAD-{k.number}' == device_id), None)
+        rsp = next((r for r in design.rsps if device_id in
+                    {f'RSP-{r.number}', f'PS-{r.number}'}), None)
+        if device_id != 'MSP' and not any((splitter, keypad, rsp)):
+            messagebox.showinfo('Device unavailable', 'This device is no longer in the project.')
+            return
+        self._close_hardware_dialog()
+        win = self._hardware_dialog = _dialog_shell(self.root, f'Edit {device_id}')
+        win.resizable(True, True)
+        win.geometry('780x460' if keypad else '700x390')
+        _dialog_title(win, f'Edit {device_id} — shared project hardware')
+        ctk.CTkLabel(win,
+            text='Edits apply immediately to the project and future exports. '
+                 'Hardware changes use the same rules as the other tabs.',
+            wraplength=640, justify='left').pack(fill='x', padx=20, pady=(0, 10))
+        body = ctk.CTkScrollableFrame(win)
+        body.pack(fill='both', expand=True, padx=12)
+        if splitter:
+            card = self.splitters_tab._build_splitter_card(splitter, parent=body)
+            card.pack(fill='x')
+        elif keypad:
+            self.keypads_tab._build_keypad_card(keypad, parent=body).pack(fill='x')
+        elif rsp:
+            self.power_tab._build_rsp_card(rsp,
+                {ps.number: ps for ps in design.power_supplies}, parent=body).pack(fill='x')
+        else:
+            ctk.CTkLabel(body, text='XR550 / MSP location').pack(anchor='w', padx=10)
+            ctk.CTkEntry(body, textvariable=self._site_vars['xr550_location']).pack(
+                fill='x', padx=10, pady=10)
+            ctk.CTkLabel(body, text='The project requires one MSP; it cannot be removed.').pack(pady=10)
+
+        def done():
+            # FocusOut is asynchronous; explicitly commit before destroying widgets.
+            if splitter and card.winfo_exists():
+                card.commit_pending()
+            self._close_hardware_dialog()
+            self.refresh_all_tabs()
+
+        ctk.CTkButton(win, text='Done', command=done).pack(padx=20, pady=12)
+        win.protocol('WM_DELETE_WINDOW', done)
+
+    def _remove_riser_hardware(self, device_id):
+        """Reuse the existing domain confirmation and cascade-removal workflow."""
+        for splitter in self.session.design.splitters:
+            if splitter.id == device_id:
+                self.splitters_tab._remove_clicked(splitter)
+                return
+        for keypad in self.session.design.keypads:
+            if f"KEYPAD-{keypad.number}" == device_id:
+                self.keypads_tab._remove_clicked(keypad)
+                return
+        for rsp in self.session.design.rsps:
+            if device_id in {f"RSP-{rsp.number}", f"PS-{rsp.number}"}:
+                self.power_tab._remove_clicked(rsp)
+                return
 
     def _build_footer(self):
         """Footer bar: save state and open-issue chips left, generation actions
@@ -576,13 +690,37 @@ class EditorFrame(ctk.CTkFrame):
 
     def _on_design_edit(self):
         """Splitter/keypad/power edits: RSP locations feed master rows too."""
-        self._sync_topology_review()
+        sync_project_locations(self.session.design)
+        topology_changed = self._sync_topology_review()
+        self._location_signature = location_values(self.session.design)
         sync_master_zones(self.session.design)
         self.mark_dirty()
-        self.refresh_validation()
-        self._refresh_remotelink_receipt()
         if hasattr(self, "power_tab"):
             self.power_tab.sync_locations()
+        self._cancel_design_refresh()
+        if topology_changed:
+            self._refresh_design_views()
+        else:
+            # Location entries notify on every keystroke. Keep the model live,
+            # but coalesce expensive redraws until the typing burst settles.
+            self._design_refresh_job = self.after(150, self._refresh_design_views)
+
+    def _cancel_design_refresh(self, event=None):
+        if event is not None and event.widget is not self:
+            return
+        if self._design_refresh_job is not None:
+            self.after_cancel(self._design_refresh_job)
+            self._design_refresh_job = None
+
+    def flush_design_refresh(self):
+        if self._design_refresh_job is not None:
+            self._cancel_design_refresh()
+            self._refresh_design_views()
+
+    def _refresh_design_views(self):
+        self._design_refresh_job = None
+        self.refresh_validation()
+        self._refresh_remotelink_receipt()
         if hasattr(self, "riser_tab"):
             self.riser_tab.refresh()
 
@@ -602,22 +740,41 @@ class EditorFrame(ctk.CTkFrame):
 
     def _on_riser_edit(self):
         """Canvas topology edits must be visible in the legacy cards at once."""
-        self._sync_topology_review()
-        sync_master_zones(self.session.design)
+        topology_changed = self._sync_topology_review()
+        locations = location_values(self.session.design)
+        locations_changed = locations != self._location_signature
+        self._location_signature = locations
         self.mark_dirty()
-        self.refresh_validation()
-        self.splitters_tab.refresh()
-        self.keypads_tab.refresh()
+        if topology_changed or locations_changed:
+            sync_master_zones(self.session.design)
+            self.refresh_validation()
+            self.splitters_tab.refresh()
+            self.keypads_tab.refresh()
+        if locations_changed:
+            self.power_tab.sync_locations()
+            suspended = self._suspend_traces
+            self._suspend_traces = True
+            try:
+                self._site_vars['xr550_location'].set(
+                    self.session.design.site_info.xr550_location or '')
+            finally:
+                self._suspend_traces = suspended
+            self.zones.refresh()
+            self._refresh_remotelink_receipt()
 
     def _sync_topology_review(self):
         """Wiring changes (including undo) invalidate review; markup does not."""
         signature = _graph_signature(self.session.design)
-        if signature != self._topology_signature:
+        changed = signature != self._topology_signature
+        if changed:
             self.session.topology_confirmed = False
         self._topology_signature = signature
+        return changed
 
     def _on_structure_change(self):
         """Hardware was added or removed: every tab's choices and rows shift."""
+        self._close_hardware_dialog()
+        sync_project_locations(self.session.design)
         prune_unknown_connections(self.session.design)
         project_legacy_topology(self.session.design)
         self.session.topology_confirmed = False
@@ -637,6 +794,7 @@ class EditorFrame(ctk.CTkFrame):
         """
         before = snapshot_refs(self.session.design)
         mutate()
+        self._close_hardware_dialog()
         prune_unknown_connections(self.session.design)
         project_legacy_topology(self.session.design)
         changes = diff_refs(before, snapshot_refs(self.session.design))
@@ -708,6 +866,7 @@ class EditorFrame(ctk.CTkFrame):
 
     def refresh_all_tabs(self):
         """Rebuild every tab from the (mutated) design lists."""
+        self._cancel_design_refresh()
         self.zones.refresh()
         self.splitters_tab.refresh()
         self.keypads_tab.refresh()
@@ -715,10 +874,23 @@ class EditorFrame(ctk.CTkFrame):
         self.remotelink_tab.refresh()
         self.riser_tab.refresh()
         self._topology_signature = _graph_signature(self.session.design)
+        self._location_signature = location_values(self.session.design)
 
     # ------------------------------------------------------------------ #
     # Pre-generate issue summary (warn, never block)                        #
     # ------------------------------------------------------------------ #
+
+    def generation_allowed(self):
+        if getattr(getattr(self, 'riser_tab', None), '_layout_preview', None) is not None:
+            messagebox.showinfo('Layout preview', 'Apply or cancel the layout preview before generating.')
+            return False
+        return True
+
+    def _guard_generation(self, callback):
+        def guarded():
+            if self.generation_allowed() and callback:
+                return callback()
+        return guarded
 
     def goto_issue(self, issue):
         """Jump to the tab (and zone row) an Issue points at."""
@@ -1080,6 +1252,9 @@ class EditorFrame(ctk.CTkFrame):
         if self._suspend_traces:
             return
         setattr(self.session.design.site_info, attr, var.get().strip() or None)
+        if attr == 'xr550_location':
+            self._on_design_edit()
+            return
         self.mark_dirty()
         self.refresh_validation()
         self._refresh_remotelink_receipt()

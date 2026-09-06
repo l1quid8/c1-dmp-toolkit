@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import heapq
 import re
-from dataclasses import dataclass
+import fitz
+from dataclasses import dataclass, fields
 
 from riser_model import (
     RiserDocument,
@@ -13,9 +14,10 @@ from riser_model import (
     default_riser_document,
 )
 from topology_service import TopologyError, validate_connection_endpoints
+from riser_drawing import TITLE_BLOCK_WIDTH, location_text_runs, title_bounds, device_text, title_text
+from location_model import legacy_normal_location
 
 
-TITLE_BLOCK_WIDTH = 270.0
 PAGE_MARGIN = 54.0
 GRID = 18.0
 BRIDGE_HALF_WIDTH = 9.0
@@ -65,7 +67,10 @@ def _location(design, device_id: str) -> str:
     if device_id.startswith("RSP-"):
         number = int(device_id.split("-", 1)[1])
         rsp = next((r for r in design.rsps if r.number == number), None)
-        return (rsp.location if rsp else None) or "UNSPECIFIED"
+        location = (rsp.location if rsp else None) or "UNSPECIFIED"
+        if _normal_location(location) in {"MSP", "AT MSP", "SAME AS MSP"}:
+            return design.site_info.xr550_location or "MSP"
+        return location
     if device_id.startswith("KEYPAD-"):
         number = int(device_id.split("-", 1)[1])
         keypad = next((k for k in design.keypads if k.number == number), None)
@@ -74,12 +79,7 @@ def _location(design, device_id: str) -> str:
 
 
 def _normal_location(value: str) -> str:
-    text = (value or "UNSPECIFIED").upper()
-    text = re.sub(r"\(\s*SERVICE\s+KEYPAD\s*\)", "", text)
-    text = re.sub(r"\bBLDG\b", "BUILDING", text)
-    text = re.sub(r"\bFLR\b", "FLOOR", text)
-    text = re.sub(r"[()_,./-]+", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+    return legacy_normal_location(value)
 
 
 def _kind(design, device_id: str) -> str:
@@ -143,9 +143,19 @@ def _snap(value: float) -> float:
     return round(value / GRID) * GRID
 
 
-def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserDocument:
+def layout_clusters(design, *, title_source=None):
+    from riser_cluster_layout import layout_clusters as build
+    return build(design, title_source=title_source)
+
+
+def layout_riser(design, *, title_source: RiserDocument | None = None,
+                 _cluster_records=None, _cluster_bindings=None,
+                 _cluster_spacing=(72.0, 90.0)) -> RiserDocument:
     """Create a deterministic location-first 24x36 electrical scene."""
     document = default_riser_document(design)
+    clustered = _cluster_records is not None
+    document.layout_version = 2 if clustered else 1
+    from riser_cluster_layout import natural_key, cluster_heading
     source_z_order: list[str] = []
     if title_source is not None:
         document.title_block = title_source.title_block
@@ -172,18 +182,21 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
 
     locations = {device_id: physical_location(key)
                  for device_id, key in raw_locations.items()}
+    if clustered:
+        locations = {device_id: _cluster_bindings[device_id] for device_id in device_ids}
     location_devices: dict[str, list[str]] = {}
     for device_id in device_ids:
         location_devices.setdefault(locations[device_id], []).append(device_id)
 
-    H_GAP = 36.0
+    H_GAP = 54.0
     # Three independent splitter outputs need distinct orthogonal lanes
     # between vertically stacked devices. A 36-point gap left only four
     # points after symbol clearances and forced cables through the next 710.
-    V_GAP = 54.0
+    V_GAP = _cluster_spacing[0] if clustered else 72.0
     FRAME_X = 24.0
     FRAME_TOP = 50.0
     FRAME_BOTTOM = 18.0
+    heading_data = {}
 
     def module_geometry(location: str, members: list[str]):
         rows: dict[int, list[str]] = {}
@@ -193,7 +206,8 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
         maximum_inner_width = drawing_width - FRAME_X * 2
         for level in sorted(rows):
             ordered = sorted(rows[level], key=lambda item: (
-                {"kp": 0, "root": 1, "lx": 2}.get(branch[item], 1), item))
+                {"kp": 0, "root": 1, "lx": 2}.get(branch[item], 1),
+                natural_key(item) if clustered else item))
             current: list[str] = []
             current_width = 0.0
             for item in ordered:
@@ -214,9 +228,18 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
         label_width = min(drawing_width, len(location) * 9.5 + FRAME_X * 2)
         width = max(max(row_widths, default=220.0) + FRAME_X * 2,
                     label_width)
-        height = FRAME_TOP + sum(row_heights) + V_GAP * max(0, len(ordered_rows) - 1) + FRAME_BOTTOM
+        frame_top = FRAME_TOP
+        if clustered:
+            width = max(max(row_widths, default=220.0) + FRAME_X * 2, 360.0)
+            lines = cluster_heading(_cluster_records[location], members)
+            probe = RiserElement('measure', 'location', '', 0, 0, width, 0, heading_lines=lines)
+            runs = location_text_runs(probe, small=True)
+            heading_height = max((run.y + run.size * .3 for run in runs), default=30) + 12
+            frame_top = heading_height + 24
+            heading_data[location] = (lines, heading_height)
+        height = frame_top + sum(row_heights) + V_GAP * max(0, len(ordered_rows) - 1) + FRAME_BOTTOM
         local_positions = {}
-        y = FRAME_TOP
+        y = frame_top
         for row, row_width, row_height in zip(ordered_rows, row_widths, row_heights):
             x = (width - row_width) / 2
             for device_id in row:
@@ -246,9 +269,17 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
     remaining = {location for location in location_devices if location != root_location}
     adjacency: dict[str, set[str]] = {location: set() for location in remaining}
     indegree = {location: 0 for location in remaining}
+    incoming_order = {}
+    ranks = {location: 0 for location in remaining}
     for edge in design.connections:
         source_location = locations.get(edge.source.device_id)
         target_location = locations.get(edge.target.device_id)
+        key = _connection_sort_key(edge)
+        if clustered:
+            key = (natural_key(edge.source.device_id), key[1], edge.source.port_id,
+                   natural_key(edge.target.device_id), edge.target.port_id, edge.id)
+        if target_location != source_location:
+            incoming_order[target_location] = min(incoming_order.get(target_location, key), key)
         if (source_location == target_location or target_location not in remaining
                 or source_location == root_location or source_location not in remaining):
             continue
@@ -258,7 +289,7 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
 
     def location_sort_key(location: str):
         return (min(depth[item] for item in location_devices[location]),
-                lane(location), location)
+                lane(location), incoming_order.get(location, ()), location)
 
     ready = sorted((location for location in remaining if indegree[location] == 0),
                    key=location_sort_key)
@@ -267,29 +298,53 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
         location = ready.pop(0)
         ordered_locations.append(location)
         for target_location in sorted(adjacency[location], key=location_sort_key):
+            ranks[target_location] = max(ranks[target_location], ranks[location] + 1)
             indegree[target_location] -= 1
             if indegree[target_location] == 0:
                 ready.append(target_location)
                 ready.sort(key=location_sort_key)
     ordered_locations.extend(sorted(remaining - set(ordered_locations),
                                     key=location_sort_key))
+    if clustered:
+        ranks = {location: min(depth[item] for item in location_devices[location])
+                 for location in remaining}
+        ordered_locations = sorted(remaining, key=lambda loc: (
+            ranks[loc], lane(loc), incoming_order.get(loc, ()),
+            natural_key(_cluster_records[loc].full_label), loc))
 
-    MODULE_GAP = 36.0
-    ROW_GAP = 54.0
-    packed_rows: list[list[str]] = []
-    current_row: list[str] = []
-    current_width = 0.0
+    MODULE_GAP = 72.0
+    ROW_GAP = _cluster_spacing[1] if clustered else 90.0
+
+    def balanced_rows(items):
+        # Minimum row count, then minimum squared unused width. Unlike a
+        # greedy shelf, a nearly empty last row is balanced with its siblings.
+        best = [(0, 0.0, [])] + [None] * len(items)
+        for end in range(1, len(items) + 1):
+            width = 0.0
+            for start in range(end - 1, -1, -1):
+                width += modules[items[start]][0] + (MODULE_GAP if start < end - 1 else 0)
+                if width > drawing_width and start < end - 1:
+                    break
+                previous = best[start]
+                candidate = (previous[0] + 1, previous[1] + (drawing_width - width)**2,
+                             previous[2] + [items[start:end]])
+                if best[end] is None or candidate[:2] < best[end][:2]:
+                    best[end] = candidate
+        return best[-1][2]
+
+    # Reserve a separate tier for downstream modules whenever the sheet has
+    # room. Within a tier, KP/LX and source output order remain deterministic.
+    tiers = {}
     for location in ordered_locations:
-        width = modules[location][0]
-        added = width if not current_row else MODULE_GAP + width
-        if current_row and current_width + added > drawing_width:
-            packed_rows.append(current_row)
-            current_row, current_width = [], 0.0
-            added = width
-        current_row.append(location)
-        current_width += added
-    if current_row:
-        packed_rows.append(current_row)
+        tiers.setdefault(ranks[location], []).append(location)
+    packed_rows = [row for rank in sorted(tiers)
+                   for row in balanced_rows(tiers[rank])]
+    height = root_height + sum(max(modules[loc][1] for loc in row) + ROW_GAP
+                               for row in packed_rows)
+    if height > document.page_height - 2 * PAGE_MARGIN:
+        # Dense chains retain left-to-right topological order on compact rows,
+        # rather than shrinking symbols or spilling a long single column.
+        packed_rows = balanced_rows(ordered_locations)
 
     cursor_y = root_y + root_height + ROW_GAP
     for row in packed_rows:
@@ -317,7 +372,7 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
     printable_bottom = document.page_height - PAGE_MARGIN
     content_height = content_bottom - content_top
     printable_height = printable_bottom - printable_top
-    if content_height < printable_height:
+    if content_height < printable_height and not clustered:
         balanced_top = printable_top + (printable_height - content_height) / 2
         shift_y = _snap(balanced_top - content_top)
         module_origins = {
@@ -340,6 +395,7 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
         element = RiserElement(
             id=f"device:{device_id}", kind="device", ref=device_id,
             x=x, y=y, width=width, height=height,
+            location_id=f"location:{locations[device_id]}",
         )
         document.elements[element.id] = element
 
@@ -353,6 +409,11 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
             id=key, kind="location", ref=location,
             x=x1, y=y1, width=module_width, height=module_height,
         )
+        if clustered:
+            frame = document.elements[key]
+            frame.ref = _cluster_records[location].full_label or 'LOCATION UNCONFIRMED'
+            frame.physical_location_id = location
+            frame.heading_lines, frame.heading_height = heading_data[location]
 
     location_ids = sorted(k for k, e in document.elements.items() if e.kind == "location")
     device_ids = [f"device:{d}" for d in _device_ids(design)]
@@ -389,7 +450,7 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
             if annotation_id not in seen_annotations
         )
         document.z_order = merged_order
-    obstacles = [e for e in document.elements.values() if e.kind == "device"]
+    obstacles = routing_obstacles(document)
     reserved_segments = []
     routed_connections: dict[str, RiserRoute] = {}
     for edge in sorted(design.connections, key=_connection_sort_key):
@@ -401,7 +462,9 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
             edge, source, target, obstacles,
             reserved_segments=reserved_segments,
         )
-        routed_connections[edge.id] = RiserRoute(edge.id, points)
+        previous = title_source.routes.get(edge.id) if title_source else None
+        routed_connections[edge.id] = RiserRoute(
+            edge.id, points, label_hidden=previous.label_hidden if previous else False)
         reserved_segments.extend(_route_segments(points))
     # Routing order is deliberately canonical, while serialized/display
     # order continues to mirror the domain graph for compatibility.
@@ -414,16 +477,40 @@ def layout_riser(design, *, title_source: RiserDocument | None = None) -> RiserD
     return document
 
 
+def routing_obstacles(document: RiserDocument, design=None) -> list[RiserElement]:
+    """Device footprints and the text band of each location are protected."""
+    obstacles = [e for e in document.elements.values() if e.kind == "device"]
+    for element in document.elements.values():
+        if element.kind == "location" and document.show_location_frames:
+            left, top, right, bottom = _location_heading_box(element)
+            obstacles.append(RiserElement(
+                f"heading:{element.id}", "heading", f"heading:{element.id}",
+                left, top, right - left, bottom - top))
+    if design is not None:
+        from riser_symbols import caption_boxes
+        for element in document.elements.values():
+            if element.kind != 'device':
+                continue
+            for index,(left,top,right,bottom) in enumerate(caption_boxes(design,element)):
+                obstacles.append(RiserElement(f'caption:{element.id}:{index}', 'caption',
+                    f'caption:{element.id}:{index}',left,top,right-left,bottom-top))
+    return obstacles
+
+
 def port_point(element: RiserElement, port_id: str, *, output: bool) -> tuple[float, float]:
+    if not output and element.input_side == 'right':
+        return element.x+element.width, element.y+element.height/2
     if element.ref == "MSP":
+        if port_id == 'KP BUS':
+            return (element.x, element.y + element.height / 2)
         # These seven targets must remain distinct at editor fit zoom. Do not
         # grid-snap them: snapping previously collapsed LX800 and LX900 onto
         # the same coordinate and made reconnecting to the intended bus
         # impossible.
-        order = {"KP BUS": 0.06, "PROG": 0.207, "LX500": 0.353,
+        order = {"PROG": 0.207, "LX500": 0.353,
                  "LX600": 0.5, "LX700": 0.647, "LX800": 0.793,
                  "LX900": 0.94}
-        return (element.x + element.width * order.get(port_id, 0.5),
+        return (element.x + element.width * element.port_x.get(port_id,order.get(port_id, 0.5)),
                 element.y + element.height)
     match = re.fullmatch(r"OUT([123])", port_id)
     if output and match:
@@ -491,6 +578,22 @@ def _route_segments(points: list[tuple[float, float]]):
     return list(zip(points, points[1:]))
 
 
+def reattach_source_route(edge, source, points, obstacles):
+    """Keep manual bends, adapting a legacy bottom feed to the left-side KP port."""
+    start = port_point(source, edge.source.port_id, output=True)
+    if source.ref != 'MSP' or edge.source.port_id != 'KP BUS' or len(points) < 2:
+        return reattach_route_endpoint(points, start, at_start=True)
+    if points[0] == start:
+        return list(points)
+    # Normal moves of an already left-facing lead retain their existing bends.
+    adjusted = reattach_route_endpoint(points, start, at_start=True)
+    if adjusted[1][0] < start[0] and adjusted[1][1] == start[1]:
+        return adjusted
+    lead = (start[0] - GRID, start[1])
+    middle = route_connection(lead, points[1], obstacles)
+    return _compact_route([start, *middle, *points[1:]])
+
+
 def reserved_route_segments(document: RiserDocument, *, exclude_id: str = "",
                             live_ids: set[str] | None = None):
     segments = []
@@ -546,6 +649,20 @@ def route_connection(start: tuple[float, float], end: tuple[float, float],
         if obstacle.ref not in {source_ref, target_ref}
         and not contains(start, obstacle) and not contains(end, obstacle)
     ]
+    # An unobstructed L is already a minimum-length, minimum-bend route.
+    # Check both orientations before allocating a visibility graph over every
+    # device, heading, and reserved lane (especially costly after a drop).
+    def direct_clear(points):
+        segments = _route_segments(points)
+        return (not any(_segment_hits_rect(a, b, obstacle, clearance=12.0)
+                    for a, b in segments for obstacle in blockers)
+                and not any(_collinear_overlap_length(segment, reserved) > 0
+                            for segment in segments for reserved in reserved_segments))
+
+    for bend in ((start[0], end[1]), (end[0], start[1])):
+        direct = _compact_route([start, bend, end])
+        if direct_clear(direct):
+            return direct
     xs = {start[0], end[0]}
     ys = {start[1], end[1]}
     for obstacle in blockers:
@@ -560,6 +677,21 @@ def route_connection(start: tuple[float, float], end: tuple[float, float],
             xs.update((first[0] - GRID, first[0] + GRID))
     xs.update((min(xs) - GRID, max(xs) + GRID))
     ys.update((min(ys) - GRID, max(ys) + GRID))
+
+    # If both L orientations are blocked, a clear two-bend lane strictly
+    # between the endpoints still has minimum Manhattan length. These cheap
+    # checks must not take a detour outside that rectangle; complex detours
+    # remain the visibility solver's responsibility.
+    for axis, lanes in ((0, xs), (1, ys)):
+        midpoint = (start[axis] + end[axis]) / 2
+        for lane in sorted(lanes | {midpoint}, key=lambda value: (abs(value-midpoint), value)):
+            if not min(start[axis], end[axis]) < lane < max(start[axis], end[axis]):
+                continue
+            bends = ([(lane, start[1]), (lane, end[1])] if axis == 0
+                     else [(start[0], lane), (end[0], lane)])
+            direct = _compact_route([start, *bends, end])
+            if direct_clear(direct):
+                return direct
 
     def inside_clearance(point):
         x, y = point
@@ -659,15 +791,18 @@ def route_topology_connection(edge, source: RiserElement, target: RiserElement,
     The generic Manhattan router is free to leave an endpoint horizontally.
     Doing that for several outputs on one 710 places independent cables on top
     of each other and makes them look like a common trunk.  C1 output symbols
-    face down and input symbols face up, so reserve a short vertical lead at
-    both ends before asking the obstacle router to connect them.
+    face down and input symbols face up; MSP KP BUS faces left. Reserve a
+    short outward lead before asking the obstacle router to connect them.
     """
     reserved_segments = tuple(reserved_segments)
     start = port_point(source, edge.source.port_id, output=True)
     end = port_point(target, edge.target.port_id, output=False)
 
     output_match = re.fullmatch(r"OUT([123])", edge.source.port_id)
-    if output_match:
+    left_output = source.ref == 'MSP' and edge.source.port_id == 'KP BUS'
+    if left_output:
+        start_lead = (start[0] - GRID, start[1])
+    elif output_match:
         port_number = int(output_match.group(1))
         source_bottom = source.y + source.height
         # Use full grid lanes where space permits.  If another device is
@@ -692,7 +827,8 @@ def route_topology_connection(edge, source: RiserElement, target: RiserElement,
     else:
         start_lead = (start[0], start[1] + GRID)
 
-    target_lead = (end[0], end[1] - GRID)
+    right_input = target.input_side == 'right'
+    target_lead = (end[0]+GRID,end[1]) if right_input else (end[0], end[1] - GRID)
 
     def build(prefix, middle_start, middle_end, suffix):
         middle = route_connection(
@@ -794,10 +930,12 @@ def route_topology_connection(edge, source: RiserElement, target: RiserElement,
              (right, entry_y)),
         ]
 
-    prefixes = [([start, start_lead], start_lead), *side_leads(
-        source, start, downward=True)]
-    suffixes = [([target_lead, end], target_lead), *side_leads(
-        target, end, downward=False)]
+    prefixes = [([start, start_lead], start_lead)]
+    if not left_output:
+        prefixes.extend(side_leads(source, start, downward=True))
+    suffixes = [([target_lead, end], target_lead)]
+    if not right_input:
+        suffixes.extend(side_leads(target, end, downward=False))
     candidates = [(score(standard, 0), standard)]
     preference = 1
     for prefix, middle_start in prefixes:
@@ -896,19 +1034,183 @@ def find_bridges(routes: dict[str, list[tuple[float, float]]]) -> list[Bridge]:
         b.connection_id, b.y, b.x, b.orientation))
 
 
+def wire_segments(connection_id, points, bridges):
+    """Shared line/quadratic segments; hops never mask the underlying cable."""
+    result = []
+    for start, end in zip(points, points[1:]):
+        axis = 0 if start[1] == end[1] else 1 if start[0] == end[0] else None
+        cursor = start
+        if axis is not None:
+            orientation = "horizontal" if axis == 0 else "vertical"
+            contacts = [b for b in bridges if b.connection_id == connection_id
+                        and b.orientation == orientation
+                        and min(start[axis], end[axis]) + BRIDGE_HALF_WIDTH <= (b.x, b.y)[axis]
+                        <= max(start[axis], end[axis]) - BRIDGE_HALF_WIDTH
+                        and abs((b.x, b.y)[1-axis] - start[1-axis]) < .01]
+            direction = 1 if end[axis] >= start[axis] else -1
+            for bridge in sorted(contacts, key=lambda b: (b.x, b.y)[axis], reverse=direction < 0):
+                before, after, control = [bridge.x, bridge.y], [bridge.x, bridge.y], [bridge.x, bridge.y]
+                before[axis] -= direction * BRIDGE_HALF_WIDTH
+                after[axis] += direction * BRIDGE_HALF_WIDTH
+                control[1-axis] += -BRIDGE_HEIGHT if axis == 0 else BRIDGE_HEIGHT
+                result.append(("L", cursor, tuple(before)))
+                result.append(("Q", tuple(before), tuple(control), tuple(after)))
+                cursor = tuple(after)
+        result.append(("L", cursor, end))
+    return result
+
+
+def repair_generated_scene(design, document: RiserDocument) -> bool:
+    """Recover an outdated complete generated scene without moving manual work.
+
+    Old saves can contain stale routes and frames with no logical ownership.
+    A fresh layout is safe only when every device is present and no electrical
+    drawing geometry was manually edited. Markup/title data survive via the
+    normal re-layout path. Partially placed or manual scenes use conservative
+    synchronization instead.
+    """
+    if document.layout_version >= 2:
+        return False  # Version-2 geometry changes only through Preview/Apply.
+    devices = [e for e in document.elements.values() if e.kind == "device"]
+    if (document.unplaced or {e.ref for e in devices} != set(_device_ids(design))
+            or any(e.manual for e in document.elements.values())
+            or any(r.manual or r.label_manual for r in document.routes.values())):
+        return False
+    frames = {e.id: e for e in document.elements.values() if e.kind == "location"}
+    owners = {e.location_id for e in devices}
+    live_routes = {edge.id for edge in design.connections}
+    invalid = bool(set(document.routes) - live_routes or set(frames) - owners)
+    frame_list = list(frames.values())
+    invalid = invalid or any(_overlap(a, b) for index, a in enumerate(frame_list)
+                             for b in frame_list[index + 1:])
+    for device in devices:
+        expected = _normal_location(_location(design, device.ref))
+        without_floor = re.sub(r"\b\d+(?:ST|ND|RD|TH)\s+FLOOR\b", "", expected)
+        without_floor = re.sub(r"\s+", " ", without_floor).strip()
+        owner = frames.get(device.location_id)
+        if owner is None or _normal_location(owner.ref) not in {expected, without_floor}:
+            invalid = True
+        elif not (owner.x <= device.x and owner.y <= device.y
+                  and device.x + device.width <= owner.x + owner.width
+                  and device.y + device.height <= owner.y + owner.height):
+            invalid = True
+    if not invalid:
+        return False
+    replacement = layout_riser(design, title_source=document)
+    for field in fields(RiserDocument):
+        setattr(document, field.name, getattr(replacement, field.name))
+    return True
+
+
+def sync_location_ownership(design, document: RiserDocument) -> None:
+    """Migrate and reconcile membership by domain location, never by containment.
+
+    Existing coordinates and cable routes survive an assignment. A sole-owner
+    frame can be renamed in place; joining an existing room changes ownership
+    and lets validation highlight any placement that still needs adjustment.
+    """
+    if document.layout_version >= 2:
+        sync_cluster_ownership(design, document)
+        return
+    frames = {e.id: e for e in document.elements.values() if e.kind == "location"}
+    devices = [e for e in document.elements.values() if e.kind == "device" and not e.stale]
+    desired = {e.id: _normal_location(_location(design, e.ref)) for e in devices}
+    for device in devices:
+        expected = desired[device.id]
+        without_floor = re.sub(r"\b\d+(?:ST|ND|RD|TH)\s+FLOOR\b", "", expected)
+        without_floor = re.sub(r"\s+", " ", without_floor).strip()
+        owner = frames.get(device.location_id)
+        matches = [f for f in frames.values()
+                   if _normal_location(f.ref) in {expected, without_floor}]
+        if owner in matches:
+            continue
+        if matches:
+            device.location_id = sorted(matches, key=lambda f: (f.ref != expected, f.id))[0].id
+            continue
+        siblings = [e for e in devices if e.location_id == device.location_id] if owner else []
+        if owner and all(desired[e.id] == expected for e in siblings):
+            owner.ref = expected
+            continue
+        key = f"location:{expected}"
+        suffix = 2
+        while key in document.elements:
+            key = f"location:{expected}:{suffix}"
+            suffix += 1
+        frame = RiserElement(key, "location", expected, device.x - 24, device.y - 50,
+                             max(device.width + 48, len(expected) * 8 + 24), device.height + 68)
+        document.elements[key] = frames[key] = frame
+        document.z_order.insert(0, key)
+        device.location_id = key
+
+    # Generated frames are containers, not independent markup. Once their
+    # last member leaves, retaining them creates ghost boxes on every reopen.
+    occupied = {e.location_id for e in document.elements.values() if e.kind == "device"}
+    unused = {key for key, frame in frames.items() if key not in occupied and not frame.manual}
+    for key in unused:
+        document.elements.pop(key, None)
+    document.z_order = [key for key in document.z_order if key not in unused]
+
+
+def sync_cluster_ownership(design, document):
+    from project_locations import sync_project_locations
+    from riser_cluster_layout import cluster_heading
+    sync_project_locations(design)
+    frames = {e.physical_location_id: e for e in document.elements.values()
+              if e.kind == 'location' and e.physical_location_id}
+    devices = [e for e in document.elements.values() if e.kind == 'device' and not e.stale]
+    for device in devices:
+        identity = design.device_location_ids.get(device.ref)
+        if not identity:
+            continue
+        frame = frames.get(identity)
+        if frame is None:
+            key = 'location:' + identity
+            suffix = 2
+            while key in document.elements:
+                key = f'location:{identity}:{suffix}'
+                suffix += 1
+            frame = RiserElement(key, 'location', '', device.x - 24, device.y - 90,
+                                 max(360, device.width + 48), device.height + 114,
+                                 physical_location_id=identity)
+            frames[identity] = document.elements[key] = frame
+            document.z_order.insert(0, key)
+        device.location_id = frame.id
+    occupied = {e.location_id for e in document.elements.values() if e.kind == 'device'}
+    for frame in list(document.elements.values()):
+        if frame.kind != 'location':
+            continue
+        if frame.id not in occupied and not frame.manual:
+            document.elements.pop(frame.id)
+            document.z_order = [key for key in document.z_order if key != frame.id]
+            continue
+        record = design.equipment_locations.get(frame.physical_location_id)
+        if record:
+            frame.ref = record.full_label or 'LOCATION UNCONFIRMED'
+            frame.heading_lines = cluster_heading(record, [e.ref for e in devices if e.location_id == frame.id])
+            runs = location_text_runs(frame, small=True)
+            frame.heading_height = max((run.y - frame.y + run.size * .3 for run in runs), default=30) + 12
+
+
 def sync_riser_document(design, document: RiserDocument) -> None:
     live = set(_device_ids(design))
     existing = {e.ref for e in document.elements.values() if e.kind == "device"}
     for element in document.elements.values():
         if element.kind == "device":
             element.stale = element.ref not in live
+            if element.symbol_style == 'detailed' and not element.stale:
+                from riser_symbols import detailed_size
+                minimum_width,minimum_height=detailed_size(design,element.ref)
+                element.width=max(element.width,minimum_width)
+                element.height=max(element.height,minimum_height)
     for device_id in sorted(live - existing):
         if device_id not in document.unplaced:
             document.unplaced.append(device_id)
     document.unplaced = [d for d in document.unplaced if d in live and d not in existing]
-    obstacles = [e for e in document.elements.values()
-                 if e.kind == "device" and not e.stale]
+    sync_location_ownership(design, document)
+    obstacles = [e for e in routing_obstacles(document, design) if not e.stale]
     live_connection_ids = {edge.id for edge in design.connections}
+    for route_id in set(document.routes) - live_connection_ids:
+        document.routes.pop(route_id)
     for edge in sorted(design.connections, key=_connection_sort_key):
         source = document.elements.get(f"device:{edge.source.device_id}")
         target = document.elements.get(f"device:{edge.target.device_id}")
@@ -940,8 +1242,7 @@ def sync_riser_document(design, document: RiserDocument) -> None:
             )
             continue
         if route.points[0] != start:
-            route.points = reattach_route_endpoint(
-                route.points, start, at_start=True)
+            route.points = reattach_source_route(edge, source, route.points, obstacles)
         if route.points[-1] != end:
             route.points = reattach_route_endpoint(
                 route.points, end, at_start=False)
@@ -958,16 +1259,21 @@ def _boxes_overlap(first, second) -> bool:
 
 
 def _route_label_box(edge, route):
+    if route.label_hidden:
+        return None
     point = route_label_point(route.points)
     if point is None:
         return None
     x = point[0] + route.label_offset[0]
     y = point[1] + route.label_offset[1]
-    width = max(42.0, len(edge.label) * 7.5)
-    return (x - width / 2, y - 14, x + width / 2, y + 3)
+    width = max(42.0, fitz.get_text_length(edge.label, fontname='hebo', fontsize=15.3) + 10)
+    return (x - width / 2, y - 17, x + width / 2, y + 5)
 
 
 def _location_heading_box(location: RiserElement):
+    if location.heading_lines:
+        return (location.x + 8, location.y + 4,
+                location.x + location.width - 8, location.y + location.heading_height)
     return (
         location.x + 8,
         location.y + 4,
@@ -998,19 +1304,33 @@ def _place_route_labels(design, document: RiserDocument) -> None:
     ]
     protected_boxes = device_boxes + [
         _location_heading_box(element)
-        for element in document.elements.values() if element.kind == "location"
+        for element in document.elements.values() if element.kind == "location" and document.show_location_frames
+    ]
+    from riser_symbols import caption_boxes
+    protected_boxes += [box for e in document.elements.values() if e.kind == 'device'
+                        for box in caption_boxes(design,e)]
+    protected_boxes += [
+        (min(a[0], b[0]) - 3, min(a[1], b[1]) - 3,
+         max(a[0], b[0]) + 3, max(a[1], b[1]) + 3)
+        for route in document.routes.values() for a, b in _route_segments(route.points)
     ]
     used_boxes = []
-    edges = {edge.id: edge for edge in design.connections}
-    offsets = [(0.0, 0.0)]
+    offsets = [(0.0, 0.0), (-72.0, 0.0), (72.0, 0.0)]
     offsets.extend(
         (dx, dy)
         for dy in (-28.0, 28.0, -56.0, 56.0, -84.0, 84.0, -112.0, 112.0)
         for dx in (0.0, -72.0, 72.0, -144.0, 144.0, -216.0, 216.0)
     )
-    for route_id, route in document.routes.items():
-        edge = edges.get(route_id)
-        if edge is None:
+    for edge in sorted(design.connections, key=_connection_sort_key):
+        route = document.routes.get(edge.id)
+        if route is None:
+            continue
+        if route.label_hidden:
+            continue
+        if route.label_manual:
+            box = _route_label_box(edge, route)
+            if box is not None:
+                used_boxes.append(box)
             continue
         chosen = None
         for offset in offsets:
@@ -1019,7 +1339,7 @@ def _place_route_labels(design, document: RiserDocument) -> None:
             if box is None:
                 continue
             inside = (box[0] >= PAGE_MARGIN / 2 and box[1] >= PAGE_MARGIN / 2 and
-                      box[2] <= document.page_width - TITLE_BLOCK_WIDTH - PAGE_MARGIN / 2 and
+                      box[2] <= title_bounds(document)[0] - PAGE_MARGIN / 2 and
                       box[3] <= document.page_height - PAGE_MARGIN / 2)
             if (inside and not any(_boxes_overlap(box, item) for item in protected_boxes)
                     and not any(_boxes_overlap(box, item) for item in used_boxes)):
@@ -1055,6 +1375,7 @@ def _graph_cycle(design) -> bool:
 
 def validate_riser(design, document: RiserDocument) -> list[RiserIssue]:
     issues: list[RiserIssue] = []
+    drawing_right = title_bounds(document)[0]
     if _graph_cycle(design):
         issues.append(RiserIssue("topology.cycle", "Topology contains a cycle"))
     incoming: dict[tuple[str, str], int] = {}
@@ -1092,26 +1413,51 @@ def validate_riser(design, document: RiserDocument) -> list[RiserIssue]:
     for element in document.elements.values():
         if element.stale:
             issues.append(RiserIssue("scene.stale", "Drawing references removed hardware", element.ref))
+        if element.kind == 'location' and not document.show_location_frames:
+            continue
         if (element.x < 0 or element.y < 0 or
-                element.x + element.width > document.page_width - TITLE_BLOCK_WIDTH or
+                element.x + element.width > drawing_right or
                 element.y + element.height > document.page_height):
             issues.append(RiserIssue("scene.off_page", "Drawing object is outside the printable area", element.id))
     devices = [e for e in document.elements.values() if e.kind == "device"]
     locations = [e for e in document.elements.values() if e.kind == "location"]
+    visible_locations = locations if document.show_location_frames else []
+    owners = {e.location_id for e in devices}
+    for index, location in enumerate(locations):
+        if document.layout_version < 2:
+            identities = {design.device_location_ids.get(e.ref) for e in devices
+                          if e.location_id == location.id}
+            identities.discard(None)
+            if len(identities) > 1:
+                issues.append(RiserIssue('location.review',
+                    'Legacy box combines different location records; Preview layout to review', location.id))
+        if location.id not in owners:
+            issues.append(RiserIssue(
+                "scene.unused_location", "Location box has no devices; Re-layout All can remove it",
+                location.id))
+        for other in (locations[index + 1:] if document.show_location_frames else []):
+            if _overlap(location, other):
+                issues.append(RiserIssue(
+                    "scene.location_overlap", "Location boxes overlap", location.id))
     for device in devices:
         expected = _normal_location(_location(design, device.ref))
         center = (device.x + device.width / 2, device.y + device.height / 2)
         containers = [frame for frame in locations
-                      if frame.x <= center[0] <= frame.x + frame.width
+                      if frame.id == device.location_id
+                      and frame.x <= center[0] <= frame.x + frame.width
                       and frame.y <= center[1] <= frame.y + frame.height]
 
         def equivalent(frame):
+            if document.layout_version >= 2:
+                return frame.physical_location_id == design.device_location_ids.get(device.ref)
             actual = _normal_location(frame.ref)
             without_floor = re.sub(
                 r"\b\d+(?:ST|ND|RD|TH)\s+FLOOR\b", "", expected)
             without_floor = re.sub(r"\s+", " ", without_floor).strip()
             return actual in {expected, without_floor}
 
+        if document.layout_version >= 3:
+            containers = [frame for frame in locations if frame.id == device.location_id]
         if not any(equivalent(frame) for frame in containers):
             issues.append(RiserIssue(
                 "scene.location_mismatch",
@@ -1121,13 +1467,31 @@ def validate_riser(design, document: RiserDocument) -> list[RiserIssue]:
         for second in devices[index + 1:]:
             if _overlap(first, second):
                 issues.append(RiserIssue("scene.overlap", "Device symbols overlap", first.id))
+    if document.layout_version >= 2:
+        from location_model import is_unresolved
+        for location in locations:
+            record = design.equipment_locations.get(location.physical_location_id)
+            if record is None or is_unresolved(record.full_label):
+                issues.append(RiserIssue('location.unconfirmed',
+                                        'Confirm the physical location of this equipment', location.id))
+            if not document.show_location_frames:
+                continue
+            heading = _location_heading_box(location)
+            for device in devices:
+                box = (device.x, device.y, device.x + device.width, device.y + device.height)
+                if _boxes_overlap(heading, box):
+                    issues.append(RiserIssue('scene.heading_overlap',
+                                            'Location heading overlaps equipment', location.id))
+            if any(run.size * 11 / 24 < 7 for run in location_text_runs(location, small=True)):
+                issues.append(RiserIssue('print.legibility',
+                                        'Location heading is below the 11x17 minimum', location.id))
     edges = {edge.id: edge for edge in design.connections}
     label_boxes = []
     location_heading_boxes = [
-        (location.ref, _location_heading_box(location)) for location in locations
+        (location.ref, _location_heading_box(location)) for location in visible_locations
     ]
     for route_id, route in document.routes.items():
-        if any(x < 0 or y < 0 or x > document.page_width - TITLE_BLOCK_WIDTH
+        if any(x < 0 or y < 0 or x > drawing_right
                or y > document.page_height for x, y in route.points):
             issues.append(RiserIssue(
                 "scene.off_page", "Cable route is outside the printable drawing area",
@@ -1142,6 +1506,11 @@ def validate_riser(design, document: RiserDocument) -> list[RiserIssue]:
             continue
         label_box = _route_label_box(edge, route)
         if label_box:
+            if (label_box[0] < PAGE_MARGIN / 2 or label_box[1] < PAGE_MARGIN / 2
+                    or label_box[2] > drawing_right - PAGE_MARGIN / 2
+                    or label_box[3] > document.page_height - PAGE_MARGIN / 2):
+                issues.append(RiserIssue('scene.off_page',
+                                        'Cable callout is outside the printable drawing area', route_id))
             label_boxes.append((route_id, label_box))
             for device in devices:
                 device_box = (device.x, device.y,
@@ -1188,11 +1557,34 @@ def validate_riser(design, document: RiserDocument) -> list[RiserIssue]:
         if not getattr(document.title_block, name).strip():
             issues.append(RiserIssue("title.required", f"Title block field is required: {name}", name))
     for annotation in document.annotations:
-        if any(x < 0 or y < 0 or x > document.page_width - TITLE_BLOCK_WIDTH
+        if any(x < 0 or y < 0 or x > drawing_right
                or y > document.page_height for x, y in annotation.points):
             issues.append(RiserIssue(
                 "scene.off_page", "Markup is outside the printable drawing area",
                 annotation.id))
         if annotation.kind == "text" and annotation.font_size * 11 / 24 < 6:
             issues.append(RiserIssue("print.legibility", "Annotation is below the 11x17 minimum text size", annotation.id))
+    if document.layout_version >= 3:
+        from riser_symbols import text_bounds, caption_boxes
+        for element in devices:
+            runs=device_text(design,element,small=True)
+            for i,run in enumerate(runs):
+                box=text_bounds(run)
+                if run.size*11/24 < 7:
+                    issues.append(RiserIssue('print.legibility','Equipment text is below the 11x17 minimum',element.id))
+                if box[0]<36 or box[2]>drawing_right or box[1]<36 or box[3]>document.page_height-36:
+                    issues.append(RiserIssue('scene.off_page','Equipment text is outside the printable area',element.id))
+                if any(_boxes_overlap(box,text_bounds(other)) for other in runs[i+1:]):
+                    issues.append(RiserIssue('scene.label_overlap','Equipment text overlaps; resize or edit its location',element.id))
+            for box in caption_boxes(design,element):
+                for route_id,route in document.routes.items():
+                    probe=RiserElement('caption','caption','caption',box[0],box[1],box[2]-box[0],box[3]-box[1])
+                    if any(_segment_hits_rect(a,b,probe,clearance=0) for a,b in _segments(route.points)):
+                        issues.append(RiserIssue('scene.caption_overlap','Cable crosses a location caption',route_id))
+                if any(_boxes_overlap(box,(e.x,e.y,e.x+e.width,e.y+e.height)) for e in devices if e.id!=element.id):
+                    issues.append(RiserIssue('scene.caption_overlap','Location caption overlaps equipment',element.id))
+        left,top,right,bottom=title_bounds(document)
+        title_runs=title_text(document,small=True)
+        if any((lambda b:b[0]<left or b[2]>right or b[1]<top or b[3]>bottom)(text_bounds(r)) for r in title_runs):
+            issues.append(RiserIssue('title.overflow','Title-block text does not fit the sheet; shorten the metadata','titleblock'))
     return issues

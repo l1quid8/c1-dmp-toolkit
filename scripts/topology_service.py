@@ -154,6 +154,12 @@ def connect(design, source: DevicePortRef, target: DevicePortRef, *,
     _validate_ports(design, source, target)
     if _has_path(design, target.device_id, source.device_id):
         raise TopologyError("This connection would create a cycle")
+    # Imports retain their original graph for review. Interactive mutations
+    # must not introduce ambiguity that a single worksheet port cannot show.
+    if any(edge.source == source for edge in design.connections):
+        raise TopologyError(f"{source.device_id} {source.port_id} is occupied. Reconnect its cable instead.")
+    if any(edge.target == target for edge in design.connections):
+        raise TopologyError(f"{target.device_id} {target.port_id} is occupied. Reconnect its cable instead.")
     if status not in {"new", "existing"}:
         raise TopologyError("Cable status must be new or existing")
     if quantity < 1:
@@ -248,40 +254,26 @@ def project_legacy_topology(design) -> None:
     for keypad in design.keypads:
         keypad.source = None
 
-    for edge in design.connections:
-        target_splitter = splitters.get(edge.target.device_id)
-        if target_splitter:
-            key = "KP-Bus In" if target_splitter.splitter_type.upper() == "KP" else "LX-Bus In"
-            if edge.source.device_id == "MSP":
-                if target_splitter.splitter_type.upper() == "KP":
-                    value = "KEYPAD BUS IN FROM XR/550"
-                else:
-                    bus = edge.source.port_id.removeprefix("LX") or "500"
-                    value = f"{bus} BUS IN FROM XR/550"
-            else:
-                value = f"From {edge.source.device_id}"
-            target_splitter.inputs = {key: value}
-
-        source_splitter = splitters.get(edge.source.device_id)
-        match = _OUT_RE.match(edge.source.port_id)
-        if source_splitter and match:
-            source_splitter.outputs[int(match.group(1)) - 1] = _legacy_output(edge.target.device_id)
-
-        keypad = keypads.get(edge.target.device_id)
-        if keypad:
-            keypad.source = "MSP" if edge.source.device_id == "MSP" else edge.source.device_id
+    for splitter_id in splitters:
+        _project_splitter_input(design, splitter_id)
+        for index in range(1, 4):
+            _project_splitter_output(design, splitter_id, f"OUT{index}")
+    for keypad_id in keypads:
+        _project_keypad_source(design, keypad_id)
 
     for splitter_id, inputs in manual_inputs.items():
-        splitters[splitter_id].inputs = inputs
+        if not any(str(value).startswith("CONFLICT:") for value in splitters[splitter_id].inputs.values()):
+            splitters[splitter_id].inputs = inputs
     for splitter_id, outputs in manual_outputs.items():
         for index, value in outputs.items():
-            splitters[splitter_id].outputs[index] = value
+            if not splitters[splitter_id].outputs[index].startswith("CONFLICT:"):
+                splitters[splitter_id].outputs[index] = value
 
 
 def _manual_input_text(design, splitter) -> bool:
     """Whether a legacy IN field is a note the graph cannot represent."""
     value = next(iter((splitter.inputs or {}).values()), "").strip()
-    if not value:
+    if not value or value.startswith("CONFLICT:"):
         return False
     if splitter.splitter_type.upper() == "KP":
         if value.casefold() == "keypad bus in from xr/550":
@@ -296,7 +288,7 @@ def _manual_input_text(design, splitter) -> bool:
 def _manual_output_text(design, value: str) -> bool:
     """Whether an OUT value is legacy wording rather than a graph endpoint."""
     text = (value or "").strip()
-    if not text or text.casefold() == "spare":
+    if not text or text.casefold() == "spare" or text.startswith("CONFLICT:"):
         return False
     if re.fullmatch(r"RSP[\s_-]*\d+", text, re.I):
         return False
@@ -307,25 +299,36 @@ def _manual_output_text(design, value: str) -> bool:
     return True
 
 
+def _project_values(values, empty):
+    """A port with multiple edges must expose all of them in every projection."""
+    values = list(values)
+    if len(values) > 1:
+        return "CONFLICT: " + " | ".join(sorted(values))
+    return values[0] if values else empty
+
+
 def _project_splitter_input(design, splitter_id: str) -> None:
     splitter = _splitter(design, splitter_id)
     if splitter is None:
         return
-    edge = next((item for item in design.connections
-                 if item.target == DevicePortRef(splitter_id, "IN")), None)
-    if edge is None:
+    edges = [item for item in design.connections
+             if item.target == DevicePortRef(splitter_id, "IN")]
+    if not edges:
         splitter.inputs = {}
         return
     key = "KP-Bus In" if splitter.splitter_type.upper() == "KP" else "LX-Bus In"
-    if edge.source.device_id == "MSP":
-        if splitter.splitter_type.upper() == "KP":
-            value = "KEYPAD BUS IN FROM XR/550"
+    values = []
+    for edge in edges:
+        if edge.source.device_id == "MSP":
+            if splitter.splitter_type.upper() == "KP":
+                value = "KEYPAD BUS IN FROM XR/550"
+            else:
+                bus = edge.source.port_id.removeprefix("LX") or "500"
+                value = f"{bus} BUS IN FROM XR/550"
         else:
-            bus = edge.source.port_id.removeprefix("LX") or "500"
-            value = f"{bus} BUS IN FROM XR/550"
-    else:
-        value = f"From {edge.source.device_id}"
-    splitter.inputs = {key: value}
+            value = f"From {edge.source.device_id}"
+        values.append(value)
+    splitter.inputs = {key: _project_values(values, "")}
 
 
 def _project_splitter_output(design, splitter_id: str, port_id: str) -> None:
@@ -336,9 +339,9 @@ def _project_splitter_output(design, splitter_id: str, port_id: str) -> None:
     while len(splitter.outputs) < 3:
         splitter.outputs.append("Spare")
     source = DevicePortRef(splitter_id, port_id)
-    edge = next((item for item in design.connections if item.source == source), None)
-    splitter.outputs[int(match.group(1)) - 1] = (
-        _legacy_output(edge.target.device_id) if edge else "Spare")
+    splitter.outputs[int(match.group(1)) - 1] = _project_values(
+        (_legacy_output(edge.target.device_id) for edge in design.connections
+         if edge.source == source), "Spare")
 
 
 def _project_keypad_source(design, keypad_id: str) -> None:
@@ -350,10 +353,8 @@ def _project_keypad_source(design, keypad_id: str) -> None:
     if keypad is None:
         return
     target = DevicePortRef(keypad_id, "IN")
-    edge = next((item for item in design.connections if item.target == target), None)
-    keypad.source = (None if edge is None else
-                     "MSP" if edge.source.device_id == "MSP"
-                     else edge.source.device_id)
+    keypad.source = _project_values(
+        (edge.source.device_id for edge in design.connections if edge.target == target), None)
 
 
 def _project_affected_connection(design, edge: TopologyConnection | None) -> None:

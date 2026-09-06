@@ -2,6 +2,7 @@ import sys
 import os
 import json
 import copy
+import queue
 import threading
 import subprocess
 import contextlib
@@ -97,7 +98,10 @@ checked it against the riser diagram (required before FINAL).
    • REMOTELINK — account, users, arming model, optional advanced settings, and a live \
 read-back receipt of the account that will be generated.
    • RISER — auto-layout the shared topology, adjust devices and orthogonal cable routes, \
-add markup, edit the title block, and review riser-specific warnings.
+add markup, edit the title block, and review riser-specific warnings. Add Device opens \
+the shared hardware forms; double-click a device to edit it globally. Select and drag \
+wire callout text independently. Delete on text hides the label, not its wire; select \
+the wire for Restore Label or Reset Label Position. Label edits support Undo/Redo.
 
    Naming rules the checks enforce: SPARE must be uppercase, and RSP references \
 must be hyphenated (RSP-3, not RSP 3).
@@ -237,6 +241,9 @@ class App:
         self._ws_epoch: int | None = None
 
         self._spinner_jobs: list[str] = []
+        self._recent_scan = None
+        self._recent_poll_job = None
+        self._recent_frame = None
 
         # Output folder — configurable per machine via the meta section picker.
         self.output_dir: Path = output_dir()
@@ -442,7 +449,9 @@ class App:
             "Revert to Saved…", state="normal" if can_revert else "disabled")
 
         self._recent_menu.delete(0, "end")
-        recents = list_recent_sessions(limit=10)
+        # Native accessibility also invokes menu postcommands. A filesystem
+        # scan here can freeze the entire app on an unavailable cloud folder.
+        recents = getattr(self, '_recent_menu_cache', [])
         if not recents:
             self._recent_menu.add_command(label="(No recent projects)",
                                           state="disabled")
@@ -459,7 +468,9 @@ class App:
                 and self._generating is None)
         self._worksheet_menu.entryconfigure(
             "Generate Worksheet", state="normal" if idle else "disabled")
-        can_chart = idle and self._latest_worksheet_path() is not None
+        # Resolve the source only when the action is invoked; its handler
+        # already explains a missing worksheet. Never enumerate files here.
+        can_chart = idle
         self._worksheet_menu.entryconfigure(
             "Generate Door Chart", state="normal" if can_chart else "disabled")
         self._worksheet_menu.entryconfigure(
@@ -656,6 +667,7 @@ class App:
     # ------------------------------------------------------------------ #
 
     def _clear_input_section(self):
+        self._cancel_recent_poll()
         for w in self.input_section.winfo_children():
             w.destroy()
         self._show_flow()
@@ -757,13 +769,59 @@ class App:
         bind_click(change, self._choose_output_dir)
 
     def _show_recent_projects(self):
-        recents = list_recent_sessions(limit=4)
-        if not recents:
-            return
-
+        self._cancel_recent_poll()
         frame = ctk.CTkFrame(self.input_section, fg_color="transparent")
         frame.grid(row=2, column=0, sticky="ew", pady=(theme.PAD["lg"], 0))
         frame.columnconfigure(0, weight=1)
+        self._recent_frame = frame
+        ctk.CTkLabel(frame, text="Loading recent projects…",
+                     text_color=theme.TEXT_TERTIARY).grid(row=0, column=0, sticky="w")
+
+        # Filesystem enumeration can block indefinitely on a cloud/network
+        # folder or an OS permission prompt. Never run it on Tk's thread.
+        # Reuse a pending scan when returning home instead of leaking workers.
+        if self._recent_scan is None or not self._recent_scan[0].is_alive():
+            results = queue.SimpleQueue()
+            scanner = list_recent_sessions
+            def scan():
+                try:
+                    results.put((scanner(limit=4), False))
+                except Exception:
+                    results.put(([], True))
+            worker = threading.Thread(target=scan, daemon=True, name="recent-projects")
+            self._recent_scan = (worker, results)
+            worker.start()
+        self._poll_recent_projects(frame, self._recent_scan[1])
+
+    def _cancel_recent_poll(self):
+        if self._recent_poll_job is not None:
+            self.root.after_cancel(self._recent_poll_job)
+            self._recent_poll_job = None
+        self._recent_frame = None
+
+    def _poll_recent_projects(self, frame, results):
+        self._recent_poll_job = None
+        if frame is not self._recent_frame or not frame.winfo_exists():
+            return
+        try:
+            recents, failed = results.get_nowait()
+        except queue.Empty:
+            self._recent_poll_job = self.root.after(
+                100, lambda: self._poll_recent_projects(frame, results))
+            return
+        for child in frame.winfo_children():
+            child.destroy()
+        if failed:
+            ctk.CTkLabel(frame, text="Recent projects unavailable. Browse to open a project.",
+                         text_color=theme.TEXT_TERTIARY).grid(row=0, column=0, sticky="w")
+            return
+        self._recent_menu_cache = list(recents)
+        if not recents:
+            frame.destroy()
+            return
+        self._render_recent_projects(frame, recents)
+
+    def _render_recent_projects(self, frame, recents):
 
         SectionLabel(frame, "Recent projects").grid(
             row=0, column=0, sticky="w", pady=(0, 6))
@@ -1297,6 +1355,7 @@ class App:
 
     def _show_editor_surface(self):
         """Full-bleed editor; flow column hidden."""
+        self._cancel_recent_poll()
         self._flow_host.grid_remove()
         self.action_section.grid_remove()
         self.editor_section.grid(row=0, column=0, sticky="nsew",
@@ -1392,6 +1451,8 @@ class App:
         if self.state != "editing" or not self.session or not self.editor \
                 or self._generating is not None:
             return
+        if not getattr(self.editor, 'generation_allowed', lambda: True)():
+            return
         if self.editor.dirty and messagebox.askyesno(
             "Save project?", "Save the project before generating?",
         ):
@@ -1454,13 +1515,17 @@ class App:
         if self.state != "editing" or not self.session or not self.editor \
                 or self._generating is not None:
             return
+        if not getattr(self.editor, 'generation_allowed', lambda: True)():
+            return
+        self.editor.flush_design_refresh()
         if self.editor.dirty and messagebox.askyesno(
                 "Save project?", "Save the project before generating the riser?"):
             self.editor.save()
 
         design = self.session.design
         if design.riser_document is None or not design.riser_document.elements:
-            design.riser_document = layout_riser(design)
+            from riser_presentation import layout_presentation
+            design.riser_document = layout_presentation(design)
         sync_riser_document(design, design.riser_document)
         issues = validate_riser(design, design.riser_document)
         if issues:
@@ -1504,6 +1569,8 @@ class App:
         """Generate the next door-chart revision from the newest worksheet."""
         if self.state != "editing" or not self.session or not self.editor \
                 or self._generating is not None:
+            return
+        if not getattr(self.editor, 'generation_allowed', lambda: True)():
             return
         src = self._latest_worksheet_path()
         if src is None:
@@ -1566,6 +1633,8 @@ class App:
         Portable (any OS) — the operator imports the `.xml` into RemoteLink."""
         if self.state != "editing" or not self.session or not self.editor \
                 or self._generating is not None:
+            return
+        if not getattr(self.editor, 'generation_allowed', lambda: True)():
             return
         if self.editor.dirty and messagebox.askyesno(
             "Save project?", "Save the project before generating?",
@@ -2004,10 +2073,10 @@ class App:
             (f"{mod}+E", "Generate the DMP worksheet (next revision)"),
             (f"{mod}+D", "Generate the door chart (next revision)"),
             (f"{mod}+R", "Generate the vector riser bundle (next revision)"),
-            ("Delete / Backspace", "Delete selected riser markup or cable"),
+            ("Delete / Backspace", "Hide selected callout; delete markup; confirm wire/device removal"),
             ("Arrow keys", "Nudge selected riser objects on the grid"),
             ("Double-click / Return / F2", "Edit the selected zone cell"),
-            ("Escape", "Cancel a zone edit"),
+            ("Escape", "Cancel a zone edit, riser drag, connection, or layout preview"),
         ]
         body = "\n".join(f"{k:<28}{v}" for k, v in rows)
         self._show_help_text("Keyboard Shortcuts", body)

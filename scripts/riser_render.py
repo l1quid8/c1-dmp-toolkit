@@ -12,12 +12,12 @@ from pathlib import Path
 import fitz
 
 from paths import resource_path
+from riser_drawing import device_shape, device_text, location_text_runs, title_bounds, logo_bounds, title_text
+from riser_symbols import symbol_parts, modern_title, terminal_parts
 from riser_scene import (
-    BRIDGE_HALF_WIDTH,
-    BRIDGE_HEIGHT,
-    TITLE_BLOCK_WIDTH,
     find_bridges,
     route_label_point,
+    wire_segments,
 )
 
 
@@ -29,6 +29,13 @@ SMALL_HEIGHT = 11 * 72
 
 def _esc(value) -> str:
     return html.escape(str(value or ""), quote=True)
+
+
+def _svg_text(run):
+    return (f'<text x="{run.x:.2f}" y="{run.y:.2f}" text-anchor="{run.anchor}" '
+            'font-family="Helvetica" '
+            f'font-size="{run.size}" font-weight="{"bold" if run.bold else "normal"}" '
+            f'stroke="none" fill="#111">{_esc(run.text)}</text>')
 
 
 def _slug(value: str) -> str:
@@ -47,87 +54,36 @@ def _connection_map(design):
     return {edge.id: edge for edge in design.connections}
 
 
+def _svg_symbol(part):
+    c = part.coords
+    common = f'fill="{"white" if part.fill else "none"}" stroke="#111" stroke-width="{part.width}"'
+    if part.kind == 'polygon':
+        closed=(*c,*c[:2])
+        points=' '.join(f'{x:.2f},{y:.2f}' for x,y in zip(closed[::2],closed[1::2]))
+        return f'<polygon points="{points}" {common}/>'
+    x,y,right,bottom=c
+    if part.kind == 'ellipse':
+        return f'<ellipse cx="{(x+right)/2:.2f}" cy="{(y+bottom)/2:.2f}" rx="{(right-x)/2:.2f}" ry="{(bottom-y)/2:.2f}" {common}/>'
+    if part.kind == 'line':
+        return f'<line x1="{x:.2f}" y1="{y:.2f}" x2="{right:.2f}" y2="{bottom:.2f}" {common}/>'
+    return f'<rect x="{x:.2f}" y="{y:.2f}" width="{right-x:.2f}" height="{bottom-y:.2f}" {common}/>'
+
+
 def _route_path(connection_id: str, points, bridges) -> str:
     if not points:
         return ""
     commands = [f"M {points[0][0]:.2f} {points[0][1]:.2f}"]
-    route_bridges = [b for b in bridges if b.connection_id == connection_id]
-    for start, end in zip(points, points[1:]):
-        if start[1] == end[1]:
-            forward = end[0] >= start[0]
-            crossings = [b for b in route_bridges
-                         if b.orientation == "horizontal"
-                         and min(start[0], end[0]) + BRIDGE_HALF_WIDTH <= b.x
-                         <= max(start[0], end[0]) - BRIDGE_HALF_WIDTH
-                         and abs(b.y - start[1]) < 0.01]
-            crossings.sort(key=lambda b: b.x, reverse=not forward)
-            for bridge in crossings:
-                before = (bridge.x - BRIDGE_HALF_WIDTH if forward
-                          else bridge.x + BRIDGE_HALF_WIDTH)
-                after = (bridge.x + BRIDGE_HALF_WIDTH if forward
-                         else bridge.x - BRIDGE_HALF_WIDTH)
-                commands.append(f"L {before:.2f} {start[1]:.2f}")
-                commands.append(
-                    f"Q {bridge.x:.2f} {start[1] - BRIDGE_HEIGHT:.2f} "
-                    f"{after:.2f} {start[1]:.2f}")
-            commands.append(f"L {end[0]:.2f} {end[1]:.2f}")
-        elif start[0] == end[0]:
-            forward = end[1] >= start[1]
-            crossings = [b for b in route_bridges
-                         if b.orientation == "vertical"
-                         and min(start[1], end[1]) + BRIDGE_HALF_WIDTH <= b.y
-                         <= max(start[1], end[1]) - BRIDGE_HALF_WIDTH
-                         and abs(b.x - start[0]) < 0.01]
-            crossings.sort(key=lambda b: b.y, reverse=not forward)
-            for bridge in crossings:
-                before = (bridge.y - BRIDGE_HALF_WIDTH if forward
-                          else bridge.y + BRIDGE_HALF_WIDTH)
-                after = (bridge.y + BRIDGE_HALF_WIDTH if forward
-                         else bridge.y - BRIDGE_HALF_WIDTH)
-                commands.append(f"L {start[0]:.2f} {before:.2f}")
-                commands.append(
-                    f"Q {start[0] + BRIDGE_HEIGHT:.2f} {bridge.y:.2f} "
-                    f"{start[0]:.2f} {after:.2f}")
-            commands.append(f"L {end[0]:.2f} {end[1]:.2f}")
-        else:
-            commands.append(f"L {end[0]:.2f} {end[1]:.2f}")
+    for segment in wire_segments(connection_id, points, bridges):
+        coordinates = " ".join(f"{x:.2f} {y:.2f}" for x, y in segment[2:])
+        commands.append(f"{segment[0]} {coordinates}")
     return " ".join(commands)
 
 
-def _device_detail(design, ref: str) -> str:
-    if ref.startswith("RSP-"):
-        number = int(ref.split("-", 1)[1])
-        rsp = next((r for r in design.rsps if r.number == number), None)
-        if rsp:
-            zone = f"Z{min(rsp.zones)}–Z{max(rsp.zones)}" if rsp.zones else ""
-            return " · ".join(x for x in (rsp.model, zone) if x)
-    return ""
-
-
-def _is_splitter(design, ref: str) -> bool:
-    return any(splitter.id == ref for splitter in design.splitters)
-
-
-def _wrap_words(value: str, maximum_characters: int) -> list[str]:
-    words = (value or "").replace("\n", " ").split()
-    if not words:
-        return [""]
-    lines: list[str] = []
-    current = words[0]
-    for word in words[1:]:
-        if len(current) + 1 + len(word) <= maximum_characters:
-            current += f" {word}"
-        else:
-            lines.append(current)
-            current = word
-    lines.append(current)
-    return lines
 
 
 def _svg_bytes(design, document, *, width, height, physical_width: str,
                physical_height: str, profile: str = "24x36") -> bytes:
     small = profile == "11x17"
-    secondary_size = 13.2 if small else 11
     cable_size = 15.3 if small else 14
     bridges = find_bridges({key: route.points for key, route in document.routes.items()})
     connections = _connection_map(design)
@@ -140,7 +96,7 @@ def _svg_bytes(design, document, *, width, height, physical_width: str,
          'refX="9" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" '
          ' fill="context-stroke"/></marker></defs>'),
         '<rect width="100%" height="100%" fill="white"/>',
-        '<g id="drawing" font-family="Arial, Helvetica, sans-serif" fill="#111111">',
+        '<g id="drawing" font-family="Helvetica" fill="#111111">',
     ]
 
     for element_id in document.z_order:
@@ -148,39 +104,24 @@ def _svg_bytes(design, document, *, width, height, physical_width: str,
         if element is None:
             continue
         if element.kind == "location":
+            if not document.show_location_frames:
+                continue
             lines.append(
                 f'<g id="{_esc(element.id)}" class="location"><rect x="{element.x:.2f}" '
                 f'y="{element.y:.2f}" width="{element.width:.2f}" height="{element.height:.2f}" '
-                'rx="8" fill="none" stroke="#8b949e" stroke-width="1" '
-                'stroke-dasharray="8 5"/><line x1="{:.2f}" y1="{:.2f}" x2="{:.2f}" y2="{:.2f}" '
-                'stroke="#d7dde3" stroke-width="1"/><text x="{:.2f}" y="{:.2f}" '
-                'font-size="{:.1f}" font-weight="bold">{}</text></g>'.format(
-                    element.x, element.y + 34, element.x + element.width, element.y + 34,
-                    element.x + 12, element.y + 22,
-                    13.2 if small else 13, _esc(element.ref)))
+                'fill="none" stroke="#8b949e" stroke-width="1" stroke-dasharray="8 5"/>'
+                f'<line x1="{element.x:.2f}" y1="{element.y + element.heading_height:.2f}" '
+                f'x2="{element.x + element.width:.2f}" y2="{element.y + element.heading_height:.2f}" '
+                'stroke="#d7dde3" stroke-width="1"/>' +
+                ''.join(_svg_text(run) for run in location_text_runs(element, small=small)) + '</g>')
             continue
         if element.kind != "device":
             continue
         x, y, w, h = element.x, element.y, element.width, element.height
         lines.append(f'<g id="{_esc(element.id)}" class="device {_esc(element.ref)}">')
-        if element.ref.startswith("KEYPAD-"):
-            lines.append(f'<ellipse cx="{x + w/2:.2f}" cy="{y + h/2:.2f}" rx="{w/2:.2f}" '
-                         f'ry="{h/2:.2f}" fill="white" stroke="#111" stroke-width="2"/>')
-        else:
-            lines.append(f'<rect x="{x:.2f}" y="{y:.2f}" width="{w:.2f}" height="{h:.2f}" '
-                         'rx="4" fill="white" stroke="#111" stroke-width="2"/>')
-        lines.append(f'<text x="{x + w/2:.2f}" y="{y + h/2 - 3:.2f}" text-anchor="middle" '
-                     f'font-size="18" font-weight="bold">{_esc(element.ref)}</text>')
-        detail = _device_detail(design, element.ref)
-        if detail:
-            lines.append(f'<text x="{x + w/2:.2f}" y="{y + h/2 + 17:.2f}" text-anchor="middle" '
-                         f'font-size="{13.2 if small else 13}">{_esc(detail)}</text>')
-        if _is_splitter(design, element.ref):
-            lines.append(f'<text x="{x + w/2:.2f}" y="{y + 12:.2f}" text-anchor="middle" font-size="{secondary_size}">IN</text>')
-            for index in range(1, 4):
-                px = x + w * index / 4
-                lines.append(f'<text x="{px:.2f}" y="{y + h - 7:.2f}" text-anchor="middle" '
-                             f'font-size="{secondary_size}">OUT {index}</text>')
+        lines.extend(_svg_symbol(part) for part in symbol_parts(design,element))
+        lines.extend(_svg_text(run) for run in device_text(design, element, small=small))
+        lines.extend(_svg_symbol(part) for part in terminal_parts(design,element))
         lines.append('</g>')
 
     lines.append('<g id="topology" fill="none" stroke="#111" stroke-width="1.2">')
@@ -191,12 +132,14 @@ def _svg_bytes(design, document, *, width, height, physical_width: str,
     lines.append(f'<g id="cable-labels" font-size="{cable_size}" font-weight="bold">')
     for connection_id, route in document.routes.items():
         edge = connections.get(connection_id)
-        if edge is None or not route.points:
+        if edge is None or not route.points or route.label_hidden:
             continue
         x, y = route_label_point(route.points) or (0.0, 0.0)
         x += route.label_offset[0]
         y += route.label_offset[1]
-        lines.append(f'<text x="{x:.2f}" y="{y:.2f}" text-anchor="middle">{_esc(edge.label)}</text>')
+        lines.append(f'<text x="{x:.2f}" y="{y:.2f}" text-anchor="middle" '
+                     f'font-family="Helvetica" font-size="{cable_size}" font-weight="bold">'
+                     f'{_esc(edge.label)}</text>')
     lines.append('</g>')
 
     lines.append('<g id="markup">')
@@ -215,6 +158,7 @@ def _svg_bytes(design, document, *, width, height, physical_width: str,
                 annotation.alignment, "start")
             font_size = max(annotation.font_size, 13.2 if small else 0.0)
             lines.append(f'<text id="{_esc(annotation.id)}" x="{x:.2f}" y="{y:.2f}" '
+                         'font-family="Helvetica" '
                          f'font-size="{font_size:.2f}" font-weight="{_esc(annotation.font_weight)}" '
                          f'text-anchor="{anchor}" fill="{_esc(annotation.stroke)}">'
                          f'{_esc(annotation.text)}</text>')
@@ -232,45 +176,21 @@ def _svg_bytes(design, document, *, width, height, physical_width: str,
                          f'{common}{marker}/>')
     lines.append('</g>')
 
-    tb = document.title_block
-    tx = document.page_width - TITLE_BLOCK_WIDTH
+    tx, ty, right, bottom = title_bounds(document)
+    if document.layout_version >= 3:
+        lines.append(f'<g id="sheet-frame"><rect x="36" y="36" width="{document.page_width-72}" height="{document.page_height-72}" fill="none" stroke="#111" stroke-width="2"/></g>')
     lines.append('<g id="title-block" stroke="#111" fill="white">')
-    lines.append(f'<rect x="{tx:.2f}" y="36" width="{TITLE_BLOCK_WIDTH - 36:.2f}" '
-                 f'height="{document.page_height - 72:.2f}" stroke-width="2"/>')
+    lines.append(f'<rect x="{tx:.2f}" y="{ty:.2f}" width="{right - tx:.2f}" '
+                 f'height="{bottom - ty:.2f}" stroke-width="2"/>')
     logo = _logo_data()
     if logo:
-        lines.append(f'<image x="{tx + 22:.2f}" y="64" width="{TITLE_BLOCK_WIDTH - 80:.2f}" height="80" '
+        lx, ly, lr, lb = logo_bounds(document)
+        lines.append(f'<image x="{lx:.2f}" y="{ly:.2f}" width="{lr-lx:.2f}" height="{lb-ly:.2f}" '
                      f'preserveAspectRatio="xMidYMid meet" xlink:href="data:image/png;base64,{logo}"/>')
-    text_rows = [
-        (170, tb.school_name, 18, "bold"),
-        (205, tb.address.replace("\n", " · "), 12, "normal"),
-        (245, f"LOCAL CODE: {tb.local_code}", 12, "bold"),
-        (310, tb.project_title, 14, "bold"),
-        (370, tb.drawing_title, 18, "bold"),
-        (410, f"SYSTEM: {tb.system}", 12, "bold"),
-        (470, f"DRAWN BY: {tb.drawn_by}", 11, "normal"),
-        (500, f"CHECKED BY: {tb.checked_by}", 11, "normal"),
-        (530, f"DATE: {tb.issue_date}", 11, "normal"),
-        (document.page_height - 115, f"SHEET {tb.sheet_number}", 20, "bold"),
-    ]
-    for index, revision in enumerate(tb.revisions[-6:]):
-        text_rows.append((590 + index * 25, f"REV: {revision}", 11, "normal"))
-    text_width = TITLE_BLOCK_WIDTH - 60
-    text_center = tx + (TITLE_BLOCK_WIDTH - 36) / 2
-    for y, text, size, weight in text_rows:
-        size = max(size, secondary_size)
-        maximum_characters = max(8, int(text_width / max(1.0, size * 0.6)))
-        wrapped = _wrap_words(str(text or ""), maximum_characters)
-        line_height = size * 1.15
-        first_y = y - (len(wrapped) - 1) * line_height / 2
-        tspans = "".join(
-            f'<tspan x="{text_center:.2f}" y="{first_y + index * line_height:.2f}">'
-            f'{_esc(line)}</tspan>'
-            for index, line in enumerate(wrapped)
-        )
-        lines.append(f'<text x="{text_center:.2f}" y="{y:.2f}" '
-                     f'text-anchor="middle" stroke="none" fill="#111" font-size="{size}" '
-                     f'font-weight="{weight}">{tspans}</text>')
+    lines.extend(_svg_text(run) for run in title_text(document, small=small))
+    if document.layout_version >= 3:
+        for (x1,y1),(x2,y2) in modern_title(document)[1]:
+            lines.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke-width="1.2"/>')
     lines.append('</g></g></svg>')
     return "\n".join(lines).encode("utf-8")
 

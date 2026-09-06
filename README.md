@@ -70,6 +70,18 @@ artifacts and are never re-imported.
   and cable editing, topology-aware connect/reconnect, orthogonal route handles,
   markup tools, title-block fields, undo/redo, validation jumps, and an Unplaced
   tray. Electrical changes appear immediately in SPLITTERS and worksheet output.
+  Select a location box and choose **Rename location globally…** (or double-click
+  the box) to rename its equipment across the project, with an affected-item
+  confirmation and undo. Paired power supplies follow their RSP; unrelated zone
+  descriptions are not rewritten. Generate a new worksheet before a new door
+  chart to include the corrected locations. Building/Floor/Room fields edit the
+  shared physical location; **Assign location** moves only selected equipment's
+  assignment. Geometry and wiring remain unchanged.
+  **Preview layout** proposes electrical-first room clusters with a centered
+  head end, wrapped location headings, and separate unknown-location items.
+  **Apply layout** commits one undoable replacement; Cancel changes nothing.
+  Existing saved drawings keep their layout until Apply. **Auto-layout** places
+  missing equipment into clear space and leaves it Unplaced if no space fits.
 - **Validation** runs live (status-bar chips per tab: required IP/gateway/
   tech/date, no blank or placeholder zone descriptions, `RSP-N`/`SPARE`
   naming, conflicts resolved, wiring reviewed). It warns — it never blocks.
@@ -143,9 +155,38 @@ remembers your choice for next launch.
 The combined release opens projects from the original app, the RemoteLink
 integration, and the riser integration. Saving keeps both RemoteLink settings
 and the editable riser (connections, layout, routes, and markup) together.
-Combined projects use **schema 3**; older schema-2 builds will ask you to update
+Combined projects use **schema 7**, including stable shared equipment locations,
+versioned riser location ownership, independent cable-callout visibility, and
+detailed symbol/port geometry with printed location-frame visibility;
+older builds will ask you to update
 instead of opening a project they cannot preserve. Keep a copy of the original
 `.dmps` if you need to continue using an older build.
+
+### Hardware and cable callouts in RISER
+
+New drawings use schematic keypad faces, compact 710s with inside location
+captions, and a structured title block. To adopt the style in a saved drawing,
+choose **Preview layout**, review it, then **Apply layout** (undoable). Opening
+an older project does not replace its saved manual geometry. Long location
+captions can grow detailed symbols to keep text readable. **Locations** shows
+or hides group outlines in both the editor and exports; detailed drawings hide
+these outlines by default. Electrical connections remain unchanged.
+
+- **Add Device** opens the existing splitter, keypad, or RSP/power-supply creation
+  form. New equipment appears in **Unplaced**; existing drawing positions stay put.
+- Select a device and choose **Edit Device**, or double-click its symbol. The same
+  forms used by the domain tabs edit the shared project immediately. **Done** closes
+  the form; it is not a separate draft. **Remove from Project** uses the existing
+  wiring/zone-cascade confirmation. The required MSP cannot be removed.
+- Select cable text independently to drag or arrow-key nudge it. Double-click
+  edits its text; blank restores the automatic cable label. **Delete** on selected
+  text hides only the callout. Deleting a selected wire still asks to disconnect it.
+- Select the wire for **Restore Label**, **Hide Label**, and **Reset Label Position**.
+  Callout movement/visibility supports Undo/Redo and Escape during a drag, persists
+  in the project, and matches both PDF sizes and SVG. Full Preview/Apply layout
+  replaces manual positions but preserves hidden labels.
+- Hardware forms retain the domain tabs' existing history behavior; adding/removing
+  hardware is not a canvas Undo command. Save a project copy before major hardware changes.
 
 ## Repository layout
 
