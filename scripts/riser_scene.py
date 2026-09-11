@@ -499,6 +499,8 @@ def routing_obstacles(document: RiserDocument, design=None) -> list[RiserElement
 
 INPUT_SIDES = ('top', 'right', 'bottom', 'left')
 INPUT_NORMALS = {'top': (0, -1), 'right': (1, 0), 'bottom': (0, 1), 'left': (-1, 0)}
+MSP_OUTPUT_X = {"PROG": 0.207, "LX500": 0.353, "LX600": 0.5,
+                "LX700": 0.647, "LX800": 0.793, "LX900": 0.94}
 
 
 def input_side_point(element: RiserElement, side: str):
@@ -518,10 +520,7 @@ def port_point(element: RiserElement, port_id: str, *, output: bool) -> tuple[fl
         # grid-snap them: snapping previously collapsed LX800 and LX900 onto
         # the same coordinate and made reconnecting to the intended bus
         # impossible.
-        order = {"PROG": 0.207, "LX500": 0.353,
-                 "LX600": 0.5, "LX700": 0.647, "LX800": 0.793,
-                 "LX900": 0.94}
-        return (element.x + element.width * element.port_x.get(port_id,order.get(port_id, 0.5)),
+        return (element.x + element.width * element.port_x.get(port_id,MSP_OUTPUT_X.get(port_id, 0.5)),
                 element.y + element.height)
     match = re.fullmatch(r"OUT([123])", port_id)
     if output and match:
@@ -1232,6 +1231,14 @@ def sync_cluster_ownership(design, document):
 
 
 def sync_riser_document(design, document: RiserDocument) -> None:
+    # Older generated layouts spread active outputs first and placed unused
+    # ones in arbitrary gaps. Repair their order before attaching cables to
+    # named ports; preserve already ordered custom spacing and device geometry.
+    panel = document.elements.get('device:MSP')
+    if panel is not None and panel.port_x:
+        positions = [panel.port_x.get(name, x) for name, x in MSP_OUTPUT_X.items()]
+        if not all(a < b for a, b in zip(positions, positions[1:])):
+            panel.port_x.update(MSP_OUTPUT_X)
     live = set(_device_ids(design))
     existing = {e.ref for e in document.elements.values() if e.kind == "device"}
     for element in document.elements.values():

@@ -13,7 +13,8 @@ from riser_cluster_layout import natural_key, cluster_heading
 def layout_presentation(design, *, title_source=None):
     from project_locations import sync_project_locations
     from riser_scene import (_device_ids, _connection_sort_key, routing_obstacles,
-                             route_topology_connection, _route_segments, _place_route_labels)
+                             route_topology_connection, _route_segments, _place_route_labels,
+                             MSP_OUTPUT_X)
     isolated=copy.deepcopy(design)
     sync_project_locations(isolated)
     doc=default_riser_document(isolated)
@@ -147,15 +148,8 @@ def layout_presentation(design, *, title_source=None):
             panel.x-w-150,panel.y+(panel.height-h)/2,w,h,
             location_id='location:'+identity,symbol_style='detailed',input_side='right')
     panel=doc.elements['device:MSP']
-    active=sorted({e.source.port_id for e in isolated.connections if e.source.device_id=='MSP'}-{'KP BUS'},key=natural_key)
-    active.sort(key=lambda name:(name!='PROG',natural_key(name)))
-    start,span=(.08,.84) if len(active)>3 else (.25,.5)
-    panel.port_x={name:(.5 if len(active)==1 else start+span*i/(len(active)-1)) for i,name in enumerate(active)}
-    unused=[name for name in ('PROG','LX500','LX600','LX700','LX800','LX900') if name not in panel.port_x]
-    slots=[.08,.92,.16,.84,.4,.6,.5]
-    for name in unused:
-        slot=max(slots,key=lambda s:min(abs(s-p) for p in panel.port_x.values()) if panel.port_x else 1)
-        panel.port_x[name]=slot; slots.remove(slot)
+    # Connected and unused outputs share one stable electrical order.
+    panel.port_x=dict(MSP_OUTPUT_X)
     for identity,record in sorted(isolated.equipment_locations.items()):
         members=[e for e in doc.elements.values() if e.location_id=='location:'+identity]
         if not members: continue

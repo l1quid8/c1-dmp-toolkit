@@ -119,7 +119,7 @@ def test_old_manual_geometry_and_classic_style_are_not_silently_replaced():
     assert getattr(doc.elements['device:710-KP-1'],'symbol_style',None)=='classic'
 
 
-def test_service_keypad_feed_is_horizontal_and_active_panel_outputs_are_spread():
+def test_service_keypad_feed_is_horizontal_and_panel_outputs_are_distinct():
     d,_,doc=approved_scene()
     edge=next(e for e in d.connections if e.source.port_id=='KP BUS')
     points=doc.routes[edge.id].points
@@ -128,7 +128,7 @@ def test_service_keypad_feed_is_horizontal_and_active_panel_outputs_are_spread()
     panel=doc.elements['device:MSP']
     a=port_point(panel,'PROG',output=True)
     b=port_point(panel,'LX500',output=True)
-    assert b[0]-a[0] >= panel.width/2
+    assert b[0]-a[0] > panel.width*.1
 
 
 def test_frame_toggle_updates_export_and_is_undoable(editor,tmp_path):
