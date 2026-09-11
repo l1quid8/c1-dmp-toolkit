@@ -6,7 +6,15 @@ encrypted **RemoteLink Account** —
 with a built-in editor for correcting the design in the field before anything
 is generated.
 
-![Project editor — ZONES tab](docs/screenshots/editor-zones.png)
+## See it in 55 seconds
+
+Import a design, correct a zone, edit the riser, and generate the files your team needs.
+
+https://github.com/user-attachments/assets/fbbad379-596e-4965-9399-51c9bf878d3e
+
+[Full feature tour · 3:44 (v1.6.0)](https://github.com/l1quid8/c1-dmp-toolkit/releases/download/v1.7.0/C1-DMP-Toolkit-Feature-Tour.mp4) · [Chapters and transcript](https://github.com/l1quid8/c1-dmp-toolkit/releases/download/v1.7.0/C1-DMP-Toolkit-Feature-Guide.md)
+
+*Recorded from `main` on September 11, 2026, using a fictional campus. Sound is not required.*
 
 ## What it does
 
