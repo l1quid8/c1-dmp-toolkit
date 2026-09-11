@@ -54,8 +54,11 @@ artifacts and are never re-imported.
   tree** sits beside the cards so you can verify the derived 710-bus wiring at a
   glance — click any node to jump to the card (or tab) that owns it.
 - **Hardware changes** — add or remove **714-16/714-8 expanders** (each brings
-  its RSP + power supply + zone block — DMP bus addressing: module 7 starts
-  Z601), **710 splitters** (LX or KP), and **keypads**. Removal re-points
+  its RSP + power supply + consecutive 16- or 8-zone block), **710 splitters**
+  (LX or KP), and **keypads**. New expanders use the first available range that
+  fits on one LX bus, then advance to the next bus when needed. Existing zone
+  addresses and descriptions stay intact; removal clears only the selected
+  expander's zones. Removal re-points
   dependent wiring to Spare and pops a review summary that routes you to the
   affected connections. Location fields autocomplete from locations already in
   the project. Template capacities are enforced: 15 expanders, 12 splitters
@@ -70,6 +73,11 @@ artifacts and are never re-imported.
   and cable editing, topology-aware connect/reconnect, orthogonal route handles,
   markup tools, title-block fields, undo/redo, validation jumps, and an Unplaced
   tray. Electrical changes appear immediately in SPLITTERS and worksheet output.
+  **Hide panel / Show panel** collapses the right-side controls to give the
+  drawing more room while retaining selections and entered values. **Full screen**
+  is available in the riser toolbar and View menu; press **Escape** to exit,
+  or toggle with **Ctrl+Cmd+F** on Mac or **F11**. These view changes do not mark
+  the project as edited.
   Select a location box and choose **Rename location globally…** (or double-click
   the box) to rename its equipment across the project, with an affected-item
   confirmation and undo. Paired power supplies follow their RSP; unrelated zone

@@ -3,9 +3,54 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections import Counter
 
 from location_model import EquipmentLocation, location_key, is_unresolved
 from location_model import legacy_normal_location as _normal_location
+
+
+# A direction such as HALLWAY (E) is valid; a cable model following (E)/(N)
+# or a bare West Penn/AQC model is not an equipment location.
+_CABLE_LOCATION_RE = re.compile(
+    r'\([NE]\)\s*(?:\(\d+\)\s*)?[A-Z]+\d+|\b(?:WP|AQC)\s*\d+', re.I)
+
+
+def _retained_location_ids(design):
+    identities = set(design.device_location_ids.values())
+    identities.update(key for key, record in design.equipment_locations.items() if record.confirmed)
+    if design.riser_document:
+        identities.update(element.physical_location_id
+                          for element in design.riser_document.elements.values()
+                          if element.kind == 'location' and element.manual)
+    return identities
+
+
+def is_equipment_location_name(value):
+    """Keep manual entry and reusable choices under the same location rules."""
+    return bool(not is_unresolved(value) and re.search(r'\w', value or '')
+                and location_key(value) not in {'(E)', '(N)', 'LOCATION NEEDS REVIEW'}
+                and not _CABLE_LOCATION_RE.search(value))
+
+
+def equipment_location_choices(design):
+    """Offer actual equipment rooms, not edit history or imported cable labels."""
+    retained = _retained_location_ids(design)
+    candidates = [(identity, ' '.join(record.full_label.split()))
+                  for identity, record in design.equipment_locations.items()
+                  if identity in retained and is_equipment_location_name(record.full_label)]
+    counts = Counter(location_key(label) for _, label in candidates)
+    choices = {}
+    for identity, label in sorted(candidates, key=lambda item: (location_key(item[1]), item[0])):
+        if counts[location_key(label)] > 1:
+            members = sorted(ref for ref, key in design.device_location_ids.items() if key == identity)
+            label += ' · ' + (', '.join(members) or 'Unassigned')
+        base = label
+        suffix = 2
+        while label in choices:
+            label = f'{base} ({suffix})'
+            suffix += 1
+        choices[label] = identity
+    return choices
 
 
 def _location(design, ref):
@@ -76,6 +121,12 @@ def sync_project_locations(design):
         bindings[ref] = identity
     design.device_location_ids = {ref: identity for ref, identity in bindings.items() if ref in values}
     design.location_sync_values = dict(values)
+    # Location entry fields synchronize on each keystroke. Their previous text
+    # is not a reusable room once nothing refers to it. Undo keeps its own full
+    # registry snapshot; confirmed rooms and manual drawing frames remain valid.
+    retained = _retained_location_ids(design)
+    for identity in set(records) - retained:
+        del records[identity]
 
 
 def _write_assignments(design, refs, identity):
@@ -103,6 +154,36 @@ def assign_location(design, device_id, location_id):
     if device_id.startswith('PS-'):
         refs.append('RSP-' + device_id[3:])
     _write_assignments(design, refs, location_id)
+    sync_project_locations(design)
+
+
+def assign_location_name(design, device_id, name):
+    """Create or reuse a room only when a complete assignment is committed."""
+    label = ' '.join((name or '').split())
+    if not is_equipment_location_name(label):
+        raise ValueError('Enter a location name, such as a building or room.')
+    if device_id not in location_fields(design):
+        raise ValueError('Choose current equipment to assign a location.')
+    sync_project_locations(design)
+    if device_id.startswith(('RSP-', 'PS-')) and location_key(label) in {'MSP', 'AT MSP', 'SAME AS MSP'}:
+        identity = design.device_location_ids['MSP']
+        assign_location(design, device_id, identity)
+        return identity
+    matches = [identity for identity, record in design.equipment_locations.items()
+               if location_key(record.full_label) == location_key(label)]
+    current = design.device_location_ids.get(device_id)
+    if current in matches:
+        identity = current
+    elif len(matches) > 1:
+        raise ValueError('Several locations use that name. Choose one from the list.')
+    elif matches:
+        identity = matches[0]
+    else:
+        identity = str(uuid.uuid4())
+        design.equipment_locations[identity] = EquipmentLocation(
+            identity, label, room=label, confirmed=True)
+    assign_location(design, device_id, identity)
+    return identity
 
 
 def rename_equipment_location(design, identity, label, *, allow_merge=False):

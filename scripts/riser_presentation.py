@@ -71,41 +71,73 @@ def layout_presentation(design, *, title_source=None):
         position(root,cursor); cursor+=widths[root]+120
     preferred={ref:left+available/2+(x-total/2)*min(1,available/max(1,total))
                for ref,x in preferred.items()}
-    # Pack each electrical depth without shrinking symbols. Dense ranks wrap
-    # onto additional rows; excessive depth remains a legibility warning.
-    rows=[]
-    for rank in sorted(set(depth.values())):
-        members=sorted((r for r in ids if depth[r]==rank and r!=service),
-                       key=lambda r:(preferred[r],natural_key(r)))
-        row=[]; used=0
-        for ref in members:
-            w=packing_width[ref]
-            if row and used+90+w>available:
-                rows.append(row); row=[]; used=0
-            row.append(ref); used+=w+(90 if len(row)>1 else 0)
-        if row: rows.append(row)
-    heights=[max(sizes[r][1]+(60 if r.startswith('KEYPAD-') else 0) for r in row) for row in rows]
-    y=90. if len(rows)>4 else 180.
-    gap=min(190.,max(36.,(doc.page_height-y-90-sum(heights))/max(1,len(rows)-1)))
+    # Measure captions as part of the footprint, then choose a packing that
+    # fits the sheet before placing or routing any equipment.
+    footprint_heights = {}
+    for ref, (w, h) in sizes.items():
+        probe = RiserElement(ref, 'device', ref, 0, 0, w, h, symbol_style='detailed')
+        footprint_heights[ref] = max([h] + [box[3] for box in caption_boxes(isolated, probe)])
+
+    def pack_rows(levels, spacing):
+        packed = []
+        for rank in sorted(set(levels.values())):
+            members = sorted((r for r in ids if levels[r] == rank and r != service),
+                             key=lambda r: (preferred[r], natural_key(r)))
+            row, used = [], 0
+            for ref in members:
+                w = packing_width[ref]
+                if row and used + spacing + w > available:
+                    packed.append(row)
+                    row, used = [], 0
+                row.append(ref)
+                used += w + (spacing if len(row) > 1 else 0)
+            if row:
+                packed.append(row)
+        heights = [max(footprint_heights[r] for r in row) for row in packed]
+        return packed, heights
+
+    # Terminal equipment can sit beside its feeding splitter on dense sheets.
+    # The splitter chain still flows down the page and wiring stays identical.
+    compact_depth = dict(depth)
+    for parent, leaves in children.items():
+        if parent == 'MSP':
+            continue
+        for child in leaves:
+            if not children[child] and child.startswith(('RSP-', 'KEYPAD-')):
+                compact_depth[child] = depth[parent]
+    for levels, spacing in ((depth, 90.), (depth, 54.), (compact_depth, 54.)):
+        rows, heights = pack_rows(levels, spacing)
+        y = 90. if len(rows) > 4 else 180.
+        if y + sum(heights) + 36 * (len(rows)-1) <= doc.page_height - 54:
+            break
+    gap = min(190., max(36., (doc.page_height-y-54-sum(heights))/max(1,len(rows)-1)))
+    columns = None
+    if levels is compact_depth:
+        columns = _branch_columns(children, roots, packing_width, footprint_heights,
+                                  sizes, left, right, doc.page_height)
     for row,height in zip(rows,heights):
         centers=[]; cursor=left
         for ref in row:
             w=packing_width[ref]
             cx=max(preferred[ref],cursor+w/2)
-            centers.append(cx); cursor=cx+w/2+90
+            centers.append(cx); cursor=cx+w/2+spacing
         # Backward packing compresses only overflowing gaps, never translates
         # the whole rank off the left edge to accommodate its final device.
         limit=right
         for i in range(len(row)-1,-1,-1):
             w=packing_width[row[i]]
             centers[i]=min(centers[i],limit-w/2)
-            limit=centers[i]-w/2-90
+            limit=centers[i]-w/2-spacing
         for ref,cx in zip(row,centers):
             w,h=sizes[ref]
             identity=isolated.device_location_ids[ref]
             doc.elements['device:'+ref]=RiserElement('device:'+ref,'device',ref,cx-w/2,y,w,h,
                                                     location_id='location:'+identity,symbol_style='detailed')
         y+=height+gap
+    if columns:
+        for ref, (x, y) in columns.items():
+            element = doc.elements['device:'+ref]
+            element.x, element.y = x, y
     if service:
         panel=doc.elements['device:MSP']; w,h=sizes[service]
         panel.x=max(panel.x,left+w+150)
@@ -147,9 +179,60 @@ def layout_presentation(design, *, title_source=None):
         source=doc.elements.get('device:'+edge.source.device_id)
         target=doc.elements.get('device:'+edge.target.device_id)
         if not source or not target: continue
+        if target.y == source.y and target.ref.startswith(('RSP-', 'KEYPAD-')):
+            target.input_side = 'left' if target.x > source.x else 'right'
         points=route_topology_connection(edge,source,target,obstacles,reserved_segments=reserved)
         previous=title_source.routes.get(edge.id) if title_source else None
         doc.routes[edge.id]=RiserRoute(edge.id,points,label_hidden=previous.label_hidden if previous else False)
         reserved.extend(_route_segments(points))
+        if columns:
+            # A crossing needs straight cable on both sides for a bridge hop.
+            # Keep later runs away from corners that would look like junctions.
+            for index, (x, y) in enumerate(points[1:-1]):
+                key = f'bend:{edge.id}:{index}'
+                obstacles.append(RiserElement(key, 'cable-bend', key, x-1, y-1, 2, 2))
     _place_route_labels(isolated,doc)
     return doc
+
+
+def _branch_columns(children, roots, packing_width, heights, sizes, left, right, page_height):
+    """Pack dense bus trees into independent columns with aligned splitter spines."""
+    branches = children['MSP'] + [ref for ref in roots if ref != 'MSP']
+    if not branches:
+        return None
+    columns = []
+    for branch in branches:
+        groups = []
+        def collect(ref):
+            leaves = [child for child in children[ref]
+                      if not children[child] and child.startswith(('RSP-', 'KEYPAD-'))]
+            groups.append([ref, *leaves])
+            for child in children[ref]:
+                if child not in leaves:
+                    collect(child)
+        collect(branch)
+        width = max(sum(packing_width[ref] for ref in group) + 54*(len(group)-1)
+                    for group in groups)
+        group_heights = [max(heights[ref] for ref in group) for group in groups]
+        columns.append((groups, width, group_heights))
+    gutter = 64.
+    total_width = sum(width for _, width, _ in columns) + gutter*(len(columns)-1)
+    panel_y = 54.
+    top = panel_y + sizes['MSP'][1] + 54
+    bottom = page_height - 72
+    if total_width > right-left or any(
+            sum(hs) + 30*(len(hs)-1) > bottom-top for _, _, hs in columns):
+        return None
+    result = {'MSP': ((left+right-sizes['MSP'][0])/2, panel_y)}
+    x = left + (right-left-total_width)/2
+    for groups, width, group_heights in columns:
+        gap = min(100., (bottom-top-sum(group_heights))/max(1,len(groups)-1))
+        y = top
+        for group, height in zip(groups, group_heights):
+            cursor = x
+            for ref in group:
+                result[ref] = (cursor+(packing_width[ref]-sizes[ref][0])/2, y)
+                cursor += packing_width[ref]+54
+            y += height+gap
+        x += width+gutter
+    return result

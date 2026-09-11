@@ -309,6 +309,7 @@ class EditorFrame(ctk.CTkFrame):
     def __init__(self, master, root, session: Session, *,
                  on_generate_worksheet=None, on_generate_chart=None,
                  on_generate_remotelink=None, on_generate_riser=None,
+                 on_toggle_fullscreen=None,
                  on_status_change=None, on_validation_change=None):
         super().__init__(master, fg_color="transparent")
         self.root = root
@@ -325,6 +326,7 @@ class EditorFrame(ctk.CTkFrame):
         self._on_generate_chart = self._guard_generation(on_generate_chart)
         self._on_generate_remotelink = self._guard_generation(on_generate_remotelink)
         self._on_generate_riser = self._guard_generation(on_generate_riser)
+        self._on_toggle_fullscreen = on_toggle_fullscreen
         self.on_status_change = on_status_change or (lambda text, dirty: None)
         self.on_validation_change = on_validation_change or (lambda text, ok: None)
         self._site_vars: dict[str, ctk.StringVar] = {}
@@ -478,7 +480,8 @@ class EditorFrame(ctk.CTkFrame):
             on_generate=self._on_generate_riser,
             on_remove_hardware=self._remove_riser_hardware,
             on_add_hardware=self._add_riser_hardware,
-            on_edit_hardware=self._edit_riser_hardware)
+            on_edit_hardware=self._edit_riser_hardware,
+            on_toggle_fullscreen=self._on_toggle_fullscreen)
         self.riser_tab.grid(row=0, column=0, sticky="nsew")
 
         self._build_footer()

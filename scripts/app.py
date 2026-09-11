@@ -281,6 +281,11 @@ class App:
         self.root.bind_all(f"<{mod}-e>", lambda _e=None: self._generate_worksheet())
         self.root.bind_all(f"<{mod}-d>", lambda _e=None: self._generate_door_chart())
         self.root.bind_all(f"<{mod}-r>", lambda _e=None: self._generate_riser())
+        self.root.bind_all("<F11>", self._toggle_fullscreen)
+        if sys.platform == "darwin":
+            self.root.bind_all("<Control-Command-f>", self._toggle_fullscreen)
+        self.root.bind("<Escape>", self._exit_fullscreen, add="+")
+        self.root.bind("<Configure>", self._window_view_changed, add="+")
 
         try:
             self.root.drop_target_register(DND_FILES)
@@ -419,6 +424,14 @@ class App:
                             command=self._generate_riser)
         self._menubar.add_cascade(label="Worksheet", menu=ws_menu)
 
+        # Native window state is shared by the menu and the riser toolbar.
+        self._view_menu = tk.Menu(self._menubar, tearoff=0,
+                                  postcommand=self._sync_fullscreen_controls)
+        self._view_menu.add_command(
+            label="Full screen", command=self._toggle_fullscreen,
+            accelerator="Ctrl+Cmd+F" if is_mac else "F11")
+        self._menubar.add_cascade(label="View", menu=self._view_menu)
+
         # ---- Help (always present — lowers the README-dependence) ----
         help_menu = tk.Menu(self._menubar, tearoff=0)
         help_menu.add_command(label="Field-Edit Workflow…",
@@ -438,6 +451,34 @@ class App:
         self._menubar.add_cascade(label="Help", menu=help_menu)
 
         self.root.configure(menu=self._menubar)
+
+    def _is_fullscreen(self):
+        return self.root.tk.getboolean(self.root.attributes("-fullscreen"))
+
+    def _sync_fullscreen_controls(self):
+        fullscreen = self._is_fullscreen()
+        self._view_menu.entryconfigure(
+            0, label="Exit full screen" if fullscreen else "Full screen")
+        if self.editor is not None:
+            self.editor.riser_tab.set_fullscreen(fullscreen)
+
+    def _toggle_fullscreen(self, _event=None):
+        self.root.attributes("-fullscreen", not self._is_fullscreen())
+        self._sync_fullscreen_controls()
+        return "break"
+
+    def _exit_fullscreen(self, _event=None):
+        if self._is_fullscreen():
+            self.root.attributes("-fullscreen", False)
+            self._sync_fullscreen_controls()
+            return "break"
+        return None
+
+    def _window_view_changed(self, event):
+        # Toplevel bindings also see child resizes. Only native window changes
+        # need to refresh state, including the macOS green full-screen button.
+        if event.widget is self.root:
+            self._sync_fullscreen_controls()
 
     def _refresh_file_menu(self):
         """Rebuild dynamic File-menu state each time it opens."""
@@ -1336,10 +1377,12 @@ class App:
             on_generate_chart=self._generate_door_chart,
             on_generate_remotelink=self._generate_remotelink,
             on_generate_riser=self._generate_riser,
+            on_toggle_fullscreen=self._toggle_fullscreen,
             on_status_change=self._on_editor_status,
             on_validation_change=self._on_editor_validation,
         )
         self.editor.grid(row=0, column=0, sticky="nsew")
+        self._sync_fullscreen_controls()
         if session.source_kind == "xlsx" and self.dmp_path is not None:
             # The imported worksheet IS the design as of right now — treat it
             # as in-sync so the door-chart staleness warning only fires for
@@ -2131,6 +2174,8 @@ class App:
             (f"{mod}+E", "Generate the DMP worksheet (next revision)"),
             (f"{mod}+D", "Generate the door chart (next revision)"),
             (f"{mod}+R", "Generate the vector riser bundle (next revision)"),
+            ("Ctrl+Cmd+F / F11" if sys.platform == "darwin" else "F11",
+             "Enter or exit full screen (Escape also exits)"),
             ("Delete / Backspace", "Hide selected callout; delete markup; confirm wire/device removal"),
             ("Arrow keys", "Nudge selected riser objects on the grid"),
             ("Double-click / Return / F2", "Edit the selected zone cell"),
