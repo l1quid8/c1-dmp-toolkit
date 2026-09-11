@@ -4,17 +4,14 @@ Pure mutations with capacity guards; no UI. The editor calls these, then
 re-syncs master zones and refreshes its tabs.
 
 Conventions encoded here:
-- Expander module N owns the fixed 16-zone address block
-  Z{501+16(N-1)}..Z{500+16N} regardless of model — the template's Point Info
-  sheet N is hard-wired to that Master stride, and DMP addressing assigns the
-  range by module address. A 714-8 only materializes its 8 real points; the
-  rest of the block stays unallocated (blank Master rows).
+- New expanders take an available consecutive 8- or 16-zone range on one
+  LX bus. Module IDs do not determine addresses; imported ranges stay intact.
 - The expander's last two physical points supervise its paired power supply
   (exact phrases 'PS-N: A/C LOSS' / 'PS-N: BATT. TRBL' — door-chart
   conditional formatting keys on them).
 - Zone addresses are physical: removal leaves a numbering gap, never
-  renumbers. Adding reuses the lowest free module number (a fresh expander
-  takes the free address).
+  renumbers. Adding reuses the lowest free module number and a fitting free
+  address range, which need not be the range of the removed module.
 """
 
 from __future__ import annotations
@@ -33,7 +30,9 @@ EXPANDER_MODELS = {"714-16": 16, "714-8": 8}
 
 ZONE_BLOCK = 16
 ZONE_BASE = 501
-MODULES_PER_BUS = 6   # each LX bus carries 6 modules; zone hundreds encode the bus
+MODULES_PER_BUS = 6   # legacy template layout: six 16-point sheets per bus
+LX_BUS_BASES = (500, 600, 700, 800, 900)
+LX_BUS_ZONE_COUNT = 100
 
 
 class HardwareError(Exception):
@@ -43,11 +42,10 @@ class HardwareError(Exception):
 # -------- expanders (RSP + paired PS + zone block) --------
 
 def zone_block_for(number: int) -> range:
-    """The 16-zone address block owned by expander module `number`.
+    """Return a module's nominal block in the original worksheet template.
 
-    DMP addressing is bus-based: bus 500 carries modules 1-6 (Z501-596),
-    bus 600 modules 7-12 (Z601-696), and so on — the Master template skips
-    Zx97-Zx00 at each bus boundary, so module 7 starts at Z601, not Z597.
+    Legacy formula relocation and PDF recovery use this template mapping.
+    It is not an allocation rule: live module ownership is always rsp.zones.
     """
     bus, slot = divmod(number - 1, MODULES_PER_BUS)
     start = ZONE_BASE + 100 * bus + ZONE_BLOCK * slot
@@ -63,23 +61,37 @@ def next_expander_number(design: DMPDesign) -> int:
 
 
 def block_orphans(design: DMPDesign, number: int) -> list[ZoneInfo]:
-    """Existing ZoneInfo entries inside module `number`'s address block that no
-    RSP owns. Real worksheets carry these (stray SPARE/PS rows on the Master
-    sheet beyond the installed expanders); adding an expander replaces them,
-    so the UI warns first when any holds a non-SPARE description."""
+    """Legacy inspection of unowned rows in a nominal template block.
+
+    Additions preserve these rows and allocate around them.
+    """
     block = set(zone_block_for(number))
-    return [z for z in design.zones if z.number in block]
+    owned = {zone for rsp in design.rsps for zone in rsp.zones}
+    return [z for z in design.zones if z.number in block and z.number not in owned]
+
+
+def _next_expander_zones(design: DMPDesign, points: int) -> list[int]:
+    """Find a whole free module range without moving or overwriting any zones."""
+    occupied = {zone for rsp in design.rsps for zone in rsp.zones}
+    occupied.update(z.number for z in design.zones)
+    occupied.update(z.number for z in design.master_zones)
+    for bus in LX_BUS_BASES:
+        # Keep the worksheet's usual first address x01. The x00 address is
+        # valid too: try a block starting there before leaving this bus.
+        starts = [*range(bus + 1, bus + LX_BUS_ZONE_COUNT - points + 1), bus]
+        for start in starts:
+            block = range(start, start + points)
+            if occupied.isdisjoint(block):
+                return list(block)
+    raise HardwareError(
+        f"No consecutive {points}-zone space is available on LX buses 500-900. "
+        "Existing zone addresses have been preserved."
+    )
 
 
 def add_expander(design: DMPDesign, model: str, location: str | None = None) -> RSP:
     if model not in EXPANDER_MODELS:
         raise HardwareError(f"Unknown expander model: {model}")
-    # A design parsed from an xlsx with uncached Point Info formulas carries
-    # its zone data only in master_zones. Materialize editable zones FIRST,
-    # or the next sync_master_zones would rebuild master from just the new
-    # expander's zones and wipe every existing description.
-    from session import ensure_editable_zones
-    ensure_editable_zones(design)
     if len(design.rsps) >= MAX_EXPANDERS:
         raise HardwareError(
             f"The worksheet template supports at most {MAX_EXPANDERS} expanders "
@@ -87,13 +99,13 @@ def add_expander(design: DMPDesign, model: str, location: str | None = None) -> 
         )
     number = next_expander_number(design)
     points = EXPANDER_MODELS[model]
-    block = list(zone_block_for(number))[:points]
+    block = _next_expander_zones(design, points)
 
-    # Absorb orphan zone rows already sitting in this block (stray SPARE/PS
-    # rows parsed from the Master sheet) — duplicates would corrupt the zone
-    # grid and the Master write. The number is free, so no RSP owns them.
-    full_block = set(zone_block_for(number))
-    design.zones = [z for z in design.zones if z.number not in full_block]
+    # Check capacity before mutating either representation. Uncached worksheet
+    # imports may have only Master records; materialize them before appending
+    # so the next sync preserves every existing description.
+    from session import ensure_editable_zones
+    ensure_editable_zones(design, merge_missing=True)
 
     rsp = RSP(number=number, location=location, zones=block, model=model)
     design.rsps.append(rsp)
@@ -124,11 +136,16 @@ def remove_expander(design: DMPDesign, number: int) -> None:
     if rsp is None:
         raise HardwareError(f"No expander #{number} in this design.")
     from session import ensure_editable_zones
-    ensure_editable_zones(design)  # same wipe guard as add_expander
-    block = set(zone_block_for(number))
+    ensure_editable_zones(design, merge_missing=True)
+    # A malformed import can claim a zone twice. Removing one module must not
+    # erase a surviving module's point. Never infer ownership from module ID.
+    surviving_zones = {zone for other in design.rsps if other is not rsp
+                       for zone in other.zones}
+    block = set(rsp.zones) - surviving_zones
     design.rsps.remove(rsp)
     design.power_supplies = [p for p in design.power_supplies if p.number != number]
     design.zones = [z for z in design.zones if z.number not in block]
+    design.master_zones = [z for z in design.master_zones if z.number not in block]
     _scrub_splitter_outputs(design, f"RSP-{number}")
     _scrub_splitter_outputs(design, f"RSP {number}")
 

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import re
 import shutil
+from copy import copy
 from datetime import date
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -45,11 +46,14 @@ from hardware import zone_block_for
 
 # Mapping: zone number → master row (bus-aligned)
 def zone_to_master_row(zone_num: int) -> int:
-    """501 -> 67, 596 -> 162, 601 -> 167, etc.  Returns 0 if out of range."""
-    if not (501 <= zone_num <= 996):
+    """Keep legacy rows for 501–996; append LX edge addresses. Invalid -> 0."""
+    if not (500 <= zone_num <= 999):
         return 0
-    # Linear: zone N (501..996) → row 67 + (N - 501). Door chart Master sheet's
-    # zone area starts at row 67 and runs to row 562.
+    # Zone 500 cannot take linear row 66: that is the zone-table header. Put it
+    # after the existing rows and 997–999 instead, keeping every old reference.
+    if zone_num == 500:
+        return 566
+    # Zone 501..999 maps to 67..565; the template already contains 67..562.
     return 67 + (zone_num - 501)
 
 
@@ -65,7 +69,7 @@ def rsp_block_anchor(rsp_number: int) -> int:
 
 # -------- surgical presentation edits --------
 #
-# The Master data sheet is a clean CONTIGUOUS zone list (zone N → row zone_to_master_row).
+# The Master data sheet keeps stable zone rows (zone N → row zone_to_master_row).
 # The presentation tabs' fixed block anchors only line up with that when every module is
 # 16-port; each 8-port module shifts every later block's source rows by 8. So we retarget
 # each block's =Master! references to its RSP's real contiguous rows (and reshape 8-port
@@ -782,8 +786,8 @@ def inject(template_path: Path, dmp_design: DMPDesign, output_path: Path) -> Non
     if dmp_design.site_info.address_line2:
         header["B5"] = dmp_design.site_info.address_line2
 
-    # 2. Master sheet — zone area (rows 67-562). A clean CONTIGUOUS zone list: zone N at
-    # zone_to_master_row(N). The presentation tabs are retargeted to these rows later.
+    # 2. Master sheet — existing zone rows 67–562 plus occupied LX edge addresses.
+    # The presentation tabs are retargeted through zone_to_master_row later.
     master = wb["Master"]
     n_rooms = 0
     n_spares = 0
@@ -797,6 +801,17 @@ def inject(template_path: Path, dmp_design: DMPDesign, output_path: Path) -> Non
     # Only real zones (those owned by an actual RSP module) get written — the worksheet's
     # Master can carry PS-N placeholder rows for modules that don't exist.
     rsp_zone_set = {z for rsp in dmp_design.rsps for z in rsp.zones}
+
+    occupied_zones = rsp_zone_set | {
+        z.number for z in dmp_design.master_zones
+        if not rsp_zone_set or z.number in rsp_zone_set
+    }
+    occupied_rows = {zone_to_master_row(z) for z in occupied_zones}
+    for row in sorted(row for row in occupied_rows if row > 562):
+        for column in range(1, 5):
+            master.cell(row, column)._style = copy(master.cell(562, column)._style)
+            master.cell(row, column).value = None
+        master.row_dimensions[row].height = master.row_dimensions[562].height
 
     for z in dmp_design.master_zones:
         if rsp_zone_set and z.number not in rsp_zone_set:

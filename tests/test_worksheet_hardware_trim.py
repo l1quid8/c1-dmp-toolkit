@@ -107,3 +107,18 @@ def test_sparse_device_ids_do_not_create_placeholders_or_lose_relay_data(tmp_pat
         assert actual.location == expected.location
         for relay in (2, 3, 4):
             assert actual.relays[relay] == expected.relays[relay]
+
+
+@pytest.mark.parametrize("count", [8, 15, 30])
+def test_power_supply_import_keeps_every_block_and_its_final_relays(tmp_path, count):
+    design = DMPDesign(power_supplies=[
+        PowerSupply(n, f"PS ROOM {n}", {2: f"AC {n}", 3: f"BATT {n}", 4: "Spare"})
+        for n in range(1, count + 1)
+    ])
+    output = tmp_path / "power-supply-roundtrip.xlsx"
+    write_dmp_xlsx(design, TEMPLATE, output)
+    actual = parse_dmp_worksheet(output).power_supplies
+    assert [ps.number for ps in actual] == list(range(1, count + 1))
+    for ps, expected in zip(actual, design.power_supplies):
+        assert ps.location == expected.location
+        assert ps.relays == expected.relays

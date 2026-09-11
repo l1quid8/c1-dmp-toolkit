@@ -303,16 +303,22 @@ def design_from_dict(d: dict) -> DMPDesign:
 # what the door chart consumes. Editors mutate zones, then call
 # sync_master_zones before any save or export.
 
-def ensure_editable_zones(design: DMPDesign) -> None:
+def ensure_editable_zones(design: DMPDesign, *, merge_missing: bool = False) -> None:
     """Synthesize editable ZoneInfo rows when only master_zones exist.
 
     Happens when a worksheet was loaded whose Point Info formulas were never
     evaluated by Excel (openpyxl data_only=True reads None), so the parser got
     master_zones but no zones.
+
+    Hardware mutations can request merge_missing to retain Master-only rows
+    from partial imports while keeping already edited ZoneInfo objects intact.
     """
-    if design.zones or not design.master_zones:
+    if (design.zones and not merge_missing) or not design.master_zones:
         return
+    existing = {zone.number for zone in design.zones}
     for mz in design.master_zones:
+        if mz.number in existing:
+            continue
         if mz.is_spare:
             loc, dtype = "SPARE", "Spare"
         elif mz.is_ps_ac or mz.is_ps_batt:
@@ -321,6 +327,7 @@ def ensure_editable_zones(design: DMPDesign) -> None:
             loc, dtype = mz.description, "Motion"
         design.zones.append(ZoneInfo(number=mz.number, location=loc,
                                      device_type=dtype, partition=1))
+        existing.add(mz.number)
 
 
 def normalize_zone_descriptions(design: DMPDesign) -> None:

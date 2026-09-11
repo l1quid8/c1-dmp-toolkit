@@ -81,6 +81,27 @@ def test_no_false_zone_from_noise_lines():
     assert set(zones) == {510}
 
 
+def test_ocr_missing_separator_and_rsp_digit_artifact_keep_spare_and_ac_zones():
+    """4th St OCR read Z547/RSP4 as 2547/RSPA4 and Z574/RSP6 without its slash."""
+    text = "\n".join([
+        "2546/RSP4", "SPARE",
+        "2547/RSPA4", "NORTH BLDG", "1ST FLR", "CLASSROOM 17A", "N/A", "AC POWER",
+        "2548/RSP4", "NORTH BLDG", "1ST FLR", "CLASSROOM 17A", "N/A", "BATTERY TROUBLE",
+        "7573/RSP6", "BLDG BB 219", "2ND FLR", "CLASSROOM 37", "EXISTING", "(E)WP240",
+        "7574RSP6", "SPARE",
+        "7575/RSP6", "SPARE",
+    ])
+    zones = _by_num(extract_zones(text))
+    assert set(zones) == {546, 547, 548, 573, 574, 575}
+    assert zones[546].is_spare and not zones[546].is_ps_ac
+    assert zones[547].rsp == 4 and zones[547].is_ps_ac
+    assert zones[547].room == "CLASSROOM 17A"
+    assert not zones[547].is_ps_batt
+    assert zones[548].is_ps_batt and not zones[548].is_ps_ac
+    assert zones[573].room == "CLASSROOM 37"
+    assert zones[574].rsp == 6 and zones[574].is_spare
+
+
 def test_title_block_address_accepts_street_name_without_suffix():
     """Some C1 title blocks omit AVE/ST even though the site address is valid."""
     text = "\n".join([
@@ -146,4 +167,42 @@ def test_combus_rows_survive_reordered_zone_schedule_text_before_table():
         ("KEYPAD", 2, "MAIN OFFICE"),
         ("KEYPAD", 3, "CAFE MANAGER'S OFFICE"),
         ("KEYPAD", 4, "CLERK'S AREA"),
+    ]
+
+
+def test_combus_inline_building_does_not_turn_supply_reference_into_a_location():
+    """OCR can join the ID and building cells while leaving the rest separate."""
+    text = "\n".join([
+        "COMBUS LINES (RSP & KEYPADS)",
+        "RSP5", "BUILDING A", "1ST FLR", "DATA ROOM", "MSP", "(N)AQC240",
+        "RSP7", "BUILDING B", "1ST FLR", "STORAGE", "MSP", "(N)AQC240",
+        "KEYPAD 7 | BUILDING A", "1ST FLR", "WAITING AREA (NE)", "RSP5", "(E)WP240",
+        "KEYPAD 8", "BUILDING B", "1ST FLR", "KITCHEN (SW)", "RSP7", "(E)WP240",
+    ])
+
+    rows = extract_combus_lines(text)
+
+    assert [(row.kind, row.n, row.building, row.room, row.fed_from, row.cable_type)
+            for row in rows] == [
+        ("RSP", 5, "BUILDING A", "DATA ROOM", "MSP", "(N)AQC240"),
+        ("RSP", 7, "BUILDING B", "STORAGE", "MSP", "(N)AQC240"),
+        ("KEYPAD", 7, "BUILDING A", "WAITING AREA (NE)", "RSP5", "(E)WP240"),
+        ("KEYPAD", 8, "BUILDING B", "KITCHEN (SW)", "RSP7", "(E)WP240"),
+    ]
+
+
+def test_combus_incomplete_row_cannot_consume_cable_or_next_equipment_row():
+    text = "\n".join([
+        "COMBUS LINES (RSP & KEYPADS)",
+        "RSP5", "(E)WP240",
+        "KEYPAD 8", "BUILDING B", "1ST FLR", "KITCHEN", "MSP", "(E)WP240",
+        "RSP7", "BUILDING C",
+        "KEYPAD 9", "BUILDING C", "1ST FLR", "OFFICE", "MSP", "(E)WP240",
+    ])
+
+    rows = extract_combus_lines(text)
+
+    assert [(row.kind, row.n, row.building, row.room) for row in rows] == [
+        ("KEYPAD", 8, "BUILDING B", "KITCHEN"),
+        ("KEYPAD", 9, "BUILDING C", "OFFICE"),
     ]

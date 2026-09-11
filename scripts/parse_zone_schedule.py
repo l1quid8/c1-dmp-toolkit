@@ -57,17 +57,23 @@ class ParsedDesign:
 
 # -------- helpers --------
 
-# 3 zone digits immediately followed by "/RSP{n}". Found with .search (not anchored):
+# 3 zone digits followed by "/RSP{n}". Found with .search (not anchored):
 # OCR sometimes prepends a floating callout annotation onto the cell line, e.g.
 # "(MAIN OFFICE, BUILDING | 7557/RSP5", which an anchored match would skip — silently
 # dropping that zone. Anchoring the capture on the 3 digits before "/RSP" also absorbs the
 # common leading-'Z'-misread (Z->7/2/1) without special-casing it: only the trailing 3
-# digits matter ("7557/RSP5" -> "557"). normalize_zone_number's range guard rejects stray hits.
-ZONE_NUMBER_RE = re.compile(r"(\d{3})/RSP(\d+)")
+# digits matter ("7557/RSP5" -> "557"). Some drawings omit the slash ("Z574RSP6"),
+# and OCR can read the 4 in RSP4 as A4 ("2547/RSPA4"). Keep these rows too.
+# normalize_zone_number's range guard rejects stray hits.
+ZONE_NUMBER_RE = re.compile(r"(\d{3})\s*/?\s*RSP(?:A)?(\d+)", re.IGNORECASE)
 
 # Identifier-only forms (when each table cell lands on its own line)
 COMBUS_RSP_ID_RE = re.compile(r"^RSP\s*(\d+)\s*$", re.IGNORECASE)
 COMBUS_KP_ID_RE  = re.compile(r"^KEYPAD\s+(\d+)\s*$", re.IGNORECASE)
+# OCR can place the first two cells on one line, sometimes including a table rule.
+COMBUS_ROW_RE = re.compile(
+    r"^(?:RSP\s*(?P<rsp>\d+)|KEYPAD\s+(?P<keypad>\d+))"
+    r"(?:\s*\|\s*|\s+|$)(?P<building>.*)$", re.IGNORECASE)
 
 # Sub-table label rows that appear interspersed in the zone schedule (e.g. "RSP 1", "RSp 4")
 RSP_LABEL_RE = re.compile(r"^RS[Pp]\s+\d+\s*$")
@@ -225,7 +231,8 @@ def extract_combus_lines(text: str) -> list[CombusLine]:
     Plus the OCR may insert noise lines between rows (page sidebar text, addresses).
 
     Strategy:
-      1. Take the first 3 cells positionally (building, floor, room).
+      1. Read the ID, allowing a building cell joined to it by OCR, then collect
+         building, floor and room without crossing a cable cell or another row.
       2. For the remaining cells, classify each by content (cable_type vs fed_from
          patterns) and skip lines that match neither.
       3. Stop at the next ID line or after consuming a bounded number of attempts.
@@ -253,7 +260,7 @@ def extract_combus_lines(text: str) -> list[CombusLine]:
             break
     if table_header is not None:
         for idx in range(table_header + 1, min(len(lines), table_header + 20)):
-            if COMBUS_RSP_ID_RE.match(lines[idx]) or COMBUS_KP_ID_RE.match(lines[idx]):
+            if COMBUS_ROW_RE.match(lines[idx]):
                 start = idx
                 break
 
@@ -265,7 +272,7 @@ def extract_combus_lines(text: str) -> list[CombusLine]:
             end = idx
             break
 
-    cable_re = re.compile(r"^\([NE]\)[A-Z0-9]+", re.IGNORECASE)
+    cable_re = re.compile(r"^\([NE]\)\s*(?:\(\d+\)\s*)?[A-Z0-9]+", re.IGNORECASE)
     fed_re = re.compile(r"^(MSP|RSP\s*\d+)\s*$", re.IGNORECASE)
     msp_re = re.compile(r"^MSP\s*$", re.IGNORECASE)
 
@@ -277,20 +284,26 @@ def extract_combus_lines(text: str) -> list[CombusLine]:
             i += 1
             continue
 
-        m_rsp = COMBUS_RSP_ID_RE.match(s)
-        m_kp = COMBUS_KP_ID_RE.match(s)
-        if not (m_rsp or m_kp):
+        row = COMBUS_ROW_RE.match(s)
+        if row is None:
             i += 1
             continue
 
-        # Take the first 3 positional cells (building, floor, room).
-        positional: list[str] = []
+        building = row.group('building').strip()
+        positional: list[str] = [building] if building else []
         j = i + 1
         while j < end and len(positional) < 3:
             t = lines[j]
+            if cable_re.match(t) or COMBUS_ROW_RE.match(t):
+                break
             if t:
                 positional.append(t)
             j += 1
+        # An orphaned FED FROM reference is not a new RSP. In particular, never
+        # let its following cable cell and the next keypad overwrite a real RSP.
+        if len(positional) != 3 or any(cable_re.match(t) for t in positional):
+            i = j
+            continue
 
         # For cells 4 and 5 (cable_type and fed_from in either order): consume cells
         # that match cable or fed patterns. Stop on the FIRST line that's neither
@@ -324,8 +337,8 @@ def extract_combus_lines(text: str) -> list[CombusLine]:
             # or a next-entry ID (caught on next outer-loop iteration).
             break
 
-        kind = "RSP" if m_rsp else "KEYPAD"
-        n = int((m_rsp or m_kp).group(1))
+        kind = "RSP" if row.group('rsp') else "KEYPAD"
+        n = int(row.group('rsp') or row.group('keypad'))
         out.append(CombusLine(
             kind=kind,
             n=n,
@@ -429,10 +442,10 @@ def backfill_missing_expander_points(
 
     The large-format schedule OCRs unreliably, and SPARE rows — carrying only the
     word "SPARE" — are the first to vanish (Shirley RSP1 lost Z508-Z514; Toluca
-    lost Z557/Z573). Those points are real: DMP addressing gives expander module N
-    the contiguous block ``zone_block_for(N)``, and the worksheet/door chart must
-    list every physical point. The dropped rows can't be recovered from text, so
-    we rebuild them from the module's point count.
+    lost Z557/Z573). For layouts matching the original template's nominal
+    ``zone_block_for(N)``, rebuild those physical points from the module's point
+    count. If any observed point falls outside that block, preserve the drawing's
+    assignment instead of inferring addresses from its RSP number.
 
     That count is *derived*, never assumed: the module's last two physical points
     supervise its paired power supply (``is_ps_ac`` at points-2, ``is_ps_batt`` at
@@ -443,12 +456,14 @@ def backfill_missing_expander_points(
 
     Only backfills modules in ``installed_rsps`` (the RSPs COMBUS LINES actually
     lists) when given, so stray zones for a phantom RSP number don't spawn spares.
-    Purely additive — existing records are never modified. Returns the new list
-    (sorted by zone number) and the count of records added.
+    Purely additive — existing records are never modified, and a recorded address
+    is never claimed by another RSP. Returns the new list (sorted by zone number)
+    and the count of records added.
     """
     from hardware import zone_block_for, ZONE_BLOCK
 
     by_rsp: dict[int, list[ZoneRecord]] = {}
+    occupied = {int(z.zone[1:]) for z in zones}
     for z in zones:
         by_rsp.setdefault(z.rsp, []).append(z)
 
@@ -458,15 +473,14 @@ def backfill_missing_expander_points(
             continue
         block = list(zone_block_for(rsp_num))
         base = block[0]
+        if any(int(r.zone[1:]) not in block for r in recs):
+            continue
 
-        # Offsets present within this module's block (ignore any stray out-of-block
-        # zone the parser may have mis-assigned to this RSP).
+        # This module's observed addresses fit the nominal template block.
         present: set[int] = set()
         batt_off = ac_off = None
         for r in recs:
             off = int(r.zone[1:]) - base
-            if not (0 <= off < ZONE_BLOCK):
-                continue
             present.add(off)
             if r.is_ps_batt:
                 batt_off = off
@@ -486,9 +500,11 @@ def backfill_missing_expander_points(
         points = min(points, ZONE_BLOCK)
 
         for off in range(points):
-            if off not in present:
-                added.append(ZoneRecord(zone=f"Z{base + off}", rsp=rsp_num,
+            number = base + off
+            if off not in present and number not in occupied:
+                added.append(ZoneRecord(zone=f"Z{number}", rsp=rsp_num,
                                         is_spare=True))
+                occupied.add(number)
 
     if not added:
         return zones, 0

@@ -1,9 +1,8 @@
 """Tests for hardware.py — post-CAD add/remove of expanders/splitters/keypads.
 
-The zone-block contract is the load-bearing part: expander module N always
-owns the fixed 16-zone address stride (Point Info sheet N is hard-wired to
-it), a 714-8 materializes only 8 points, and removal leaves numbering gaps
-rather than renumbering physical addresses.
+Expanders allocate complete free ranges of the selected size. Existing zone
+addresses survive additions and removals; module numbers identify hardware,
+while zone_block_for retains the original template's formula-anchor mapping.
 
 Run: pytest tests/test_hardware.py
 """
@@ -71,19 +70,17 @@ def test_add_714_16():
     assert by_num[515].device_type == "Supervisory"
 
 
-def test_add_714_8_consumes_full_address_block():
+def test_add_714_8_consumes_only_eight_addresses():
     d = _design_with_expanders(1)
     rsp = add_expander(d, "714-8")
     assert rsp.number == 2 and rsp.model == "714-8"
-    # 8 real points inside module 2's 16-zone stride (Z517..Z532)
     assert rsp.zones == list(range(517, 525))
     by_num = {z.number: z for z in d.zones}
     assert by_num[523].location == "PS-2: A/C LOSS"
     assert by_num[524].location == "PS-2: BATT. TRBL"
-    assert 525 not in by_num            # rest of the block unallocated
-    # A later expander still gets the NEXT stride, not a packed one
+    assert 525 not in by_num
     rsp3 = add_expander(d, "714-16")
-    assert rsp3.zones[0] == 533
+    assert rsp3.zones == list(range(525, 541))
 
 
 def test_unknown_model_rejected():
@@ -107,8 +104,8 @@ def test_gap_reuse_after_removal():
 
 
 def test_bus_boundary_addressing():
-    """Bus 500 carries modules 1-6 (Z501-596); module 7 starts bus 600 at
-    Z601 (the template's Master skips Z597-600), module 13 starts bus 700."""
+    """Legacy template anchors stay fixed; six 16-point modules leave too
+    little space on Bus500 for another complete 8-point module."""
     assert list(zone_block_for(6))[0] == 581
     assert list(zone_block_for(7))[0] == 601
     assert list(zone_block_for(12))[0] == 681
@@ -254,10 +251,8 @@ def test_remove_keypad_scrubs_outputs():
     assert d.splitters[0].outputs == ["Spare", "Spare", "Spare"]
 
 
-def test_add_expander_absorbs_orphan_block_zones():
-    """Real worksheets carry stray SPARE/PS zone rows beyond the installed
-    expanders (a legacy design has 47). Adding an expander into such a block must
-    replace them — duplicates corrupt the zone grid and Master write."""
+def test_add_expander_preserves_unowned_existing_zone_rows():
+    """An existing point reserves its address even when no RSP owns it."""
     d = _design_with_expanders(1)
     # Orphans sitting in module 2's block (Z517-532), owned by no RSP
     d.zones.append(ZoneInfo(number=517, location="SPARE", device_type="Spare", partition=1))
@@ -271,8 +266,10 @@ def test_add_expander_absorbs_orphan_block_zones():
     numbers = [z.number for z in d.zones]
     assert len(numbers) == len(set(numbers)), "duplicate zone numbers"
     by_num = {z.number: z for z in d.zones}
-    assert by_num[517].location == "SPARE"          # fresh row, not the orphan
-    assert by_num[531].location == "PS-2: A/C LOSS"  # orphan replaced
+    assert rsp.zones == list(range(532, 548))
+    assert by_num[517].location == "SPARE"
+    assert by_num[531].location == "OLD STORAGE"
+    assert by_num[546].location == "PS-2: A/C LOSS"
 
 
 def test_add_expander_materializes_zones_from_master():

@@ -68,3 +68,35 @@ def test_no_ps_zone_falls_back_by_max_offset():
     zones = [_rec(501, 1), _rec(512, 1)]                       # offset 11 -> 16-point
     out, added = backfill_missing_expander_points(zones, installed_rsps={1})
     assert _nums(out, rsp=1) == list(range(501, 517))
+
+
+def test_compact_import_with_out_of_order_module_ids_keeps_its_real_ownership():
+    """RSP IDs do not imply addresses on drawings with mixed module sizes."""
+    zones = [_rec(n, 2, is_spare=n < 507, is_ps_ac=n == 507, is_ps_batt=n == 508)
+             for n in range(501, 509)]
+    zones.extend(_rec(n, 1, is_spare=n < 523, is_ps_ac=n == 523, is_ps_batt=n == 524)
+                 for n in range(509, 525))
+    out, added = backfill_missing_expander_points(zones, installed_rsps={1, 2})
+    assert added == 0
+    assert out == zones
+    assert _nums(out, rsp=2) == list(range(501, 509))
+    assert _nums(out, rsp=1) == list(range(509, 525))
+
+
+def test_backfill_never_claims_an_address_already_recorded_for_another_rsp():
+    """Even an uninstalled owner's recorded point is evidence to preserve."""
+    zones = [_rec(501, 1), _rec(515, 1, is_ps_ac=True),
+             _rec(516, 1, is_ps_batt=True), _rec(510, 2)]
+    out, added = backfill_missing_expander_points(zones, installed_rsps={1})
+    assert added == 12
+    assert _nums(out) == list(range(501, 517))
+    assert [r.rsp for r in out if r.zone == "Z510"] == [2]
+    assert all(r in out for r in zones)
+
+
+def test_non_nominal_range_does_not_invent_points_before_the_drawn_start():
+    zones = [_rec(n, 1, is_spare=n < 523, is_ps_ac=n == 523, is_ps_batt=n == 524)
+             for n in range(509, 525)]
+    out, added = backfill_missing_expander_points(zones, installed_rsps={1})
+    assert added == 0
+    assert out == zones

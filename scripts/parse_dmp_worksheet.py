@@ -427,7 +427,9 @@ def _parse_power_supplies(ws) -> list[PowerSupply]:
     power_supplies: list[PowerSupply] = []
     current_ps: Optional[PowerSupply] = None
 
-    for row in ws.iter_rows(min_row=2, max_row=30, values_only=True):
+    # Each supply occupies four rows; the template carries up to 30 complete
+    # blocks. A fixed row-30 cutoff loses PS8's relays and every later supply.
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=True):
         if not row:
             continue
 

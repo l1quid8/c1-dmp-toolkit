@@ -987,6 +987,71 @@ def _trim_hardware_sheet(ws, last_row: int) -> None:
         cell.border = border
 
 
+def _write_xr550_buses(ws, rsps: list[RSP]) -> None:
+    """Expand the template's LX-bus groups around each module's actual zones.
+
+    Six rows fit six 16-point modules, but packed 8-point modules can put more
+    RSPs on one bus. Module numbers alone do not identify the bus on imports.
+    Keep modules with missing or ambiguous addresses visible for review.
+    """
+    groups: dict[int | None, list[RSP]] = {bus: [] for bus in range(500, 901, 100)}
+    for rsp in rsps:
+        buses = {zone // 100 * 100 for zone in rsp.zones}
+        bus = next(iter(buses)) if len(buses) == 1 else None
+        # Each LX bus occupies its whole hundred-address band (500-599,
+        # 600-699, ...). Imported layouts can use x00 and x97-x99 as well.
+        groups.setdefault(bus if bus in groups else None, []).append(rsp)
+
+    first_styles = [copy(ws.cell(13, col)._style) for col in range(1, 6)]
+    body_styles = [copy(ws.cell(14, col)._style) for col in range(1, 6)]
+    bus_style = copy(ws["A19"]._style)
+    bottom_edges = [copy(ws.cell(42, col).border.bottom) for col in range(1, 6)]
+    row_height = ws.row_dimensions[14].height
+    old_last_row = ws.max_row
+    # Rebuild only the bus table. Moving rows without rebuilding merges would
+    # leave the expanded Bus 500 rows inside the old Bus 600 label/location cells.
+    for merged in list(ws.merged_cells.ranges):
+        if merged.min_row >= 13:
+            ws.unmerge_cells(str(merged))
+    ws.delete_rows(13, old_last_row - 12)
+    for row in list(ws.row_dimensions):
+        if row >= 13:
+            del ws.row_dimensions[row]
+    ws.row_breaks.brk = [item for item in ws.row_breaks.brk if item.id < 13]
+
+    last_row = 12 + sum(max(6, len(modules)) for modules in groups.values())
+    row = 13
+    for bus, modules in groups.items():
+        start_row = row
+        for offset in range(max(6, len(modules))):
+            ws.row_dimensions[row].height = row_height
+            styles = first_styles if row == 13 else body_styles
+            for col, style in enumerate(styles, 1):
+                cell = ws.cell(row, col)
+                cell._style = copy(style)
+                if row == last_row:
+                    border = copy(cell.border)
+                    border.bottom = bottom_edges[col - 1]
+                    cell.border = border
+            ws.merge_cells(start_row=row, start_column=4, end_row=row, end_column=5)
+            if offset < len(modules):
+                rsp = modules[offset]
+                ws.cell(row, 2, f"{rsp.model or '714-16'}-{rsp.number}")
+                if rsp.zones:
+                    ws.cell(row, 3, f"{min(rsp.zones)}-{max(rsp.zones)}")
+                ws.cell(row, 4, rsp.location)
+            row += 1
+        anchor = ws.cell(start_row, 1)
+        anchor._style = copy(first_styles[0] if start_row == 13 else bus_style)
+        anchor.value = f"LX Bus {bus}" if bus is not None else "Bus needs review"
+        if row - 1 == last_row:
+            border = copy(anchor.border)
+            border.bottom = bottom_edges[0]
+            anchor.border = border
+        ws.merge_cells(start_row=start_row, start_column=1, end_row=row - 1, end_column=1)
+    ws.print_area = f"A1:E{last_row}"
+
+
 def dmp_filename(school_slug: str, stamp: str | None = None,
                  date_str: str | None = None) -> str:
     """Output filename for a generated DMP worksheet.
@@ -1058,22 +1123,7 @@ def write_dmp_xlsx(design: DMPDesign, template_path: Path, output_path: Path,
     # D4 (merged D:E anchor) holds the panel location — writing to E4 would silently drop.
     _write_cell_safe(ws, "D4", design.site_info.xr550_location)
 
-    # LX Bus 500/600/... sub-tables (rows 13-42). Clear all template defaults in B/C/D
-    # (leave column A intact — it has the merged "LX Bus 500/600/..." group labels)
-    # then write one row per RSP into the Bus 500 block.
-    for r in range(13, 43):
-        for col in ("B", "C", "D"):
-            try:
-                ws[f"{col}{r}"].value = None
-            except Exception:
-                pass
-    for i, rsp in enumerate(design.rsps[:6]):
-        row = 13 + i
-        if rsp.zones:
-            zmin, zmax = min(rsp.zones), max(rsp.zones)
-            _write_cell_safe(ws, f"B{row}", f"{getattr(rsp, 'model', '') or '714-16'}-{rsp.number}")
-            _write_cell_safe(ws, f"C{row}", f"{zmin}-{zmax}")
-        _write_cell_safe(ws, f"D{row}", rsp.location)
+    _write_xr550_buses(ws, design.rsps)
 
     # DMP 714 Exp Mod sheet
     ws = wb["DMP 714 Exp Mod"]
@@ -1101,17 +1151,29 @@ def write_dmp_xlsx(design: DMPDesign, template_path: Path, output_path: Path,
 
     # Keypad sheet
     ws = wb["Keypad"]
-    # Clear rows 3-30 first
-    for clear_row in range(3, 31):
-        for col in ["A", "B", "C", "D", "E"]:
-            try:
-                ws[f"{col}{clear_row}"].value = None
-            except:
-                pass
+    # The template formats only six keypads. Snapshot its first/body row styles
+    # and closing border before trimming, then format every actual device row.
+    first_styles = [copy(ws.cell(3, col)._style) for col in range(1, 5)]
+    body_styles = [copy(ws.cell(4, col)._style) for col in range(1, 5)]
+    bottom_edges = [copy(ws.cell(8, col).border.bottom) for col in range(1, 5)]
+    keypad_row_height = ws.row_dimensions[3].height
+    last_keypad_row = 2 + len(design.keypads)
+    _trim_hardware_sheet(ws, last_keypad_row)
+    ws.print_title_rows = "1:2"
 
     row_start = 3
     for i, kp in enumerate(design.keypads):
         row = row_start + i
+        ws.row_dimensions[row].height = keypad_row_height
+        styles = first_styles if i == 0 else body_styles
+        for col in range(1, 5):
+            cell = ws.cell(row, col)
+            cell.value = None
+            cell._style = copy(styles[col - 1])
+            if row == last_keypad_row:
+                border = copy(cell.border)
+                border.bottom = bottom_edges[col - 1]
+                cell.border = border
         _write_cell_safe(ws, f"A{row}", kp.number)
         _write_cell_safe(ws, f"B{row}", kp.source or "")
         _write_cell_safe(ws, f"C{row}", "Y" if kp.global_keypad else "N")
@@ -1268,7 +1330,7 @@ def write_dmp_xlsx(design: DMPDesign, template_path: Path, output_path: Path,
             if m:
                 wb[name].title = f"DMP 714-16 Point Info ({m.group(1)})"
 
-    # Master sheet: column A holds zone labels (Z501, Z502, ..., Z981) and column B holds
+    # Master sheet: column A holds zone labels (Z501, Z502, ..., Z996) and column B holds
     # zone descriptions. Build a zone_num -> master_row map by reading the existing labels
     # (Master has jumps at Z596->Z601 and Z696->Z701 for LX bus boundaries, so direct
     # arithmetic isn't safe — read the labels instead).
@@ -1289,6 +1351,29 @@ def write_dmp_xlsx(design: DMPDesign, template_path: Path, output_path: Path,
                 except ValueError:
                     pass
 
+        # The template reserves only x01-x96. Preserve its existing row numbers
+        # and append any occupied x00/x97-x99 addresses, so formulas continue to
+        # resolve without renumbering an imported design or shifting old rows.
+        occupied_zones = {z for rsp in design.rsps for z in rsp.zones}
+        occupied_zones.update(zone.number for zone in design.zones)
+        occupied_zones.update(zone.number for zone in design.master_zones)
+        missing_zones = sorted(z for z in occupied_zones if 500 <= z <= 999 and z not in zone_to_row)
+        last_template_row = master.max_row
+        master_styles = [copy(master.cell(last_template_row, col)._style) for col in (1, 2)]
+        for znum in missing_zones:
+            row = master.max_row + 1
+            for col, style in enumerate(master_styles, 1):
+                master.cell(row, col)._style = copy(style)
+            master.cell(row, 1, f"Z{znum}")
+            master.row_dimensions[row].height = master.row_dimensions[last_template_row].height
+            zone_to_row[znum] = row
+        if missing_zones:
+            for table in master.tables.values():
+                if table.ref == f"A1:B{last_template_row}":
+                    table.ref = f"A1:B{master.max_row}"
+                    if table.autoFilter is not None:
+                        table.autoFilter.ref = table.ref
+
         # Map each zone to its RSP and position-within-RSP. Within an RSP's 16-zone block,
         # the second-to-last zone is the A/C-loss supervisory and the last is BATT.
         zone_to_rsp_meta: dict[int, tuple[int, str]] = {}  # zone_num -> (rsp_num, "AC"|"BATT"|"NORMAL")
@@ -1303,6 +1388,16 @@ def write_dmp_xlsx(design: DMPDesign, template_path: Path, output_path: Path,
                     zone_to_rsp_meta[znum] = (rsp.number, "NORMAL")
 
         center = Alignment(horizontal="center", vertical="center")
+        # Template PS labels are examples for nominal modules, not project data.
+        # Clear them all, restore authoritative Master-only descriptions, then
+        # let editable zone rows override those values (including explicit blanks).
+        for row in zone_to_row.values():
+            master.cell(row, 2).value = None
+        for zone in design.master_zones:
+            row = zone_to_row.get(zone.number)
+            if row is not None:
+                master.cell(row, 2).value = zone.description
+                master.cell(row, 2).alignment = center
         for zone in design.zones:
             row = zone_to_row.get(zone.number)
             if row is None:
@@ -1580,6 +1675,7 @@ def _overlay_openpyxl_changes(template_path: Path, openpyxl_tmp_path: Path, outp
     # Read openpyxl's modified files
     overlays: dict[str, bytes] = {}
     new_parts: dict[str, bytes] = {}
+    table_ranges: dict[str, str] = {}
     with zipfile.ZipFile(openpyxl_tmp_path) as zop:
         names = set(zop.namelist())
         for name in names:
@@ -1590,6 +1686,10 @@ def _overlay_openpyxl_changes(template_path: Path, openpyxl_tmp_path: Path, outp
                 overlays[name] = zop.read(name)
             elif name in NEW_PARTS:
                 new_parts[name] = zop.read(name)
+            elif name.startswith("xl/tables/") and name.endswith(".xml") and "_rels" not in name:
+                table_ref = _re.search(r'<table\b[^>]*\bref="([^"]+)"', zop.read(name).decode("utf-8"))
+                if table_ref:
+                    table_ranges[name] = table_ref.group(1)
 
     # Start from the template (binary copy preserves everything Excel needs)
     shutil.copy(template_path, output_path)
@@ -1626,6 +1726,18 @@ def _overlay_openpyxl_changes(template_path: Path, openpyxl_tmp_path: Path, outp
                     )
                     rels_xml = rels_xml.replace("</Relationships>", rel + "</Relationships>")
                 zout.writestr(item, rels_xml.encode("utf-8"))
+            elif item in table_ranges:
+                # Keep the template's external-query metadata byte-for-byte,
+                # changing only the table/filter bounds when Master gained rows.
+                table_xml = zin.read(item).decode("utf-8")
+                old_ref = _re.search(r'<table\b[^>]*\bref="([^"]+)"', table_xml)
+                if old_ref and old_ref.group(1) != table_ranges[item]:
+                    table_xml = _re.sub(
+                        r'(\bref=")' + _re.escape(old_ref.group(1)) + r'(")',
+                        lambda match: match.group(1) + table_ranges[item] + match.group(2),
+                        table_xml,
+                    )
+                zout.writestr(item, table_xml.encode("utf-8"))
             else:
                 data = overlays.get(item, zin.read(item))
                 zout.writestr(item, data)
@@ -1673,7 +1785,13 @@ def _restore_master_sheet_header(template_path: Path, output_path: Path) -> None
     if tpl_split < 0 or out_split < 0:
         return
 
-    new_xml = tpl_xml[:tpl_split] + out_xml[out_split:]
+    # The namespace-rich template header is still needed, but its used range
+    # must grow when valid occupied LX edge addresses were appended to Master.
+    header = tpl_xml[:tpl_split]
+    dimension = re.search(r"<dimension\b[^>]*/>", out_xml[:out_split])
+    if dimension:
+        header = re.sub(r"<dimension\b[^>]*/>", lambda _: dimension.group(0), header)
+    new_xml = header + out_xml[out_split:]
 
     with NamedTemporaryFile(delete=False, suffix=".xlsx") as tmpf:
         tmp_path = tmpf.name
