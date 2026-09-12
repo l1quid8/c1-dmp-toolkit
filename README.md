@@ -240,12 +240,14 @@ these outlines by default. Electrical connections remain unchanged.
 | `scripts/rl_injector/` | RemoteLink document model, safety verification, inspector, and encrypted `.xml` export |
 | `dmp_doorchart.spec` | PyInstaller build spec (OS-branched internally) |
 | `requirements.txt` | Pinned dependencies — build with **Python 3.13** |
+| `requirements-dev.txt` | Application dependencies plus the pinned test runner |
 | `VERSION` | App version, shown in the title bar |
 | `build_mac.command` / `build_windows.bat` | Per-machine build scripts |
-| `.github/workflows/release.yml` | CI: builds both OSes on a version tag |
+| `.github/workflows/ci.yml` | Regression tests on macOS and Windows for PRs and main |
+| `.github/workflows/release.yml` | Verifies the version, runs CI, then builds and publishes both OSes on a version tag |
 | `logos/`, `*.xlsx` | Branding assets and Excel templates |
 | `docs/screenshots/` | README images (demo data only) |
-| `docs/` | Design specs |
+| `docs/` | Roadmap, design specs, and release notes |
 
 Build output, virtualenvs, and working data are **not** committed — see
 `.gitignore`. One codebase runs on both operating systems — platform
@@ -257,9 +259,13 @@ differences are handled at runtime via `sys.platform` checks.
 
 ## Developer setup (new machine)
 
+For running from source, tests, pull requests, and the release checklist, see
+[CONTRIBUTING.md](CONTRIBUTING.md). Planned improvements and maintenance priorities
+live in the [project roadmap](docs/ROADMAP.md).
+
 1. Install **Python 3.13** and **Git** (or GitHub Desktop).
 2. Install the OCR tools:
-   - macOS: `brew install tesseract ghostscript`
+   - macOS: `brew install python@3.13 python-tk@3.13 tesseract ghostscript`
    - Windows: Tesseract-OCR (UB Mannheim build) and Ghostscript, default paths.
 3. Clone this repo (anywhere **outside** OneDrive, e.g. `~/Projects/`).
 4. Build:
@@ -278,14 +284,15 @@ from GitHub Releases.
 Push a version tag to build both platforms via CI and publish a Release:
 
 ```
-# bump VERSION first (e.g. to 1.0.9), commit, then:
-git tag v1.0.9
-git push origin v1.0.9
+# choose an unused version, update VERSION and release notes, commit, then:
+git tag v1.7.1
+git push origin v1.7.1
 ```
 
-GitHub Actions builds the macOS `.app` and Windows `.exe` and attaches both to a
-GitHub Release for that tag. The Release is the version archive. CI fails fast if
-the pushed tag doesn't match the `VERSION` file, so the two can't drift.
+GitHub Actions verifies the tag matches `VERSION` and runs the regression suite
+on macOS and Windows before building the macOS `.app` and Windows `.exe`. Both
+builds must succeed before they are attached to a GitHub Release for that tag.
+The Release is the version archive; never move a published version tag.
 
 ## Auto-update
 

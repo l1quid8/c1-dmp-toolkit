@@ -1,0 +1,63 @@
+name: Bug report
+description: Report a reproducible problem with the app or generated output.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues first. This report is public: use fictional data.
+        Do not attach real school/customer files, panel user codes, credentials,
+        or network settings. Sanitize screenshots, logs, paths, and metadata.
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      description: Include the version shown in the title bar and whether this is a packaged build or source checkout.
+      placeholder: v1.7.0, packaged build
+    validations:
+      required: true
+  - type: input
+    id: operating-system
+    attributes:
+      label: Operating system
+      description: Include OS version and architecture if known.
+      placeholder: macOS 15, Apple Silicon; or Windows 11, x64
+    validations:
+      required: true
+  - type: dropdown
+    id: input-type
+    attributes:
+      label: Input type
+      options:
+        - Searchable PDF
+        - Scanned PDF / OCR
+        - DMP worksheet (.xlsx)
+        - Saved project (.dmps)
+        - RemoteLink account (.xml)
+        - No input / other
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Give the smallest repeatable sequence, including the affected tab or output.
+      placeholder: |
+        1. Open a fictional project with...
+        2. Select...
+        3. Generate...
+    validations:
+      required: true
+  - type: textarea
+    id: expected-actual
+    attributes:
+      label: Expected and actual behavior
+      placeholder: |
+        Expected:
+        Actual (include the exact error, if any):
+    validations:
+      required: true
+  - type: textarea
+    id: artifacts
+    attributes:
+      label: Sanitized artifacts (optional)
+      description: Attach a fictional reproducer, sanitized screenshot, or relevant log excerpt. Check file contents and metadata before uploading; .dmps and RemoteLink summaries can contain readable user codes.

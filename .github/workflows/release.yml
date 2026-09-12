@@ -7,6 +7,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: read
+
 jobs:
   # The in-app updater compares the bundled VERSION against the latest release
   # tag, so they must match. Fail fast if a tag is pushed that disagrees with
@@ -20,8 +23,12 @@ jobs:
           test "v$(cat VERSION)" = "${GITHUB_REF_NAME}" \
             || { echo "VERSION ($(cat VERSION)) != tag ${GITHUB_REF_NAME}"; exit 1; }
 
-  build-macos:
+  tests:
     needs: verify-version
+    uses: ./.github/workflows/ci.yml
+
+  build-macos:
+    needs: [verify-version, tests]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,7 +61,7 @@ jobs:
           retention-days: 1
 
   build-windows:
-    needs: verify-version
+    needs: [verify-version, tests]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

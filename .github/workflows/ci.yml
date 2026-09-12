@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      # Match the packaged app's Tk 9 runtime: tkinterdnd2's arm64 library
+      # cannot load into the Tk 8.6 bundled with setup-python on macOS.
+      - name: Install macOS Python and OCR tools
+        if: runner.os == 'macOS'
+        run: |
+          brew install python@3.13 python-tk@3.13 tesseract ghostscript
+          "$(brew --prefix python@3.13)/bin/python3.13" -m venv .venv
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - uses: actions/setup-python@v5
+        if: runner.os == 'Windows'
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: Install Windows OCR tools
+        if: runner.os == 'Windows'
+        run: choco install --no-progress -y tesseract ghostscript
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+          python -m pip check
+      - name: Verify GUI runtime
+        # Fail here if the runner cannot create a window, instead of silently
+        # skipping the editor integration suite for lack of a Tk display.
+        run: python -c "import tkinter as tk; from tkinterdnd2 import TkinterDnD; root = TkinterDnD.Tk(); root.withdraw(); print('Tk', root.tk.call('info', 'patchlevel')); root.update(); root.destroy()"
+      - name: Run regression suite
+        run: python -m pytest -q -ra --junitxml=test-results/pytest.xml
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tests-${{ matrix.os }}
+          path: test-results/pytest.xml
+          if-no-files-found: ignore
+          retention-days: 7

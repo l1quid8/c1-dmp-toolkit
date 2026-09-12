@@ -1,0 +1,3 @@
+# Application/build dependencies plus the test runner used by CI.
+-r requirements.txt
+pytest==9.1.1

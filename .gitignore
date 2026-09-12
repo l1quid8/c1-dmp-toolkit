@@ -1,6 +1,7 @@
 # Virtual environments (per-machine, never shared)
 venv/
 build-venv/
+.venv/
 
 # PyInstaller build output
 build/
@@ -14,12 +15,19 @@ generated_worksheets/
 # Python bytecode
 __pycache__/
 *.pyc
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+test-results/
 
 # Logs
 *.log
 
 # Local tooling state
 .collab/
+.worktrees/
+.claude/settings.local.json
 
 # OS / editor junk
 .DS_Store
