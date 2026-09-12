@@ -34,6 +34,7 @@ from session import (
     Session,
     SessionLoadError,
     clear_recovery,
+    create_blank_session,
     ensure_editable_zones,
     list_recent_sessions,
     load_recovery,
@@ -41,10 +42,12 @@ from session import (
     normalize_rsp_tokens,
     normalize_zone_descriptions,
     pending_recovery,
+    save_session,
     sync_master_zones,
     unique_session_path,
 )
-from editor_frame import EditorFrame
+from editor_frame import EditorFrame, _site_defaults
+from new_project_dialog import ask_new_project
 from topology_service import ensure_explicit_topology, project_legacy_topology
 from riser_render import generate_riser_bundle
 from riser_scene import layout_riser, sync_riser_document, validate_riser
@@ -237,6 +240,7 @@ class App:
         # Which artifact is generating right now: "worksheet" | "chart" | None.
         # Generation runs in the background while the editor stays up.
         self._generating: str | None = None
+        self._creating_project = False
         # editor.edit_epoch at the moment the last worksheet was generated —
         # lets the door-chart action warn when the worksheet has gone stale.
         self._ws_epoch: int | None = None
@@ -275,7 +279,7 @@ class App:
 
         # Menu-bar shortcuts (mirror File + Worksheet). Handlers self-guard.
         mod = "Command" if sys.platform == "darwin" else "Control"
-        self.root.bind_all(f"<{mod}-n>", lambda _e=None: self._process_another())
+        self.root.bind_all(f"<{mod}-n>", lambda _e=None: self._create_new_project())
         self.root.bind_all(f"<{mod}-o>", lambda _e=None: self._choose_pdf())
         self.root.bind_all(f"<{mod}-w>", lambda _e=None: self._process_another())
         self.root.bind_all(f"<{mod}-e>", lambda _e=None: self._generate_worksheet())
@@ -395,8 +399,8 @@ class App:
         self._file_menu = file_menu
         self._recent_menu = tk.Menu(file_menu, tearoff=0)
 
-        file_menu.add_command(label="New Project", accelerator=accel("N"),
-                              command=self._process_another)
+        file_menu.add_command(label="Create New Project", accelerator=accel("N"),
+                              command=self._create_new_project)
         file_menu.add_command(label="Open…", accelerator=accel("O"),
                               command=self._choose_pdf)
         file_menu.add_cascade(label="Open Recent", menu=self._recent_menu)
@@ -721,6 +725,9 @@ class App:
         self._status_lbl.configure(text="Ready", text_color=theme.TEXT_TERTIARY)
         self._source_lbl.configure(text="")
         self._outdir_lbl.configure(text="")
+
+        primary_button(self.input_section, "Create New Project", self._create_new_project,
+                       width=180).grid(row=0, column=0, sticky="w", pady=(0, theme.PAD["md"]))
 
         # Tk frames can't draw a dashed border, so the spec's dashed outline
         # degrades to a solid 2px one in the same colour.
@@ -1356,7 +1363,7 @@ class App:
     # Project editor                                                         #
     # ------------------------------------------------------------------ #
 
-    def _enter_editor(self, session: Session):
+    def _enter_editor(self, session: Session, *, initial_tab: str = "ZONES"):
         """Open the unified editor over a session (new or loaded)."""
         # Make zones editable even when only Master rows were parsed (xlsx with
         # unevaluated Point Info formulas), and canonicalize legacy 'RSP N'
@@ -1380,6 +1387,7 @@ class App:
             on_toggle_fullscreen=self._toggle_fullscreen,
             on_status_change=self._on_editor_status,
             on_validation_change=self._on_editor_validation,
+            initial_tab=initial_tab,
         )
         self.editor.grid(row=0, column=0, sticky="nsew")
         self._sync_fullscreen_controls()
@@ -1870,6 +1878,51 @@ class App:
     # ------------------------------------------------------------------ #
     # Reset                                                                 #
     # ------------------------------------------------------------------ #
+
+    def _create_new_project(self):
+        """Keep the current project alive until a blank project is safely saved."""
+        if self._creating_project:
+            return
+        if self._generating is not None or self.state in {"parsing", "loading_xlsx"}:
+            messagebox.showinfo("Work in progress",
+                                "Wait for the current import or generation to finish "
+                                "before creating a project.")
+            return
+        self._creating_project = True
+        close_guard_passed = False
+        try:
+            prefs = load_prefs()
+            result = ask_new_project(self.root, prepared_by=prefs.get("install_tech", ""))
+            if result is None:
+                return
+            # Modal waits still service Tk callbacks and menu shortcuts.
+            if self._generating is not None or self.state in {"parsing", "loading_xlsx"}:
+                messagebox.showinfo("Work in progress",
+                                    "Wait for the current import or generation to finish "
+                                    "before creating a project.")
+                return
+            if self.editor and not self.editor.maybe_close():
+                return
+            close_guard_passed = True
+            site, title_updates = result
+            for field, value in _site_defaults(prefs).items():
+                if value and not (getattr(site, field, None) or "").strip():
+                    setattr(site, field, value)
+            session = create_blank_session(site, title_block_updates=title_updates)
+            session.path = unique_session_path(session.design)
+            save_session(session)
+        except Exception as exc:
+            if close_guard_passed and self.editor and self.editor.dirty:
+                # Discard clears recovery, but the failed replacement stays open.
+                self.editor._schedule_recovery(write_now=True)
+            messagebox.showerror("Create New Project", f"Couldn't create the project: {exc}")
+            return
+        finally:
+            self._creating_project = False
+        self.pdf_path = None
+        self.dmp_path = None
+        self.door_chart_path = None
+        self._enter_editor(session, initial_tab="RISER")
 
     def _process_another(self):
         if self._generating is not None:

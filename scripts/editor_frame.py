@@ -14,7 +14,7 @@ through the on_status_change / on_validation_change callbacks.
 from __future__ import annotations
 
 import contextlib
-from datetime import datetime
+from datetime import date, datetime
 from tkinter import messagebox
 
 import customtkinter as ctk
@@ -72,6 +72,17 @@ def _format_install_date(d) -> str:
     # 11th/12th/13th are the ordinal exceptions; otherwise key off the last digit.
     suffix = "th" if 11 <= n % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
     return f"{d.strftime('%B').upper()} {n}{suffix} {d.year}"
+
+
+def _site_defaults(prefs: dict) -> dict[str, str]:
+    """Machine-stable defaults shared by import and blank-project entry."""
+    return {
+        "install_tech": prefs.get("install_tech", ""),
+        "install_date": _format_install_date(date.today()),
+        "ip_address": prefs.get("ip_address", ""),
+        "default_gateway": prefs.get("default_gateway", ""),
+    }
+
 
 TAB_TITLES = ["SITE", "ZONES", "SPLITTERS", "KEYPADS", "RSP/POWER", "REMOTELINK", "RISER"]
 
@@ -310,10 +321,12 @@ class EditorFrame(ctk.CTkFrame):
                  on_generate_worksheet=None, on_generate_chart=None,
                  on_generate_remotelink=None, on_generate_riser=None,
                  on_toggle_fullscreen=None,
-                 on_status_change=None, on_validation_change=None):
+                 on_status_change=None, on_validation_change=None,
+                 initial_tab: str = "ZONES"):
         super().__init__(master, fg_color="transparent")
         self.root = root
         self.session = session
+        self._initial_tab = initial_tab
         self._topology_signature = _graph_signature(session.design)
         self._location_signature = location_values(session.design)
         self.dirty = False
@@ -359,10 +372,14 @@ class EditorFrame(ctk.CTkFrame):
         self.dirty = True
         self.edit_epoch += 1
         self._notify_status()
+        self._schedule_recovery(write_now=write_recovery_now)
+
+    def _schedule_recovery(self, *, write_now: bool = False):
+        """Schedule a snapshot without adding an edit or changing dirty state."""
         if self._recovery_job is not None:
             with contextlib.suppress(Exception):
                 self.root.after_cancel(self._recovery_job)
-        delay = 0 if write_recovery_now else RECOVERY_DEBOUNCE_MS
+        delay = 0 if write_now else RECOVERY_DEBOUNCE_MS
         self._recovery_job = self.root.after(delay, self._write_recovery)
 
     def _write_recovery(self):
@@ -448,7 +465,7 @@ class EditorFrame(ctk.CTkFrame):
             self.tabs.add(title)
             self.tabs.tab(title).columnconfigure(0, weight=1)
             self.tabs.tab(title).rowconfigure(0, weight=1)
-        self.tabs.set("ZONES")  # the common field-correction surface lands first
+        self.tabs.set(self._initial_tab)
 
         self._build_site_tab(self.tabs.tab("SITE"))
 
@@ -1281,13 +1298,7 @@ class EditorFrame(ctk.CTkFrame):
         machine-stable tech/IP/gateway, a date carried forward is always stale
         (it produced yesterday's date on today's job). It defaults to today,
         formatted the way techs write it, and stays fully editable."""
-        from datetime import date as _date
-        defaults = {
-            "install_tech": prefs.get("install_tech", ""),
-            "install_date": _format_install_date(_date.today()),
-            "ip_address": prefs.get("ip_address", ""),
-            "default_gateway": prefs.get("default_gateway", ""),
-        }
+        defaults = _site_defaults(prefs)
         self._suspend_traces = True
         site = self.session.design.site_info
         for attr, value in defaults.items():
