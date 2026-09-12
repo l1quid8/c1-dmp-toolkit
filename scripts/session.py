@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from paths import output_dir
 from parse_dmp_worksheet import (
@@ -69,7 +69,7 @@ class Session:
     """A DMPDesign plus the editing state that must survive app restarts."""
     design: DMPDesign
     remotelink: RemoteLinkConfig = field(default_factory=RemoteLinkConfig)
-    source_kind: str = ""            # "pdf" | "xlsx" | ""
+    source_kind: str = ""            # "pdf" | "xlsx" | "manual" | ""
     source_name: str = ""            # original input filename, display only
     topology_confirmed: bool = False
     saved_at: Optional[str] = None   # ISO timestamp of last clean save
@@ -83,6 +83,27 @@ class SessionSummary:
     school_name: str
     saved_at: Optional[str]
     source_name: str
+
+
+def create_blank_session(
+    site_info: SiteInfo,
+    *,
+    title_block_updates: Mapping[str, str] | None = None,
+) -> Session:
+    """Create a manual project from site metadata without touching disk.
+
+    The returned project uses the existing design, topology, riser, and
+    persistence models.  Hardware and wiring remain empty until the editor
+    authoring flow adds them.
+    """
+    design = DMPDesign(site_info=site_info, topology_source="manual")
+    document = default_riser_document(design)
+    title_fields = {f.name for f in dataclasses.fields(RiserTitleBlock)}
+    for field_name, value in (title_block_updates or {}).items():
+        if field_name in title_fields:
+            setattr(document.title_block, field_name, value)
+    design.riser_document = document
+    return Session(design=design, source_kind="manual", source_name="")
 
 
 # -------- dirs / naming --------
