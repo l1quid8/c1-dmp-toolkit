@@ -50,7 +50,6 @@ below as they are selected for work.
 | P0 | Snapshot exports and track the revision actually generated | Editing while a worksheet is generated can make an older export appear current | S–M | Exports use a captured design/configuration and starting edit epoch; completion cannot update another project's state; an edit during generation leaves the worksheet stale |
 | P1 | Show recovery-save health | A failed recovery write is currently suppressed, so crash protection can fail without notice | S–M | Failed writes produce a persistent, actionable status; slow storage does not block editing; successful retry clears the warning |
 | P1 | Verify updater payloads and preserve rollback | Updating should recover cleanly from corrupt downloads, wrong bundles, failed replacements, or launch failures | M | Bundle/version and integrity checks precede replacement; failure paths are tested on both platforms; the previous build survives until a successful startup |
-| P2 | Generate a coordinated deliverable set | Users currently sequence worksheet, door chart and riser generation themselves | M | One action generates selected deliverables from the same snapshot and records their project/revision association; reopened projects show which outputs are current |
 | P2 | Extend undo to hardware changes | Hardware additions/removals change shared zones and wiring and do not share canvas undo behavior | L | Undo restores device, zones, wiring and layout together across tabs; redo and save/reopen preserve the result |
 
 ### Evidence and scope
@@ -69,10 +68,6 @@ below as they are selected for work.
 - **Updates:** [`updater.py`](../scripts/updater.py) downloads and selects a
   bundle, then generates platform-specific replacement scripts. Add explicit
   payload verification and tests around backup retention and failure recovery.
-- **Deliverable sets:** `_latest_worksheet_for_school` in
-  [`app.py`](../scripts/app.py) searches by school slug. Saved
-  [`Session`](../scripts/session.py) records do not retain an export manifest.
-  Account for multiple projects at the same school and reopening old revisions.
 - **Undo:** The [documented hardware workflow](../README.md#hardware-and-cable-callouts-in-riser)
   commits changes immediately and advises saving a copy before major changes.
   Expand undo through shared project transactions, with explicit cascade tests.
@@ -81,7 +76,7 @@ below as they are selected for work.
 
 `app.py` and `riser_editor.py` are the main maintenance hotspots (roughly 2,300
 and 3,000 lines at review time). Extract an export service while implementing
-export consistency/deliverable sets, and shared transactions while extending
+export consistency, and shared transactions while extending
 undo. Avoid a broad file reshuffle before the new CI establishes a baseline.
 Existing design plans under `docs/superpowers/` are historical implementation
 records; use this roadmap for current priorities and retain incomplete native
