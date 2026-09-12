@@ -160,12 +160,15 @@ def _rule_topology_confirmed(design: DMPDesign, ctx: dict) -> Iterator[Issue]:
     # Auto-derived wiring is a guess and must be reviewed; riser-extracted
     # wiring is trustworthy but a review is still encouraged.
     severity = "error" if design.topology_source == "auto-derived" else "warning"
+    guidance = {
+        "riser": " (read from the source riser — review is encouraged)",
+        "auto-derived": " (auto-derived — must be checked against the riser)",
+        "manual": " (authored here — mark it reviewed when complete)",
+    }.get(design.topology_source, "")
     yield Issue(
         code="topology.unconfirmed", severity=severity, tab=TAB_SPLITTERS,
         ref=None,
-        message="Splitter wiring has not been marked as reviewed"
-                + (" (auto-derived — must be checked against the riser)"
-                   if severity == "error" else ""),
+        message="Splitter wiring has not been marked as reviewed" + guidance,
     )
 
 

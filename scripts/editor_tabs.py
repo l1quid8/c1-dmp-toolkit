@@ -469,18 +469,36 @@ def prompt_add_splitter(root, session: Session, on_done) -> ctk.CTkToplevel:
     _dialog_title(win, "Add a 710 splitter-repeater")
 
     type_var = tk.StringVar(value="LX")
-    for stype, label in [("LX", "LX bus  (710-LX500-N — RSP feeds)"),
+    for stype, label in [("LX", "LX bus  (710-LX500–900-N — RSP feeds)"),
                          ("KP", "KP bus  (710-KP-N — keypad feeds)")]:
         _styled_radio(win, label, type_var, stype).pack(anchor="w", padx=28, pady=3)
+
+    bus_row = ctk.CTkFrame(win, fg_color="transparent")
+    ctk.CTkLabel(bus_row, text="LX bus", text_color=theme.TEXT,
+                 font=theme.ui_font(theme.SIZE["chip"])).pack(side="left", padx=(0, 12))
+    bus_holder, bus_menu = _bordered_menu(
+        bus_row, ["500", "600", "700", "800", "900"], None,
+        tone="connected", width=108)
+    bus_holder.pack(side="left")
+    bus_row.pack(anchor="w", padx=28, pady=(8, 0))
 
     loc = AutocompleteEntry(win, lambda: existing_locations(session.design),
                             width=320, height=theme.HEIGHT["button"],
                             placeholder_text="Location")
     loc.pack(padx=20, pady=(10, 0))
 
+    def update_bus_picker(*_):
+        if type_var.get() == "LX":
+            bus_row.pack(anchor="w", padx=28, pady=(8, 0), before=loc)
+        else:
+            bus_row.pack_forget()
+
+    type_var.trace_add("write", update_bus_picker)
+
     def confirm():
         try:
-            add_splitter(session.design, type_var.get(), loc.get().strip() or None)
+            add_splitter(session.design, type_var.get(), loc.get().strip() or None,
+                         lx_bus=bus_menu.get())
         except HardwareError as exc:
             messagebox.showerror("Can't add splitter", str(exc), parent=win)
             return
@@ -534,6 +552,12 @@ def prompt_add_keypad(root, session: Session, on_done) -> ctk.CTkToplevel:
         win, _keypad_source_choices(session), None,
         tone="connected", width=318)
     holder.pack(padx=20)
+
+    ctk.CTkLabel(
+        win, text="The first keypad fed directly from MSP is the service keypad.",
+        text_color=theme.TEXT_TERTIARY, justify="left", wraplength=318,
+        font=theme.ui_font(theme.SIZE["chip"]),
+    ).pack(anchor="w", padx=20, pady=(8, 0))
 
     glob_var = tk.BooleanVar(value=False)
     _styled_checkbox(win, "Global keypad", glob_var, None,
@@ -749,12 +773,28 @@ class SplittersTab(ctk.CTkFrame):
 
         # Riser-derived wiring is trustworthy; the auto-derived convention is a
         # guess, so it gets the amber treatment until a human signs it off.
-        riser = self.session.design.topology_source == "riser"
-        if riser:
+        source = self.session.design.topology_source
+        review_label = "Wiring reviewed"
+        review_tooltip = "Confirms the splitter wiring matches the riser diagram."
+        if source == "riser":
             glyph, note = "ℹ", "Wiring below was read from the riser diagram."
             bg, border, fg = theme.SURFACE, theme.BORDER, theme.TEXT_TERTIARY
             check_accent = theme.ACCENT
+        elif source == "manual":
+            glyph, note = "ℹ", "Wiring is authored here. Mark it reviewed when complete."
+            bg, border, fg = theme.SURFACE, theme.BORDER, theme.TEXT_TERTIARY
+            check_accent = theme.ACCENT
+            review_label = "Wiring complete and reviewed"
+            review_tooltip = "Confirms the splitter wiring authored here is complete and reviewed."
+        elif source == "auto-derived":
+            glyph = "⚠"
+            note = ("Riser extraction was incomplete — the wiring below is a "
+                    "best-guess convention. Check it against the riser diagram.")
+            bg, border, fg = (theme.BANNER_BG, theme.BANNER_BORDER,
+                              theme.BANNER_TEXT)
+            check_accent = theme.WARNING
         else:
+            # Unknown/legacy provenance keeps the conservative import warning.
             glyph = "⚠"
             note = ("Riser extraction was incomplete — the wiring below is a "
                     "best-guess convention. Check it against the riser diagram.")
@@ -780,14 +820,14 @@ class SplittersTab(ctk.CTkFrame):
             self.session.topology_confirmed = self._reviewed_var.get()
             self.on_change()
 
-        reviewed_cb = _styled_checkbox(banner, "Wiring reviewed",
+        reviewed_cb = _styled_checkbox(banner, review_label,
                                        self._reviewed_var, toggled,
                                        accent=check_accent, text_color=fg)
         reviewed_cb.grid(row=0, column=2, sticky="e", padx=(theme.PAD["md"], 14),
                          pady=10)
         attach_tooltip(
             reviewed_cb,
-            "Confirms the splitter wiring matches the riser diagram. Until it's "
+            review_tooltip + " Until it's "
             "checked, generating a worksheet shows a warning. Adding or removing "
             "hardware re-opens this for review.")
         return frame

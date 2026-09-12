@@ -26,6 +26,87 @@ def test_add_splitter_from_riser_updates_project_and_unplaced(editor):
     assert not frame.session.topology_confirmed
 
 
+@pytest.mark.parametrize('bus,want', [
+    ('600', '710-LX600-1'), ('900', '710-LX900-1'),
+])
+def test_riser_shared_splitter_form_uses_selected_lx_bus(editor, bus, want):
+    frame, _ = editor
+    frame.tabs.set('RISER')
+    button(frame.riser_tab, 'Add Device').invoke()
+    button(window(frame, 'Add Device'), '710 Splitter').invoke()
+    win = window(frame, 'Add splitter')
+    menu = next(w for w in descendants(win)
+                if isinstance(w, ctk.CTkOptionMenu) and w.get() == '500')
+    assert menu.cget('values') == ['500', '600', '700', '800', '900']
+    menu._dropdown_callback(bus)
+    button(win, 'Add splitter').invoke()
+    assert any(s.id == want for s in frame.session.design.splitters)
+    assert want in frame.riser_tab.controller.document.unplaced
+    assert frame.tabs.get() == 'RISER'
+
+
+def test_splitter_form_bus_picker_only_shown_for_lx(editor):
+    frame, _ = editor
+    frame.splitters_tab._add_clicked()
+    win = window(frame, 'Add splitter')
+    menu = next(w for w in descendants(win)
+                if isinstance(w, ctk.CTkOptionMenu) and w.get() == '500')
+    holder = menu.master.master
+    assert holder.winfo_manager() == 'pack'
+    radios = [w for w in descendants(win) if isinstance(w, ctk.CTkRadioButton)]
+    next(w for w in radios if w.cget('value') == 'KP').invoke()
+    assert holder.winfo_manager() == ''
+    next(w for w in radios if w.cget('value') == 'LX').invoke()
+    assert holder.winfo_manager() == 'pack'
+
+
+@pytest.mark.parametrize('source,phrase', [
+    ('riser', 'read from the riser'),
+    ('auto-derived', 'extraction was incomplete'),
+    ('manual', 'authored here'),
+    ('', 'extraction was incomplete'),
+])
+def test_splitter_banner_and_review_control_match_provenance(editor, source, phrase):
+    frame, _ = editor
+    frame.session.design.topology_source = source
+    frame.session.topology_confirmed = False
+    header = frame.splitters_tab._build_header_row()
+    texts = [w.cget('text') for w in descendants(header)
+             if isinstance(w, ctk.CTkLabel)]
+    assert any(phrase in text for text in texts)
+    checkbox = next(w for w in descendants(header) if isinstance(w, ctk.CTkCheckBox))
+    if source == 'manual':
+        assert 'complete' in checkbox.cget('text').lower()
+        assert all('riser' not in text.lower() and 'extraction' not in text.lower()
+                   for text in texts)
+    checkbox.toggle()
+    assert frame.session.topology_confirmed
+    header.destroy()
+
+
+def test_first_msp_keypad_form_explains_service_convention_and_persists(editor, tmp_path):
+    from editor_tabs import prompt_add_keypad
+    from parse_dmp_worksheet import SiteInfo
+    from riser_model import DevicePortRef
+    from session import create_blank_session, load_session, save_session
+    frame, _ = editor
+    session = create_blank_session(SiteInfo(school_name='MANUAL SITE'))
+    done = []
+    win = prompt_add_keypad(frame.root, session, lambda: done.append(True))
+    texts = [w.cget('text') for w in descendants(win) if isinstance(w, ctk.CTkLabel)]
+    assert any('service keypad' in text.lower() and 'MSP' in text for text in texts)
+    button(win, 'Add keypad').invoke()
+    assert done == [True]
+    assert [(k.number, k.source) for k in session.design.keypads] == [(1, 'MSP')]
+    edge, = session.design.connections
+    assert edge.source == DevicePortRef('MSP', 'KP BUS')
+    assert edge.target == DevicePortRef('KEYPAD-1', 'IN')
+    saved = save_session(session, tmp_path / 'manual-service.dmps')
+    reopened = load_session(saved)
+    assert reopened.design.connections == session.design.connections
+    assert [(k.number, k.source) for k in reopened.design.keypads] == [(1, 'MSP')]
+
+
 @pytest.mark.parametrize('key,location', [
     ('710-LX500-2', 'CLASSROOM 27'), ('KEYPAD-2', 'OFFICE'),
     ('RSP-2', 'CLASSROOM 27'), ('MSP', 'MDF')])

@@ -140,6 +140,43 @@ def test_remove_missing_expander_raises():
 
 # -------- splitters --------
 
+@pytest.mark.parametrize("bus,want", [
+    ("500", "710-LX500-1"), ("600", "710-LX600-1"),
+    ("900", "710-LX900-1"),
+])
+def test_add_splitter_uses_selected_lx_bus(bus, want):
+    assert add_splitter(DMPDesign(), "LX", lx_bus=bus).id == want
+
+
+def test_add_splitter_numbers_independently_within_each_bus():
+    d = DMPDesign()
+    assert add_splitter(d, "LX", lx_bus="600").id == "710-LX600-1"
+    assert add_splitter(d, "LX").id == "710-LX500-1"
+    assert add_splitter(d, "LX", lx_bus="600").id == "710-LX600-2"
+    remove_splitter(d, "710-LX600-1")
+    assert add_splitter(d, "LX", lx_bus="600").id == "710-LX600-1"
+    assert add_splitter(d, "KP", lx_bus="900").id == "710-KP-1"
+    assert add_splitter(d, "KP").id == "710-KP-2"
+
+
+@pytest.mark.parametrize("bus", ["400", "1000", "LX600", "", "600.0"])
+def test_add_splitter_rejects_invalid_lx_bus_without_mutation(bus):
+    d = DMPDesign()
+    with pytest.raises(HardwareError, match="LX bus"):
+        add_splitter(d, "LX", lx_bus=bus)
+    assert d.splitters == []
+
+
+def test_lx_capacity_is_per_family_not_per_selected_bus():
+    d = DMPDesign()
+    for n in range(MAX_SPLITTERS_PER_TYPE):
+        add_splitter(d, "LX", lx_bus="500" if n % 2 else "600")
+    with pytest.raises(HardwareError, match="12 LX splitters"):
+        add_splitter(d, "LX", lx_bus="900")
+    assert len(d.splitters) == MAX_SPLITTERS_PER_TYPE
+    assert add_splitter(d, "KP").id == "710-KP-1"
+
+
 def test_add_splitter_ids_and_capacity():
     d = DMPDesign()
     s1 = add_splitter(d, "LX", location="FACP")

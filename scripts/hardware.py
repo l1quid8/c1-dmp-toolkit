@@ -202,20 +202,24 @@ def _used_numbers(design: DMPDesign, splitter_type: str,
 
 
 def add_splitter(design: DMPDesign, splitter_type: str,
-                 location: str | None = None) -> Splitter:
+                 location: str | None = None, *, lx_bus: str = "500") -> Splitter:
     if splitter_type not in ("LX", "KP"):
         raise HardwareError(f"Unknown splitter type: {splitter_type}")
+    if splitter_type == "LX" and lx_bus not in {"500", "600", "700", "800", "900"}:
+        raise HardwareError("LX bus must be one of 500, 600, 700, 800, or 900.")
     same_type = [s for s in design.splitters if s.splitter_type == splitter_type]
     if len(same_type) >= MAX_SPLITTERS_PER_TYPE:
         raise HardwareError(
             f"The splitter sheet fits at most {MAX_SPLITTERS_PER_TYPE} "
             f"{splitter_type} splitters."
         )
-    used = _used_numbers(design, splitter_type)
+    used = _used_numbers(design, splitter_type, bus=lx_bus)
     n = 1
     while n in used:
         n += 1
-    splitter = Splitter(id=_splitter_id(splitter_type, n),
+    splitter_id = (f"710-LX{lx_bus}-{n}" if splitter_type == "LX"
+                   else _splitter_id(splitter_type, n))
+    splitter = Splitter(id=splitter_id,
                         splitter_type=splitter_type, location=location,
                         outputs=["Spare", "Spare", "Spare"])
     design.splitters.append(splitter)
