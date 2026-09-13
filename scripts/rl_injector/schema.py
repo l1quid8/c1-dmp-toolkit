@@ -170,7 +170,7 @@ def build_staging_account(
     }
 
     for z in sorted(design.master_zones, key=lambda x: x.number):
-        if real_zone_numbers and z.number not in real_zone_numbers:
+        if z.number not in real_zone_numbers:
             continue
         zone_type = derive_zone_type(z)
         if not z.is_spare:

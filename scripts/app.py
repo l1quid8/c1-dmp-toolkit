@@ -51,6 +51,7 @@ from session import (
 from editor_frame import EditorFrame, _site_defaults
 from new_project_dialog import ask_new_project
 from topology_service import ensure_explicit_topology, project_legacy_topology
+from validation import remotelink_readiness_issues, worksheet_readiness_issues
 from riser_render import generate_riser_bundle
 from riser_scene import layout_riser, sync_riser_document, validate_riser
 from editor_tabs import auto_hide_scrollbar
@@ -1503,10 +1504,15 @@ class App:
     def _latest_worksheet_path(self) -> Path | None:
         """The worksheet a door chart would be built from: the last one this
         session touched (a generated rev, or the imported source xlsx), else
-        the highest rev on disk from a previous session."""
+        the highest rev on disk from an imported project's previous session.
+        Manual projects generate their own worksheet in each runtime first."""
         if self.dmp_path is not None and Path(self.dmp_path).exists():
             return Path(self.dmp_path)
         if self.session is not None:
+            # A new/reopened manual project must generate its own worksheet;
+            # a matching school slug on disk can belong to a different project.
+            if self.session.source_kind == "manual":
+                return None
             return latest_rev_path(self.output_dir, f"{self._school_slug()}_dmp")
         return None
 
@@ -1531,7 +1537,8 @@ class App:
             self.editor.save()
 
         def proceed():
-            design = self.session.design
+            worksheet_epoch = self.editor.edit_epoch
+            design = copy.deepcopy(self.session.design)
             project_legacy_topology(design)
             sync_master_zones(design)
             # Persist the per-machine site defaults (tech, IP, ...). Phone and
@@ -1566,7 +1573,7 @@ class App:
                 self._set_generating(None)
                 self.dmp_path = out_path
                 if self.editor is not None:
-                    self._ws_epoch = self.editor.edit_epoch
+                    self._ws_epoch = worksheet_epoch
                 rev = out_path.stem.rsplit("_rev", 1)[-1]
                 self._show_toast(
                     f"Worksheet rev {rev} ready",
@@ -1580,7 +1587,9 @@ class App:
 
             self._run_async(work, on_done, on_error)
 
-        self.editor.show_issues_dialog(proceed, proceed_label="Generate anyway")
+        readiness = worksheet_readiness_issues(self.session.design, self.session)
+        note = "\n".join(issue.message for issue in readiness) if readiness else None
+        self.editor.show_issues_dialog(proceed, proceed_label="Generate anyway", note=note)
 
     def _choose_riser_outputs(self):
         """Choose files while retaining the application's saved output folder."""
@@ -1650,10 +1659,10 @@ class App:
                 "Save project?", "Save the project before generating the riser?"):
             self.editor.save()
 
-        design = self.session.design
+        design = copy.deepcopy(self.session.design)
         if design.riser_document is None or not design.riser_document.elements:
             from riser_presentation import layout_presentation
-            design.riser_document = layout_presentation(design)
+            design.riser_document = layout_presentation(design, title_source=design.riser_document)
         sync_riser_document(design, design.riser_document)
         issues = validate_riser(design, design.riser_document)
         if issues:
@@ -1668,14 +1677,13 @@ class App:
                 return
 
         out_dir = self.output_dir
-        render_design = copy.deepcopy(design)
-        document = render_design.riser_document
+        document = design.riser_document
         self._set_generating("riser")
 
         def work():
             with contextlib.redirect_stdout(self._redirector), \
                  contextlib.redirect_stderr(self._redirector):
-                return generate_riser_bundle(render_design, document, out_dir, formats=formats)
+                return generate_riser_bundle(design, document, out_dir, formats=formats)
 
         def on_done(paths):
             self._set_generating(None)
@@ -1765,6 +1773,14 @@ class App:
             return
         if not getattr(self.editor, 'generation_allowed', lambda: True)():
             return
+        readiness = remotelink_readiness_issues(self.session.design, self.session.remotelink)
+        hard_issues = [issue for issue in readiness if issue.severity == "error"]
+        if hard_issues:
+            messagebox.showinfo("RemoteLink not ready", "\n".join(i.message for i in hard_issues))
+            return
+        if readiness:
+            messagebox.showinfo("RemoteLink configuration warnings",
+                                "\n".join(i.message for i in readiness))
         if self.editor.dirty and messagebox.askyesno(
             "Save project?", "Save the project before generating?",
         ):
@@ -1773,9 +1789,10 @@ class App:
 
     def _show_remotelink_dialog(self):
         """Review the saved configuration and prompt only for encryption."""
-        design = self.session.design
+        design = copy.deepcopy(self.session.design)
+        config = copy.deepcopy(self.session.remotelink)
         sync_master_zones(design)
-        resolved = resolve_config(self.session.remotelink, design)
+        resolved = resolve_config(config, design)
 
         dlg = ctk.CTkToplevel(self.root)
         dlg.title("Generate RemoteLink Account")
@@ -1831,7 +1848,7 @@ class App:
 
         try:
             receipt_text = preview_account_summary(
-                design, self.session.remotelink,
+                design, config,
                 resource_path("remotelink_account_template.xml"),
             )
         except Exception as exc:
@@ -1864,7 +1881,8 @@ class App:
         primary_button(btns, "Generate", submit, width=120).pack(side="right")
 
     def _run_generate_remotelink(self, passphrase):
-        design = self.session.design
+        design = copy.deepcopy(self.session.design)
+        config = copy.deepcopy(self.session.remotelink)
         sync_master_zones(design)
         out_dir = self.output_dir
         template_path = resource_path("remotelink_account_template.xml")
@@ -1875,14 +1893,14 @@ class App:
             with contextlib.redirect_stdout(self._redirector), \
                  contextlib.redirect_stderr(self._redirector):
                 return generate_configured_account_xml(
-                    design, self.session.remotelink,
+                    design, config,
                     template_path=template_path, passphrase=passphrase,
                     out_dir=out_dir)
 
         def on_done(path):
             self._set_generating(None)
             account_num = resolve_config(
-                self.session.remotelink, design).account_num
+                config, design).account_num
             self._show_toast(
                 f"RemoteLink account {account_num} ready",
                 action=("Open", lambda: open_file(path)),

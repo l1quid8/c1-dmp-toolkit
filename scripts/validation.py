@@ -8,13 +8,14 @@ are unit-testable without Tk.
 
 from __future__ import annotations
 
+import copy
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Iterator, Optional
 
 from parse_dmp_worksheet import DMPDesign
-from rl_injector.rl_config import RemoteLinkConfig, validate_config
+from rl_injector.rl_config import RemoteLinkConfig, resolve_config, validate_config
 
 # Tabs the editor exposes; Issue.tab routes badges and "Go to" buttons.
 TAB_SITE = "SITE"
@@ -207,6 +208,58 @@ GENERATION_RULES: list[Callable[[DMPDesign, dict], Iterator[Issue]]] = [
 
 
 # -------- entry points --------
+
+def worksheet_readiness_issues(design: DMPDesign, session) -> list[Issue]:
+    """Explain worksheet review needs without blocking drawing/editing/export."""
+    ctx = {"topology_confirmed": session.topology_confirmed}
+    issues = [replace(issue, severity="warning")
+              for rule in (_rule_site_required, _rule_topology_confirmed)
+              for issue in rule(design, ctx)]
+    if not design.rsps:
+        issues.append(Issue(
+            "worksheet.no_rsps", "warning", TAB_POWER, None,
+            "No RSPs have been added — the worksheet will have no installed RSPs.",
+        ))
+    if not design.zones and not design.master_zones:
+        issues.append(Issue(
+            "worksheet.no_zones", "warning", TAB_ZONES, None,
+            "No zones have been added — the worksheet will have no design zones.",
+        ))
+    return issues
+
+
+def remotelink_readiness_issues(design: DMPDesign,
+                              config: RemoteLinkConfig) -> list[Issue]:
+    """Check hard account/staging requirements and existing programming warnings.
+
+    Master synchronization follows the export's normalization boundary on an
+    isolated design. Editable-only and Master-only projects use the same staging
+    filter as the XML builder; readiness never materializes data in the editor.
+    """
+    from session import sync_master_zones
+    from rl_injector.schema import build_staging_account
+
+    resolved = resolve_config(config, design)
+    issues = []
+    if not resolved.account_num.isdigit():
+        issues.append(Issue(
+            "remotelink.account_numeric", "error", TAB_REMOTELINK,
+            "field:account_num",
+            "Enter a numeric RemoteLink account number or numeric SITE local code.",
+        ))
+    snapshot = copy.deepcopy(design)
+    sync_master_zones(snapshot)
+    account = build_staging_account(snapshot, resolved.account_num, resolved.receiver_num)
+    if not account.zones:
+        issues.append(Issue(
+            "remotelink.no_installed_zones", "error", TAB_POWER, None,
+            "Add an RSP with installed zones before generating a RemoteLink account.",
+        ))
+    issues.extend(Issue(problem.code, "warning", TAB_REMOTELINK,
+                        problem.ref, problem.message)
+                  for problem in validate_config(config, design))
+    return issues
+
 
 def validate_design(design: DMPDesign, *, topology_confirmed: bool = False,
                     remotelink: RemoteLinkConfig | None = None,
