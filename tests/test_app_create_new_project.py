@@ -3,6 +3,8 @@
 import importlib
 import sys
 from datetime import date
+from pathlib import Path
+from types import MethodType, SimpleNamespace
 
 import customtkinter as ctk
 import pytest
@@ -10,9 +12,241 @@ import pytest
 from test_app_scrollbar_runtime import application, app_module
 from test_app_recent_projects import labels
 import session as session_module
-from session import create_blank_session, load_recovery, load_session, recovery_path, save_session
+from session import (create_blank_session, list_recent_sessions, load_recovery, load_session,
+                     pending_recovery, recovery_path, save_session, write_recovery)
 from generate_dmp_ws import SiteInfo
 import editor_frame
+
+
+@pytest.fixture
+def background_editor(tmp_path):
+    """Keep real save/status/persistence; replace only window/layout dependencies."""
+    from test_session import _populated_design
+    from riser_model import default_riser_document
+    from rl_injector.rl_config import RemoteLinkConfig, RLUser
+    project = create_blank_session(SiteInfo(school_name="ORIGINAL SCHOOL"))
+    project.design = _populated_design()
+    project.design.riser_document = default_riser_document(project.design)
+    project.remotelink = RemoteLinkConfig(account_num="3141", users=[RLUser(7, "TECH", "7777", "2")])
+    project.topology_confirmed = True
+    save_session(project, tmp_path / "original.dmps")
+    statuses, cancelled_jobs = [], []
+    editor = SimpleNamespace(
+        session=project, dirty=True, _recovery_job="pending-snapshot", _save_btn=None,
+        root=SimpleNamespace(after_cancel=cancelled_jobs.append),
+        flush_design_refresh=lambda: None,
+    )
+    for name in ("save", "_notify_status", "_update_save_button"):
+        setattr(editor, name, MethodType(getattr(editor_frame.EditorFrame, name), editor))
+    app = object.__new__(app_module.App)
+    app.state, app.editor, app.session = "editing", editor, project
+    app.root = editor.root
+    header = {}
+    app._set_project_title = lambda title, dirty=False, status="": header.update(
+        title=title, dirty=dirty, status=status)
+    app._set_toolbar_enabled = lambda enabled: None
+    app.test_header = header
+
+    def on_status_change(status, dirty):
+        statuses.append((status, dirty))
+        app._on_editor_status(status, dirty)
+
+    editor.on_status_change = on_status_change
+    return app, editor, statuses, cancelled_jobs
+
+
+def test_background_create_reserves_old_save_and_recovery_and_lists_recents(monkeypatch,
+                                                                           sessions_folder):
+    sessions_folder.mkdir()
+    original = create_blank_session(SiteInfo(school_name="NEW SCHOOL"))
+    old = save_session(original, sessions_folder / "NEW_SCHOOL.dmps")
+    old_text = old.read_text()
+    orphan = sessions_folder / "NEW_SCHOOL (2).dmps.recovery"
+    orphan.write_text("older never-saved project", encoding="utf-8")
+    app = object.__new__(app_module.App)
+    app._creating_project, app._generating, app.state = False, None, "idle"
+    app.root, app.editor, app.session = None, None, None
+    app.pdf_path = app.dmp_path = app.door_chart_path = old
+    entered = []
+    app._enter_editor = lambda project, *, initial_tab: entered.append((project, initial_tab))
+    choose(monkeypatch, (SiteInfo(school_name="NEW SCHOOL"), {}))
+    monkeypatch.setattr(app_module, "load_prefs", lambda: {})
+
+    app._create_new_project()
+
+    assert len(entered) == 1
+    project, tab = entered[0]
+    assert tab == "RISER"
+    assert project.path == sessions_folder / "NEW_SCHOOL (3).dmps"
+    assert load_session(project.path).source_kind == "manual"
+    assert project.saved_at is not None
+    assert {r.path for r in list_recent_sessions()} == {old, project.path}
+    assert old.read_text() == old_text
+    assert orphan.read_text() == "older never-saved project"
+    assert app.pdf_path is app.dmp_path is app.door_chart_path is None
+
+
+def test_background_ordinary_save_keeps_current_path_and_clears_recovery(background_editor):
+    app, editor, statuses, cancelled_jobs = background_editor
+    old = app.session.path
+    app.session.design.site_info.school_code = "EDITED"
+    rec = write_recovery(app.session)
+
+    app._save_shortcut()
+
+    assert app.session.path == old
+    assert load_session(old).design.site_info.school_code == "EDITED"
+    assert not rec.exists() and not editor.dirty
+    assert editor._recovery_job is None and cancelled_jobs == ["pending-snapshot"]
+    assert statuses[-1][1] is False
+
+
+def test_background_target_save_preserves_complete_project_and_old_file(background_editor, tmp_path,
+                                                                       sessions_folder):
+    app, editor, statuses, cancelled_jobs = background_editor
+    project, old = app.session, app.session.path
+    old_text = old.read_text()
+    old_recovery = write_recovery(project)
+    project.design.site_info.school_code = "EDITED"
+    project.design.riser_document.title_block.drawn_by = "New Designer"
+    target = tmp_path / "elsewhere" / "renamed.dmps"
+
+    assert editor.save(target)
+
+    loaded = load_session(target)
+    assert project.path == target and loaded.path == target
+    assert loaded.design == project.design
+    assert loaded.remotelink == project.remotelink
+    assert loaded.source_kind == "manual" and loaded.source_name == ""
+    assert loaded.topology_confirmed is True
+    assert loaded.saved_at == project.saved_at
+    assert loaded.design.site_info.school_code == "EDITED"
+    assert loaded.design.riser_document.title_block.drawn_by == "New Designer"
+    assert old.read_text() == old_text and not old_recovery.exists()
+    assert not editor.dirty and statuses[-1][1] is False
+    assert app.test_header["dirty"] is False and app.test_header["status"].startswith("Saved")
+    assert target not in {r.path for r in list_recent_sessions()}
+    assert cancelled_jobs == ["pending-snapshot"]
+    project.design.site_info.school_code = "LATER UNSAVED"
+    editor.dirty = True
+    rec = write_recovery(project)
+    assert rec == target.parent / "renamed.dmps.recovery"
+    assert pending_recovery(target) is not None
+    recovered = load_recovery(target)
+    assert recovered.path == target
+    assert recovered.design.site_info.school_code == "LATER UNSAVED"
+    assert editor.save()
+    assert load_session(target).design.site_info.school_code == "LATER UNSAVED"
+    assert not rec.exists() and old.read_text() == old_text
+
+
+@pytest.mark.parametrize("dirty", [True, False])
+def test_background_failed_target_save_retains_save_state(background_editor, tmp_path, monkeypatch, dirty):
+    app, editor, statuses, cancelled_jobs = background_editor
+    editor.dirty = dirty
+    project, old = app.session, app.session.path
+    timestamp, old_text = project.saved_at, old.read_text()
+    rec = write_recovery(project)
+    target = tmp_path / "failed.dmps"
+    (tmp_path / "failed.dmps.tmp").mkdir()
+    errors = []
+    monkeypatch.setattr(editor_frame.messagebox, "showerror", lambda *a, **kw: errors.append(a))
+
+    assert not editor.save(target)
+
+    assert project.path == old and project.saved_at == timestamp and editor.dirty is dirty
+    assert old.read_text() == old_text and rec.exists() and not target.exists()
+    assert editor._recovery_job == "pending-snapshot"
+    assert not cancelled_jobs and not statuses and errors
+
+
+@pytest.mark.parametrize("dirty", [True, False])
+def test_background_save_as_cancel_preserves_project(background_editor, monkeypatch, sessions_folder, dirty):
+    app, editor, statuses, cancelled_jobs = background_editor
+    editor.dirty = dirty
+    old, timestamp = app.session.path, app.session.saved_at
+    before = old.read_text()
+    monkeypatch.setattr(app_module.filedialog, "asksaveasfilename", lambda **kw: "")
+
+    assert not app._save_as()
+
+    assert app.session.path == old and app.session.saved_at == timestamp
+    assert editor.dirty is dirty and old.read_text() == before
+    assert not statuses and not cancelled_jobs
+    assert not list(sessions_folder.glob("*.dmps"))
+
+
+def test_background_save_as_dialog_targets_sessions_and_uses_shared_save(background_editor, monkeypatch,
+                                                                        sessions_folder):
+    app, editor, statuses, cancelled_jobs = background_editor
+    old = app.session.path
+    target = sessions_folder / "copy.dmps"
+    options = []
+
+    def choose_target(**kwargs):
+        options.append(kwargs)
+        return str(target)
+
+    monkeypatch.setattr(app_module.filedialog, "asksaveasfilename", choose_target)
+
+    assert app._save_as()
+
+    assert Path(options[0]["initialdir"]) == sessions_folder
+    assert options[0]["defaultextension"] == ".dmps"
+    assert options[0]["filetypes"][0][1] == "*.dmps"
+    assert "Recent" in options[0]["title"] and "Sessions" in options[0]["title"]
+    assert app.session.path == target and old.exists() and target.exists()
+    assert not editor.dirty and statuses[-1][1] is False
+
+
+def test_background_save_as_write_failure_is_reported_without_switching(background_editor, monkeypatch,
+                                                                      tmp_path, sessions_folder):
+    app, editor, statuses, cancelled_jobs = background_editor
+    old, timestamp = app.session.path, app.session.saved_at
+    rec = write_recovery(app.session)
+    target = tmp_path / "blocked.dmps"
+    (tmp_path / "blocked.dmps.tmp").mkdir()
+    monkeypatch.setattr(app_module.filedialog, "asksaveasfilename", lambda **kw: str(target))
+    errors = []
+    monkeypatch.setattr(editor_frame.messagebox, "showerror", lambda *a, **kw: errors.append(a))
+
+    assert not app._save_as()
+
+    assert app.session.path == old and app.session.saved_at == timestamp
+    assert editor.dirty and rec.exists() and not target.exists()
+    assert errors and not statuses and not cancelled_jobs
+
+
+@pytest.mark.parametrize("state", ["idle", "parsing", "loading_xlsx"])
+def test_background_save_as_without_active_editor_never_opens_dialog(background_editor, monkeypatch, state):
+    app, *_ = background_editor
+    app.state = state
+    monkeypatch.setattr(app_module.filedialog, "asksaveasfilename",
+                        lambda **kw: pytest.fail("Save As opened without an active editor"))
+    assert not app._save_as()
+
+
+def test_background_rename_changes_output_slug_not_save_filename(background_editor, tmp_path):
+    app, editor, *_ = background_editor
+    old = app.session.path
+    app.session.design.site_info.school_name = "RENAMED SCHOOL"
+
+    assert app._school_slug() == "RENAMED_SCHOOL"
+    assert editor.save()
+    assert app.session.path == old
+    assert load_session(old).design.site_info.school_name == "RENAMED SCHOOL"
+    target = tmp_path / "RENAMED_SCHOOL.dmps"
+    assert editor.save(target)
+    assert app.session.path == target and old.exists()
+
+
+def test_save_as_menu_enabled_only_with_editor(application):
+    application._refresh_file_menu()
+    assert application._file_menu.entrycget("Save As…", "state") == "disabled"
+    project = create_blank_session(SiteInfo(school_name="TEST"))
+    application._enter_editor(project)
+    application._refresh_file_menu()
+    assert application._file_menu.entrycget("Save As…", "state") == "normal"
 
 
 @pytest.fixture

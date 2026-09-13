@@ -35,6 +35,7 @@ from session import (
     SessionLoadError,
     clear_recovery,
     create_blank_session,
+    default_session_path,
     ensure_editable_zones,
     list_recent_sessions,
     load_recovery,
@@ -43,6 +44,7 @@ from session import (
     normalize_zone_descriptions,
     pending_recovery,
     save_session,
+    sessions_dir,
     sync_master_zones,
     unique_session_path,
 )
@@ -113,6 +115,8 @@ must be hyphenated (RSP-3, not RSP 3).
    Saving is explicit — click Save (or Ctrl/Cmd+S). The orange dot and "Unsaved changes" \
 mean you have edits that aren't on disk yet. A background recovery file guards against \
 crashes between saves.
+   File → Save As… switches to a new .dmps file and keeps the old file; only projects \
+saved in the configured Sessions folder appear in Open Recent.
 
 4. GENERATE  (repeat as needed)
    The footer generates the worksheet, door chart, riser, or encrypted RemoteLink account. \
@@ -409,6 +413,7 @@ class App:
                               command=self._process_another)
         file_menu.add_command(label="Save", accelerator=accel("S"),
                               command=self._save_shortcut)
+        file_menu.add_command(label="Save As…", command=self._save_as)
         file_menu.add_command(label="Revert to Saved…",
                               command=self._revert_clicked)
         file_menu.add_separator()
@@ -489,6 +494,7 @@ class App:
         editing = self.state == "editing" and self.editor is not None
         state = "normal" if editing else "disabled"
         self._file_menu.entryconfigure("Save", state=state)
+        self._file_menu.entryconfigure("Save As…", state=state)
         self._file_menu.entryconfigure("Close Project", state=state)
         can_revert = editing and self.session is not None and self.session.path
         self._file_menu.entryconfigure(
@@ -1452,6 +1458,20 @@ class App:
     def _save_shortcut(self, _event=None):
         if self.state == "editing" and self.editor:
             self.editor.save()
+
+    def _save_as(self) -> bool:
+        """Choose a new project file and use the editor's normal save lifecycle."""
+        if self.state != "editing" or self.editor is None or self.session is None:
+            return False
+        target = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Save As — only projects in Sessions appear in Open Recent",
+            initialdir=str(sessions_dir()),
+            initialfile=default_session_path(self.session.design).name,
+            defaultextension=SESSION_EXT,
+            filetypes=[("Saved project", "*.dmps"), ("All files", "*.*")],
+        )
+        return self.editor.save(Path(target)) if target else False
 
     def _on_ui_exception(self, exc_type, exc, tb):
         import traceback as _tb

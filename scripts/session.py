@@ -123,7 +123,11 @@ def _slugify(name: str) -> str:
 
 
 def default_session_path(design: DMPDesign) -> Path:
-    return sessions_dir() / f"{_slugify(design.site_info.school_name or '')}{SESSION_EXT}"
+    stem = _slugify(design.site_info.school_name or '')
+    # Generated filenames must be portable, even when created on macOS.
+    if re.fullmatch(r"CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]", stem, re.IGNORECASE):
+        stem = "_" + stem
+    return sessions_dir() / f"{stem}{SESSION_EXT}"
 
 
 def unique_session_path(design: DMPDesign) -> Path:
@@ -132,15 +136,16 @@ def unique_session_path(design: DMPDesign) -> Path:
     Importing a worksheet (.xlsx) starts a *new* project, but default_session_path
     keys only on the school name — so a second project for the same school would
     overwrite the first. When the default slot is already taken on disk, fall back
-    to ' (2)', ' (3)', … leaving the prior project's .dmps intact.
+    to ' (2)', ' (3)', … leaving the prior project's .dmps intact. Recovery-only
+    slots are reserved too, so initial saving never clears older unsaved work.
     """
     base = default_session_path(design)
-    if not base.exists():
+    if not base.exists() and not recovery_path(base).exists():
         return base
     n = 2
     while True:
         cand = base.parent / f"{base.stem} ({n}){base.suffix}"
-        if not cand.exists():
+        if not cand.exists() and not recovery_path(cand).exists():
             return cand
         n += 1
 
@@ -471,15 +476,18 @@ def _atomic_write(path: Path, text: str) -> None:
 
 
 def save_session(session: Session, path: Path | None = None) -> Path:
-    """Explicit save: commit the session and clear any recovery file."""
+    """Write first, then commit the path/timestamp and clear target recovery."""
     target = path or session.path or default_session_path(session.design)
     ensure_explicit_topology(session.design)
     project_legacy_topology(session.design)
     sync_master_zones(session.design)
-    session.saved_at = datetime.now().isoformat(timespec="seconds")
-    session.path = target
+    saved_at = datetime.now().isoformat(timespec="seconds")
+    payload = _session_to_dict(session)
+    payload["saved_at"] = saved_at
     target.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(target, json.dumps(_session_to_dict(session), indent=1))
+    _atomic_write(target, json.dumps(payload, indent=1))
+    session.path = target
+    session.saved_at = saved_at
     clear_recovery(target)
     return target
 

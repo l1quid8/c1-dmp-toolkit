@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 from datetime import date, datetime
+from pathlib import Path
 from tkinter import messagebox
 
 import customtkinter as ctk
@@ -391,15 +392,19 @@ class EditorFrame(ctk.CTkFrame):
         with contextlib.suppress(Exception):
             write_recovery(self.session)
 
-    def save(self) -> bool:
+    def save(self, path: Path | None = None) -> bool:
+        """Save the current project, optionally switching to a new file."""
         self.flush_design_refresh()
         if hasattr(self, "riser_tab"):
             self.riser_tab.cancel(redraw=False)
+        old_path = self.session.path
         try:
-            save_session(self.session)
+            save_session(self.session, path)
         except Exception as exc:
             messagebox.showerror("Save failed", str(exc))
             return False
+        if old_path is not None and old_path != self.session.path:
+            clear_recovery(old_path)
         self.dirty = False
         if self._recovery_job is not None:
             with contextlib.suppress(Exception):
