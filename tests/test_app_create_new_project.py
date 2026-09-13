@@ -86,6 +86,189 @@ def test_background_create_reserves_old_save_and_recovery_and_lists_recents(monk
     assert app.pdf_path is app.dmp_path is app.door_chart_path is None
 
 
+@pytest.fixture
+def background_close_host(background_editor, monkeypatch):
+    """Exercise the real close guard and deferred recovery without a Tk root."""
+    app, editor, *_ = background_editor
+    app._creating_project, app._generating = False, None
+    editor.edit_epoch = 9
+    jobs = []
+
+    def after(delay, callback):
+        jobs.append((delay, callback))
+        return f"recovery-{len(jobs)}"
+
+    editor.root.after = after
+    for name in ("maybe_close", "_schedule_recovery", "_write_recovery"):
+        setattr(editor, name, MethodType(getattr(editor_frame.EditorFrame, name), editor))
+    app.pdf_path, app.dmp_path, app.door_chart_path = (
+        editor.session.path.with_suffix(suffix) for suffix in (".pdf", ".xlsx", ".chart.xlsx"))
+    choose(monkeypatch, (SiteInfo(school_name="NEW"), {}))
+    monkeypatch.setattr(app_module, "load_prefs", lambda: {})
+    monkeypatch.setattr(app_module.messagebox, "showinfo", lambda *a, **kw: None)
+    monkeypatch.setattr(app_module.messagebox, "showerror",
+                        lambda *a, **kw: pytest.fail(f"Unexpected creation error: {a}"))
+
+    def forbidden(*a, **kw):
+        pytest.fail("Aborted creation reached blank creation, initial save, or editor replacement")
+
+    monkeypatch.setattr(app_module, "create_blank_session", forbidden)
+    monkeypatch.setattr(app_module, "save_session", forbidden)
+    app._enter_editor = forbidden
+    return app, editor, jobs
+
+
+@pytest.mark.parametrize("busy", ["generation", "parsing", "loading_xlsx"])
+def test_background_work_started_during_dirty_close_restores_retained_recovery(
+        background_close_host, monkeypatch, sessions_folder, busy):
+    # Missing the post-close busy guard must start creating a new session here.
+    app, editor, jobs = background_close_host
+    old, epoch = app.session, editor.edit_epoch
+    old.design.site_info.school_code = "UNSAVED"
+    rec = write_recovery(old)
+    before = old.path.read_text()
+    paths = (app.pdf_path, app.dmp_path, app.door_chart_path)
+
+    def discard_after_work_starts(*a, **kw):
+        app._generating = "riser" if busy == "generation" else None
+        app.state = "editing" if busy == "generation" else busy
+        return False
+
+    monkeypatch.setattr(editor_frame.messagebox, "askyesnocancel", discard_after_work_starts)
+
+    app._create_new_project()
+
+    assert app.session is old and app.editor is editor and editor.dirty
+    assert editor.edit_epoch == epoch and old.path.read_text() == before
+    assert (app.pdf_path, app.dmp_path, app.door_chart_path) == paths
+    assert not app._creating_project and not list(sessions_folder.glob("*.dmps"))
+    assert not rec.exists(), "The real Discard must clear recovery before restoration"
+    assert len(jobs) == 1 and jobs[0][0] == 0
+    jobs[0][1]()
+    assert rec.exists() and editor._recovery_job is None
+    assert load_recovery(old.path).design.site_info.school_code == "UNSAVED"
+    assert editor.edit_epoch == epoch
+
+
+@pytest.mark.parametrize("change", ["editor", "session", "editor_session", "both", "closed"])
+def test_background_changed_close_target_aborts_without_touching_replacement(
+        background_close_host, monkeypatch, tmp_path, sessions_folder, change):
+    # Busy checks alone miss a project change that finishes during the modal wait.
+    app, editor, jobs = background_close_host
+    old, epoch = app.session, editor.edit_epoch
+    old.design.site_info.school_code = "OLD UNSAVED"
+    old_rec = write_recovery(old)
+    replacement = create_blank_session(SiteInfo(school_name="REPLACEMENT"))
+    save_session(replacement, tmp_path / "replacement.dmps")
+    replacement.design.site_info.school_code = "REPLACEMENT UNSAVED"
+    replacement_rec = write_recovery(replacement)
+    replacement_text = replacement.path.read_text()
+    replacement_recovery_text = replacement_rec.read_text()
+    replacement_editor = SimpleNamespace(session=replacement, dirty=True,
+        _schedule_recovery=lambda **kw: pytest.fail("Replacement recovery was rescheduled"))
+    paths = (tmp_path / "replacement.pdf", tmp_path / "replacement.xlsx", tmp_path / "chart.xlsx")
+
+    def discard_after_target_changes(*a, **kw):
+        if change in {"editor", "both"}:
+            app.editor = replacement_editor
+        if change in {"session", "both"}:
+            app.session = replacement
+        if change == "closed":
+            app.editor, app.session, app.state = None, None, "idle"
+        app.pdf_path, app.dmp_path, app.door_chart_path = paths
+        return False
+
+    if change == "editor_session":
+        real_close = editor.maybe_close
+        monkeypatch.setattr(editor_frame.messagebox, "askyesnocancel", lambda *a, **kw: False)
+
+        def close_then_reuse_editor():
+            assert real_close() and not old_rec.exists()
+            # Reuse between callbacks; the real Discard still clears only the old recovery.
+            editor.session = replacement
+            app.pdf_path, app.dmp_path, app.door_chart_path = paths
+            return True
+
+        editor.maybe_close = close_then_reuse_editor
+    else:
+        monkeypatch.setattr(editor_frame.messagebox, "askyesnocancel", discard_after_target_changes)
+
+    app._create_new_project()
+
+    assert app.state == ("idle" if change == "closed" else "editing")
+    assert app.session is (replacement if change in {"session", "both"} else
+                           None if change == "closed" else old)
+    assert app.editor is (replacement_editor if change in {"editor", "both"} else
+                          None if change == "closed" else editor)
+    assert (app.pdf_path, app.dmp_path, app.door_chart_path) == paths
+    assert replacement.path.read_text() == replacement_text
+    assert replacement_rec.read_text() == replacement_recovery_text
+    assert editor.edit_epoch == epoch and not app._creating_project
+    assert not old_rec.exists() and not list(sessions_folder.glob("*.dmps"))
+    if change == "session":
+        # This distinct app-session change retained the guarded editor and its old session.
+        assert len(jobs) == 1 and jobs[0][0] == 0
+        jobs[0][1]()
+        assert load_recovery(old.path).design.site_info.school_code == "OLD UNSAVED"
+        assert replacement_rec.read_text() == replacement_recovery_text
+    else:
+        assert jobs == [], "Destroyed/replaced editors or sessions must not be rescheduled"
+
+
+@pytest.mark.parametrize("outcome", ["discard", "save", "cancel", "initial_write_failure"])
+def test_background_close_guard_keeps_existing_creation_and_failure_behavior(
+        background_close_host, monkeypatch, sessions_folder, outcome):
+    app, editor, jobs = background_close_host
+    old, epoch = app.session, editor.edit_epoch
+    old.design.site_info.school_code = "UNSAVED"
+    rec = write_recovery(old)
+    old_text = old.path.read_text()
+    paths = (app.pdf_path, app.dmp_path, app.door_chart_path)
+    answer = True if outcome == "save" else None if outcome == "cancel" else False
+    monkeypatch.setattr(editor_frame.messagebox, "askyesnocancel", lambda *a, **kw: answer)
+    monkeypatch.setattr(app_module, "create_blank_session", create_blank_session)
+    monkeypatch.setattr(app_module, "save_session", save_session)
+    entered, errors = [], []
+    app._enter_editor = lambda project, *, initial_tab: entered.append((project, initial_tab))
+    monkeypatch.setattr(app_module.messagebox, "showerror", lambda *a, **kw: errors.append(a))
+    if outcome == "initial_write_failure":
+        atomic_write = session_module._atomic_write
+
+        def fail_initial_write(target, payload):
+            if target.name == "NEW.dmps":
+                assert not rec.exists(), "Discard must clear the real old recovery first"
+                raise OSError("initial save unavailable")
+            return atomic_write(target, payload)
+
+        monkeypatch.setattr(session_module, "_atomic_write", fail_initial_write)
+
+    app._create_new_project()
+
+    assert editor.edit_epoch == epoch and not app._creating_project
+    if outcome in {"discard", "save"}:
+        assert len(entered) == 1 and entered[0][1] == "RISER"
+        assert load_session(entered[0][0].path).design.site_info.school_name == "NEW"
+        assert app.pdf_path is app.dmp_path is app.door_chart_path is None
+        assert not rec.exists() and jobs == [] and not errors
+        if outcome == "save":
+            assert load_session(old.path).design.site_info.school_code == "UNSAVED"
+        else:
+            assert old.path.read_text() == old_text
+        assert editor.dirty is (outcome == "discard")
+    else:
+        assert not entered and not list(sessions_folder.glob("*.dmps"))
+        assert app.session is old and app.editor is editor and editor.dirty
+        assert (app.pdf_path, app.dmp_path, app.door_chart_path) == paths
+        assert old.path.read_text() == old_text
+        assert bool(errors) is (outcome == "initial_write_failure")
+        if outcome == "initial_write_failure":
+            assert not rec.exists() and len(jobs) == 1 and jobs[0][0] == 0
+            jobs[0][1]()
+        else:
+            assert jobs == []
+        assert load_recovery(old.path).design.site_info.school_code == "UNSAVED"
+
+
 def test_background_ordinary_save_keeps_current_path_and_clears_recovery(background_editor):
     app, editor, statuses, cancelled_jobs = background_editor
     old = app.session.path

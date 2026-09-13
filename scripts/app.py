@@ -1954,6 +1954,8 @@ class App:
             return
         self._creating_project = True
         close_guard_passed = False
+        replacement_saved = False
+        guarded_editor = guarded_editor_session = None
         try:
             prefs = load_prefs()
             result = ask_new_project(self.root, prepared_by=prefs.get("install_tech", ""))
@@ -1965,9 +1967,21 @@ class App:
                                     "Wait for the current import or generation to finish "
                                     "before creating a project.")
                 return
-            if self.editor and not self.editor.maybe_close():
+            guarded_editor, guarded_session = self.editor, self.session
+            guarded_editor_session = guarded_editor.session if guarded_editor else None
+            if guarded_editor and not guarded_editor.maybe_close():
                 return
             close_guard_passed = True
+            # The dirty-close dialog also services callbacks. Do not replace a
+            # different project, or race work that started during that wait.
+            if (self.editor is not guarded_editor or self.session is not guarded_session
+                    or (guarded_editor and guarded_editor.session is not guarded_editor_session)):
+                return
+            if self._generating is not None or self.state in {"parsing", "loading_xlsx"}:
+                messagebox.showinfo("Work in progress",
+                                    "Wait for the current import or generation to finish "
+                                    "before creating a project.")
+                return
             site, title_updates = result
             for field, value in _site_defaults(prefs).items():
                 if value and not (getattr(site, field, None) or "").strip():
@@ -1975,14 +1989,18 @@ class App:
             session = create_blank_session(site, title_block_updates=title_updates)
             session.path = unique_session_path(session.design)
             save_session(session)
+            replacement_saved = True
         except Exception as exc:
-            if close_guard_passed and self.editor and self.editor.dirty:
-                # Discard clears recovery, but the failed replacement stays open.
-                self.editor._schedule_recovery(write_now=True)
             messagebox.showerror("Create New Project", f"Couldn't create the project: {exc}")
             return
         finally:
             self._creating_project = False
+            if (close_guard_passed and not replacement_saved and guarded_editor
+                    and self.editor is guarded_editor
+                    and guarded_editor.session is guarded_editor_session and guarded_editor.dirty):
+                # Discard clears recovery. Restore only the retained dirty close
+                # target, without adding an edit or touching a replacement.
+                guarded_editor._schedule_recovery(write_now=True)
         self.pdf_path = None
         self.dmp_path = None
         self.door_chart_path = None

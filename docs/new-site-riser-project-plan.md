@@ -12,11 +12,13 @@
 
 ## Implementation status — September 12, 2026
 
-All seven phases are source-code and background-verification complete. The final
-settled-code guarded suite passed **725 tests**, with **243 skipped** (237 GUI
-tests pending, 6 existing unavailable sample fixtures), 0 failures/errors, and
-5 existing dependency warnings in 52.95 seconds. Compile checks, Tk-blocked
-app/editor/dialog imports, and dependency consistency checks also exited 0.
+All seven phases are source-code and background-verification complete. After the
+final creation-boundary strengthening below, the settled-code guarded suite passed
+**737 tests**, with **243 skipped** (237 GUI tests pending, 6 existing unavailable
+sample fixtures), 0 failures/errors, and 5 existing dependency warnings in 51.18
+seconds. Changed app/test compile and diff checks also exited 0. The historical
+phase-7 run remains **725 passed, 243 skipped** in 52.95 seconds; its compile,
+Tk-blocked app/editor/dialog imports, and dependency consistency checks exited 0.
 Native packaged acceptance is still pending, so the complete
 definition of done in section 17 has **not** been claimed.
 
@@ -53,6 +55,23 @@ checks were run. The absent v1.3.0 plan caveat in section 16 still applies.
   narrow correction, **not** a global asynchronous ownership/export-service rewrite;
   broader legacy deferred-callback/session-ownership debt remains out of scope.
 
+### Final creation-boundary strengthening
+
+- Creation captures the editor and session guarded for close, then rechecks both
+  identities and import/generation busy state immediately after the dirty-close
+  dialog. Work started during that modal wait, or a changed/closed project that
+  is already idle again, aborts before blank creation, initial save, runtime-path
+  reset, or editor replacement. In-place editor-session changes are also detected.
+- If Discard cleared recovery but creation aborts or its initial write fails,
+  only the still-retained dirty guarded editor/session uses the existing recovery
+  scheduler/writer. Its edit epoch is unchanged; replacement files and recoveries
+  are untouched. Pure background tests cover all three busy states, identity
+  changes, and existing Save/Discard/Cancel/write-failure behavior without Tk.
+- This remains a local App creation-boundary fix, not a global asynchronous
+  ownership rewrite. Existing editor, session schema, models, and import parsers
+  are unchanged. The accidentally tracked task-1 scratch report is untracked,
+  with its ignored local contents retained as evidence.
+
 ### Background-only acceptance boundary
 
 The user's background-only constraint supersedes GUI/native instructions in this
@@ -68,10 +87,10 @@ authorized in this background-only phase. `VERSION` remains unchanged.
 Final local command (run only with the guard):
 
 ```sh
-venv/bin/pytest --no-gui -q -ra --junitxml=.superpowers/sdd/new-site-riser-project-plan/task-7-pytest.xml
+venv/bin/pytest --no-gui -q -ra --junitxml=.superpowers/sdd/new-site-riser-project-plan/final-fix-pytest.xml
 ```
 
-These final 968-test results replace no historical audit baseline and must not be
+These final 980-test results replace no historical audit baseline and must not be
 combined with the interrupted GUI-capable run. The XML is ignored local evidence.
 
 Standalone import smoke checks temporarily block `_tkinter.create` **before**
