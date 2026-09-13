@@ -1,4 +1,4 @@
-# Create New Project / New Riser Project Implementation Plan
+# Create New Project Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -8,7 +8,74 @@
 
 **Tech stack:** Python 3.13, Tk/CustomTkinter, existing dataclass models and schema-8 JSON persistence, pytest, openpyxl, PyMuPDF, and the existing cross-platform PyInstaller application.
 
-**Spec:** This document records the codebase audit and the implementation design requested for a first-class Create New Project / New Riser Project workflow.
+**Spec:** This document records the codebase audit and the implementation design requested for a first-class Create New Project workflow.
+
+## Implementation status — September 12, 2026
+
+All seven phases are source-code and background-verification complete. The final
+settled-code guarded suite passed **725 tests**, with **243 skipped** (237 GUI
+tests pending, 6 existing unavailable sample fixtures), 0 failures/errors, and
+5 existing dependency warnings in 52.95 seconds. Compile checks, Tk-blocked
+app/editor/dialog imports, and dependency consistency checks also exited 0.
+Native packaged acceptance is still pending, so the complete
+definition of done in section 17 has **not** been claimed.
+
+| Phase | Delivered source behavior | Verification status |
+|---|---|---|
+| 1 — Blank session | Pure dataclass-field-whitelisted factory; manual provenance, intentional empty graph, schema-8 save/recovery | Background model/persistence tests complete |
+| 2 — Entry flow | Home/File Create New Project, setup/cancel safety, normal editor with RISER selected; existing imports reopen on ZONES | Background controller tests complete; native GUI pending |
+| 3 — Manual topology | Honest manual review copy, existing service-keypad model/forms, LX500–LX900 per-bus numbering | Background domain tests complete; native forms pending |
+| 4 — Metadata | SITE two-line address and explicit Copy from SITE; independent saved drawing title | Background controller/persistence tests complete; native controls pending |
+| 5 — Lifecycle | Collision-safe initial save, Save As path/recovery switching, old-file preservation, normal recent/reopen rules | Background lifecycle tests complete; native menu/dialog pending |
+| 6 — Outputs | Source-free riser, worksheet then file-based chart, focused RemoteLink readiness and verified XML | Background real-output tests complete; native dialogs pending |
+| 7 — Documentation/regression | Current README/help, PDF/XLSX/DMPS routing characterization and background release checks | Background checks complete; both packaged platforms pending |
+
+The original audit below (sections 1–6 and historical comparison in section 16)
+describes the audited `d966a8a` state, **not** today's delivered behavior. Its
+missing-feature findings are deliberately retained as historical evidence. The
+original task checklists are the proposed acceptance plan, not evidence that GUI
+checks were run. The absent v1.3.0 plan caveat in section 16 still applies.
+
+### Scoped export corrections delivered in phase 6
+
+- The central RemoteLink staging filter excludes every Master-template zone
+  without installed RSP ownership, including when the installed-zone set is empty.
+  Readiness uses the same staging rules, not a competing installed-zone predicate.
+- New **and reopened** manual projects generate their own worksheet in the current
+  runtime before charting. A same-school-slug file elsewhere on disk is not used;
+  imported XLSX immediate charting and PDF/XLSX/legacy-import fallback stay unchanged.
+- Existing synchronous riser auto-layout/sync, worksheet topology/Master projection,
+  and RemoteLink preview/worker Master preparation operate on copies. RemoteLink
+  workers capture matching design/config snapshots; existing seeded riser titles
+  remain intact. Exports leave live blank/unnormalized project state unchanged.
+- Worksheet completion records the edit epoch captured with its design snapshot,
+  so a mid-generation edit retains the existing stale-chart warning. This is a
+  narrow correction, **not** a global asynchronous ownership/export-service rewrite;
+  broader legacy deferred-callback/session-ownership debt remains out of scope.
+
+### Background-only acceptance boundary
+
+The user's background-only constraint supersedes GUI/native instructions in this
+plan. Every local pytest run uses the existing opt-in `--no-gui` guard, which
+prevents Tcl/Tk creation; default GUI-capable CI remains unchanged. The earlier
+interrupted GUI-capable suite is unverified, not a passing result. GUI tests are
+skipped/pending in guarded runs. Neither source controller tests nor packaging
+success can substitute for the 17-item packaged macOS **and** Windows matrix;
+unrun cross-platform CI is not claimed as passed. No application/Tk launches,
+installation, signing, publishing, version changes, or build/install scripts are
+authorized in this background-only phase. `VERSION` remains unchanged.
+
+Final local command (run only with the guard):
+
+```sh
+venv/bin/pytest --no-gui -q -ra --junitxml=.superpowers/sdd/new-site-riser-project-plan/task-7-pytest.xml
+```
+
+These final 968-test results replace no historical audit baseline and must not be
+combined with the interrupted GUI-capable run. The XML is ignored local evidence.
+
+Standalone import smoke checks temporarily block `_tkinter.create` **before**
+importing app/editor/dialog modules; compile checks never run app entrypoints.
 
 ## Global constraints
 
@@ -326,7 +393,7 @@ Do not add a “convert riser project” step. The manual project is an ordinary
 |---|---|
 | Riser | Available immediately; existing riser warnings remain non-blocking |
 | Worksheet | Available immediately from `DMPDesign`; warn clearly if no RSP/zones or worksheet-required site fields are missing |
-| Door chart | Preserve current rule: generate a worksheet first, then build the chart from that file |
+| Door chart | Generate this manual project's own worksheet in the current runtime first, including after reopen, then build the chart from that file; imported fallback remains unchanged |
 | RemoteLink | Keep the project editable, but show a focused readiness message until account/local code is numeric and at least one installed RSP contributes zones; no conversion step |
 | Reopen/edit | Normal DMPS load path; no source document requested |
 
@@ -344,8 +411,9 @@ def create_blank_session(
 ) -> Session:
     design = DMPDesign(site_info=site_info, topology_source="manual")
     document = default_riser_document(design)
+    title_fields = {f.name for f in dataclasses.fields(RiserTitleBlock)}
     for field_name, value in (title_block_updates or {}).items():
-        if hasattr(document.title_block, field_name):
+        if field_name in title_fields:
             setattr(document.title_block, field_name, value)
     design.riser_document = document
     return Session(design=design, source_kind="manual", source_name="")
@@ -497,7 +565,7 @@ Bump the schema only if implementation adds durable fields such as a typed proje
 - [ ] Implement the minimal factory using only `DMPDesign`, `SiteInfo`, `Session`, `RiserTitleBlock`, and `default_riser_document`.
 - [ ] Add save/load and recovery round-trip tests for `source_kind="manual"`, empty connections, title data, and stable equipment-location data.
 - [ ] Assert the saved file still has `schema_version == 8`.
-- [ ] Run `venv/bin/pytest -q tests/test_create_new_project_workflow.py tests/test_session.py tests/test_release_persistence.py`.
+- [ ] Run `venv/bin/pytest --no-gui -q tests/test_create_new_project_workflow.py tests/test_session.py tests/test_release_persistence.py` (GUI acceptance separate).
 
 ### Task 2: Phase 2 — Add the first-class home and menu flow
 
@@ -510,7 +578,7 @@ Bump the schema only if implementation adds durable fields such as a typed proje
 - [ ] Implement `_create_new_project` with the existing dirty-close guard, factory, collision-safe path, atomic initial save, and cleared PDF/XLSX runtime paths.
 - [ ] Add an `initial_tab="ZONES"` default to editor entry and test that only Create New Project opens RISER.
 - [ ] Add a runtime GUI test that the created blank project shows `device:MSP`, the title block, and the existing **Add Device** button.
-- [ ] Run `venv/bin/pytest -q tests/test_app_create_new_project.py tests/test_full_app_project_open.py tests/test_app_recent_projects.py tests/test_riser_app_integration.py`.
+- [ ] Run `venv/bin/pytest --no-gui -q tests/test_app_create_new_project.py tests/test_full_app_project_open.py tests/test_app_recent_projects.py tests/test_riser_app_integration.py` (GUI acceptance separate).
 
 ### Task 3: Phase 3 — Make manual topology honest and fully authorable
 
@@ -522,7 +590,7 @@ Bump the schema only if implementation adds durable fields such as a typed proje
 - [ ] Extend `add_splitter` with the optional `lx_bus` keyword and preserve the default 500 behavior.
 - [ ] Add a dynamic LX bus field to the existing splitter dialog and prove RISER still launches that same form.
 - [ ] Add a keypad-form test demonstrating that the first keypad sourced from MSP produces the existing service-keypad edge and survives save/reopen.
-- [ ] Run `venv/bin/pytest -q tests/test_hardware.py tests/test_validation.py tests/test_riser_hardware_forms.py tests/test_topology_service.py`.
+- [ ] Run `venv/bin/pytest --no-gui -q tests/test_hardware.py tests/test_validation.py tests/test_riser_hardware_forms.py tests/test_topology_service.py` (GUI acceptance separate).
 
 ### Task 4: Phase 4 — Complete metadata and title-block behavior
 
@@ -533,7 +601,7 @@ Bump the schema only if implementation adds durable fields such as a typed proje
 - [ ] Require confirmation before overwriting a different nonempty `project_title`; cancel must be a no-op.
 - [ ] Prove SITE edits do not silently alter title blocks in existing loaded projects until the explicit action is used.
 - [ ] Prove title edits remain riser-only and do not rewrite `SiteInfo`.
-- [ ] Run `venv/bin/pytest -q tests/test_create_new_project_workflow.py tests/test_riser_control_audit.py tests/test_release_editor_integration.py tests/test_rl_account.py tests/test_release_chart_layout.py`.
+- [ ] Run `venv/bin/pytest --no-gui -q tests/test_create_new_project_workflow.py tests/test_riser_control_audit.py tests/test_release_editor_integration.py tests/test_rl_account.py tests/test_release_chart_layout.py` (GUI acceptance separate).
 
 ### Task 5: Phase 5 — Save As and project lifecycle
 
@@ -545,7 +613,7 @@ Bump the schema only if implementation adds durable fields such as a typed proje
 - [ ] Test Save As cancellation and target-write failure without changing `session.path` or dirty state.
 - [ ] Test that recovery after Save As is written beside and recovered through the new path.
 - [ ] Test project rename behavior explicitly: editing the site name changes future output slugs but not the existing session filename until Save As.
-- [ ] Run `venv/bin/pytest -q tests/test_session.py tests/test_app_create_new_project.py tests/test_app_recent_projects.py tests/test_output_dir_rename.py`.
+- [ ] Run `venv/bin/pytest --no-gui -q tests/test_session.py tests/test_app_create_new_project.py tests/test_app_recent_projects.py tests/test_output_dir_rename.py` (GUI acceptance separate).
 
 ### Task 6: Phase 6 — Export readiness and source-free end-to-end coverage
 
@@ -557,19 +625,19 @@ Bump the schema only if implementation adds durable fields such as a typed proje
 - [ ] Surface those issues before the relevant export dialog without introducing a conversion or project-mode flag.
 - [ ] Add an end-to-end test that manually adds an RSP, splitter, service keypad, locations, connections, and cable metadata; saves/reopens; then generates worksheet, door chart, riser PDF/SVG, and verified RemoteLink XML from the same session.
 - [ ] Assert all exports leave the in-memory design, graph, locations, title document, and RemoteLink configuration unchanged.
-- [ ] Run `venv/bin/pytest -q tests/test_create_new_project_workflow.py tests/test_riser_workflows.py tests/test_release_persistence.py tests/test_rl_account.py tests/test_validation.py`.
+- [ ] Run `venv/bin/pytest --no-gui -q tests/test_create_new_project_workflow.py tests/test_riser_workflows.py tests/test_release_persistence.py tests/test_rl_account.py tests/test_validation.py` (GUI acceptance separate).
 
 ### Task 7: Phase 7 — Regression, documentation, and native parity
 
 **Files:** `README.md`, `scripts/app.py` help text, relevant release documentation/tests
 
-- [ ] Update Workflow step 1 to present Create New Project and Import/Open as peers.
-- [ ] Correct SITE/address documentation and describe the intentional title-block separation.
-- [ ] Document service-keypad convention, manual topology review, Save As/recent behavior, and downstream readiness.
-- [ ] Add mocked routing tests proving PDF still calls the PDF parser, XLSX still calls the worksheet parser/shape guard, and DMPS still calls the session/recovery loader; Create New Project must call none of them.
-- [ ] Run the full suite: `venv/bin/pytest -q`.
-- [ ] Run import/compile checks used by the current release process.
-- [ ] Execute the manual acceptance matrix below on packaged macOS and Windows builds.
+- [x] Update Workflow step 1 to present Create New Project and Import/Open as peers.
+- [x] Correct SITE/address documentation and describe the intentional title-block separation.
+- [x] Document service-keypad convention, manual topology review, Save As/recent behavior, and downstream readiness.
+- [x] Add mocked routing tests proving PDF still calls the PDF parser, XLSX still calls the worksheet parser/shape guard, and DMPS still calls the session/recovery loader; Create New Project must call none of them.
+- [x] Run the full background suite: `venv/bin/pytest --no-gui -q -ra --junitxml=.superpowers/sdd/new-site-riser-project-plan/task-7-pytest.xml` — 725 passed, 243 skipped; native acceptance remains pending.
+- [x] Run import/compile checks used by the current release process — blocked-Tk imports, compileall, and pip check exited 0.
+- [ ] Execute the manual acceptance matrix below on packaged macOS and Windows builds — **pending; prohibited during this background-only execution**.
 
 ## 13. Automated test plan
 
@@ -618,7 +686,9 @@ Bump the schema only if implementation adds durable fields such as a typed proje
 
 ## 14. Manual acceptance criteria
 
-Run every item on both macOS and Windows packaged builds.
+Run every item on both macOS and Windows packaged builds in a separately authorized
+native acceptance session. All 17 items are pending here; do not launch either app
+under the present background-only constraint.
 
 1. Launch to home; **Create New Project** and the existing drop/browse import surface are both visible.
 2. Cancel Create New Project; no project or recovery file is created.
@@ -708,7 +778,7 @@ The classification below is grounded in identifiable v1.3-era intent, current co
 
 ### Still relevant
 
-- A source-free Create New Project/New Riser entry point.
+- A source-free Create New Project entry point.
 - Lightweight initial site and title metadata.
 - Immediate entry into the existing riser editor.
 - Manual addition and configuration of all supported equipment and wiring.
@@ -717,7 +787,10 @@ The classification below is grounded in identifiable v1.3-era intent, current co
 - Protection of PDF/XLSX import and old project compatibility.
 - Tests proving manual creation through every downstream output.
 
-### Never implemented or still absent
+### Never implemented or still absent at audit time
+
+These findings describe the September 12 audit at `d966a8a`; the implementation
+status above records their subsequent delivery. They are not current blockers.
 
 - A home/menu action that actually creates a blank project.
 - A blank-session initialization boundary with manual provenance.

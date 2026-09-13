@@ -87,19 +87,31 @@ _WORKFLOW_HELP = """The editor is the working document. The Excel files are arti
 generated from it — they are never re-imported, so always re-open the .dmps project to \
 make changes.
 
-1. IMPORT
-   Drop a design PDF, an existing DMP worksheet (.xlsx), or a saved project (.dmps) onto \
-the home screen. The app parses it and detects the school name.
+1. CREATE NEW PROJECT OR IMPORT/OPEN
+   Create New Project on home or File (Cmd/Ctrl+N) needs only a site / school name. \
+Local code, two-line address, MSP location, sheet number, prepared by, and issue date \
+are optional. Create saves a collision-safe .dmps in Sessions and opens RISER with \
+the existing MSP/title block and no invented equipment or wiring. Cancel saves nothing.
+   Or drop/browse a PDF, DMP worksheet (.xlsx), or saved project (.dmps), or use File \
+→ Open (Cmd/Ctrl+O). PDF/XLSX imports and reopened projects start on ZONES, using the \
+same editor. Recent projects reopen without requesting the original source file.
 
 2. EDIT  (seven tabs)
    • SITE — school, address, contact, tech, install date, IP / gateway, XR-550 location, \
-and RemoteLink panel connection settings.
+and RemoteLink panel connection settings. Setup seeds the riser title; later SITE \
+edits and drawing-title edits stay independent, including after save/reopen. RISER \
+→ Copy from SITE explicitly copies school, local code, address, and school name as \
+the project title (confirming a different nonempty title). Other drawing fields stay \
+unchanged; drawing edits never overwrite SITE.
    • ZONES — searchable grid of every zone. Filter chips: All / Needs attention (blank or \
 "NEW" description) / Spares / Errors. Double-click a cell to edit, including its \
 RemoteLink zone type.
    • SPLITTERS — splitter wiring and CAD conflicts. Tick "Wiring reviewed" once you've \
-checked it against the riser diagram (required before FINAL).
-   • KEYPADS — location, source, RemoteLink device type, name, and displayed areas.
+checked the wiring (required before FINAL). For a manual design, review your authored \
+connections; its topology is not a failed PDF extraction.
+   • KEYPADS — location, source, RemoteLink device type, name, and displayed areas. \
+Keypad 1 sourced directly from MSP is the normal service-keypad convention, not a \
+separate equipment type.
    • RSP/POWER — RSP / power-supply locations; add or remove expanders here.
    • REMOTELINK — account, users, arming model, optional advanced settings, and a live \
 read-back receipt of the account that will be generated.
@@ -117,23 +129,37 @@ must be hyphenated (RSP-3, not RSP 3).
 mean you have edits that aren't on disk yet. A background recovery file guards against \
 crashes between saves.
    File → Save As… switches to a new .dmps file and keeps the old file; only projects \
-saved in the configured Sessions folder appear in Open Recent.
+saved in the configured Sessions folder appear in Open Recent. Recovery follows the \
+new path; cancel or save failure keeps the old path. Changing the output folder changes \
+the active Sessions/recent folder. A SITE name edit changes future output filenames \
+and revision series, not the current project filename; use Save As to rename it.
 
 4. GENERATE  (repeat as needed)
    The footer generates the worksheet, door chart, riser, or encrypted RemoteLink account. \
-The chart is built from the newest worksheet. Each worksheet/chart/riser run writes the next revision \
+Risers need no source file or worksheet, even for an MSP-only design. Worksheets use \
+the shared design and warn about missing site fields, RSPs/zones, and wiring review. \
+The chart is built from a worksheet: manual projects must generate their own worksheet \
+in this runtime first, including after reopen; unrelated same-name files are not used. \
+Imported XLSX files can be charted immediately; existing imported-project fallback stays unchanged.
+   Each worksheet/chart/riser run writes the next revision \
 — school_dmp_rev1.xlsx, rev2, … — keeping earlier revisions, so the normal loop is: \
 generate, print, review with the superintendent, edit, regenerate. If checks are failing \
-you'll see a summary first, but generation is never blocked. You stay in the editor the \
+you'll see a summary first; worksheet/riser warnings do not block generation. You stay in the editor the \
 whole time; a notification offers to open the finished file.
 
    RemoteLink generation uses the settings reviewed across SITE, ZONES, KEYPADS, and \
-REMOTELINK. Its final dialog is read-only and asks only for the encryption passphrase. \
+REMOTELINK. Readiness guidance precedes the passphrase dialog: a numeric account/local \
+code and installed RSP zones are required. Missing prerequisites block only RemoteLink \
+export, never project creation/editing. Master-template rows without installed RSP \
+ownership are excluded. Its final dialog is read-only and asks only for the encryption passphrase. \
 Review the receipt before importing; after import, a qualified technician must verify the \
 account before sending programming to a panel. Help → Inspect RemoteLink Account opens \
 an existing encrypted export without changing it.
 
-Hardware changes (post-CAD): you can add or remove expanders, splitters, and keypads. \
+Hardware changes (manual or imported): add or remove expanders, splitters, and keypads. \
+LX splitters support LX500–LX900 with independent per-bus numbering and matching-bus \
+connections. RSP module numbers and zone addresses are independent; existing devices \
+are not renumbered after removal. \
 Removing hardware re-points anything that fed it to "Spare" and unsources affected \
 keypads — the app pops a summary and routes you to review the new wiring. Template \
 capacities: 15 expanders, 12 LX + 12 KP splitters, 28 keypads."""
@@ -2259,8 +2285,8 @@ class App:
     def _show_shortcuts_help(self):
         mod = "Cmd" if sys.platform == "darwin" else "Ctrl"
         rows = [
-            (f"{mod}+N", "New / close project"),
-            (f"{mod}+O", "Open a PDF or worksheet"),
+            (f"{mod}+N", "Create New Project"),
+            (f"{mod}+O", "Open a PDF, worksheet, or saved project"),
             (f"{mod}+S", "Save the project (.dmps)"),
             (f"{mod}+E", "Generate the DMP worksheet (next revision)"),
             (f"{mod}+D", "Generate the door chart (next revision)"),
