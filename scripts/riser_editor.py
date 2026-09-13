@@ -627,6 +627,29 @@ class RiserEditorController:
                 setattr(self.document.title_block, name, value)
         self._mutate(operation)
 
+    def copy_title_from_site(self, *, confirm_overwrite=None) -> bool:
+        """Explicitly copy site identity, leaving drawing-specific metadata alone.
+
+        A conflicting nonempty project title requires the caller's confirmation
+        before any title fields or undo history are changed.
+        """
+        site = self.design.site_info
+        changes = {
+            "school_name": site.school_name or "",
+            "local_code": site.school_code or "",
+            "address": "\n".join(line for line in (site.address_line1, site.address_line2) if line),
+            "project_title": site.school_name or "",
+        }
+        title = self.document.title_block
+        if title.project_title and title.project_title != changes["project_title"]:
+            if confirm_overwrite is None or not confirm_overwrite(
+                    title.project_title, changes["project_title"]):
+                return False
+        if all(getattr(title, name) == value for name, value in changes.items()):
+            return False
+        self.update_title_block(**changes)
+        return True
+
     def _reroute(self, connection_id: str) -> None:
         edge = next((c for c in self.design.connections if c.id == connection_id), None)
         if edge is None:
@@ -1165,6 +1188,13 @@ class RiserTab(ctk.CTkFrame):
         title = ctk.CTkFrame(self.inspector, fg_color="transparent")
         title.grid(row=5, column=0, sticky="ew", padx=10)
         title.columnconfigure(0, weight=1)
+        ctk.CTkButton(
+            title, text="Copy from SITE", height=28,
+            fg_color=theme.SURFACE_CHIP, hover_color=theme.HOVER_SUBTLE,
+            text_color=theme.TEXT, corner_radius=theme.RADIUS["button"],
+            font=theme.ui_font(theme.SIZE["meta"]),
+            command=self.copy_title_from_site,
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         fields_to_show = (
             ("school_name", "School"), ("local_code", "Local code"),
             ("address", "Address"), ("project_title", "Project"),
@@ -1173,7 +1203,7 @@ class RiserTab(ctk.CTkFrame):
             ("checked_by", "Checked by"), ("issue_date", "Issue date"),
             ("revisions", "Revisions"),
         )
-        for row, (name, label) in enumerate(fields_to_show):
+        for row, (name, label) in enumerate(fields_to_show, start=1):
             ctk.CTkLabel(title, text=label, anchor="w", width=74,
                          text_color=theme.TEXT_SECOND,
                          font=theme.ui_font(theme.SIZE["meta"])).grid(
@@ -2572,6 +2602,21 @@ class RiserTab(ctk.CTkFrame):
             return
         self.layer_visibility[name] = not self.layer_visibility[name]
         self.redraw()
+
+    @live_edit_only
+    def copy_title_from_site(self):
+        def confirm_overwrite(current, replacement):
+            return messagebox.askyesno(
+                "Copy from SITE",
+                f'Replace project title "{current}" with "{replacement}"?\n\n'
+                "School, local code, and address will also be copied from SITE. "
+                "Other drawing fields will stay unchanged.",
+                parent=self,
+            )
+
+        if self.controller.copy_title_from_site(confirm_overwrite=confirm_overwrite):
+            self._sync_title_fields()
+            self._changed()
 
     @live_edit_only
     def _save_title(self, name, variable):

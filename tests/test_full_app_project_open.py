@@ -14,6 +14,7 @@ from session import Session, save_session
 from riser_scene import layout_riser
 from test_riser_workflows import seven_rsp_design
 
+@pytest.mark.gui
 def test_full_app_opens_seven_rsp_project_and_switches_to_riser(tmp_path):
     design = seven_rsp_design()
     design.riser_document = layout_riser(design)

@@ -8,6 +8,7 @@ import tkinter as tk
 from pathlib import Path
 
 import customtkinter as ctk
+import openpyxl
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,11 +16,15 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import app as app_module
 from editor_frame import EditorFrame, TAB_TITLES, TabBar
+from generate_dmp_ws import write_dmp_xlsx
+from inject_door_chart import inject
 from hardware import remove_keypad, renumber_splitter
-from parse_dmp_worksheet import ZoneInfo
+from parse_dmp_worksheet import Zone, ZoneInfo
 from riser_model import DevicePortRef, TopologyConnection
 from rl_injector.rl_config import RLKeypad, RemoteLinkConfig
-from session import Session, sync_master_zones
+from session import Session, sync_master_zones, save_session, load_session
+from parse_dmp_worksheet import parse_dmp_worksheet
+from rl_injector.schema import build_staging_account
 from test_riser_scene import branched_design
 from tk_compat import install_scrollbar_redraw_fix
 from topology_service import connect, set_splitter_input
@@ -144,6 +149,58 @@ def test_site_zone_and_keypad_programming_updates_live_receipt(editor):
     receipt.insert("1.0", "UNSAVED EDIT")
     assert receipt.get("1.0", "end") == before_text
     assert frame.dirty
+
+
+def test_site_address_edits_persist_and_reach_all_existing_export_data_paths(editor, tmp_path):
+    frame, _calls = editor
+    # The canvas fixture needs only one point per RSP; chart generation needs
+    # the actual module ranges, including its supervisory pair.
+    for rsp, first in zip(frame.session.design.rsps, (501, 517)):
+        rsp.zones = list(range(first, first + 16))
+    frame.session.design.master_zones = [
+        Zone(number, f"TEST ZONE {number}", rsp.number)
+        for rsp in frame.session.design.rsps for number in rsp.zones
+    ]
+    before_title = copy.deepcopy(frame.session.design.riser_document.title_block)
+    frame._site_vars["school_name"].set("EDITED SITE")
+    frame._site_vars["school_code"].set("LC-8")
+    frame._site_vars["address_line1"].set(" 1500 Sycamore Lane ")
+    frame._site_vars["address_line2"].set(" Riverton, CA 90000 ")
+    site = frame.session.design.site_info
+    assert (site.address_line1, site.address_line2) == (
+        "1500 Sycamore Lane", "Riverton, CA 90000")
+    assert frame.dirty
+    assert frame.session.design.riser_document.title_block == before_title
+
+    restored = load_session(save_session(frame.session))
+    assert restored.design.site_info == site
+    assert restored.design.riser_document.title_block == before_title
+    worksheet = tmp_path / "edited-site.xlsx"
+    write_dmp_xlsx(restored.design, ROOT / "DMP Installation Worksheet_template_blank.xlsx", worksheet)
+    reread = parse_dmp_worksheet(worksheet)
+    assert (reread.site_info.address_line1, reread.site_info.address_line2) == (
+        "1500 Sycamore Lane", "Riverton, CA 90000")
+    chart = tmp_path / "edited-site-chart.xlsx"
+    inject(ROOT / "door_chart_template_blank.xlsx", reread, chart)
+    wb = openpyxl.load_workbook(chart)
+    try:
+        assert [wb["Header"][cell].value for cell in ("B3", "B4", "B5")] == [
+            "EDITED SITE", "1500 Sycamore Lane", "Riverton, CA 90000"]
+    finally:
+        wb.close()
+    account = build_staging_account(restored.design, "1234", receiver_num="")
+    assert (account.name, account.address, account.city, account.state, account.zip_code) == (
+        "EDITED SITE", "1500 Sycamore Lane", "Riverton", "CA", "90000")
+
+
+def test_site_address_fields_support_clearing_without_changing_riser_title(editor):
+    frame, _calls = editor
+    before_title = copy.deepcopy(frame.session.design.riser_document.title_block)
+    for attr in ("address_line1", "address_line2"):
+        frame._site_vars[attr].set("Address")
+        frame._site_vars[attr].set("  ")
+        assert getattr(frame.session.design.site_info, attr) is None
+    assert frame.session.design.riser_document.title_block == before_title
 
 
 def test_generation_warning_sheet_combines_remotelink_and_topology_issues(editor):

@@ -1136,6 +1136,8 @@ class EditorFrame(ctk.CTkFrame):
     _SITE_FIELDS = [
         ("School name",       "school_name"),
         ("School code",       "school_code"),
+        ("Address line 1",    "address_line1"),
+        ("Address line 2",    "address_line2"),
         ("Main phone",        "phone"),
         ("Install tech name", "install_tech"),
         ("Install date",      "install_date"),
@@ -1183,7 +1185,7 @@ class EditorFrame(ctk.CTkFrame):
             self._site_vars[attr] = var
 
         panel = Card(holder)
-        panel.grid(row=4, column=0, columnspan=2, sticky="ew",
+        panel.grid(row=(len(self._SITE_FIELDS) + 1) // 2, column=0, columnspan=2, sticky="ew",
                    pady=(theme.PAD["md"], 0))
         panel.columnconfigure(0, weight=1)
         panel.columnconfigure(1, weight=1)
