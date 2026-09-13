@@ -759,9 +759,6 @@ class App:
         self._source_lbl.configure(text="")
         self._outdir_lbl.configure(text="")
 
-        primary_button(self.input_section, "Create New Project", self._create_new_project,
-                       width=180).grid(row=0, column=0, sticky="w", pady=(0, theme.PAD["md"]))
-
         # Tk frames can't draw a dashed border, so the spec's dashed outline
         # degrades to a solid 2px one in the same colour.
         dz = ctk.CTkFrame(
@@ -771,23 +768,37 @@ class App:
             corner_radius=12,
             fg_color=theme.SURFACE,
         )
-        dz.grid(row=1, column=0, sticky="ew")
+        dz.grid(row=0, column=0, sticky="ew")
         dz.columnconfigure(0, weight=1)
         # Let the zone shrink-wrap its contents and impose the target size as a
         # row floor instead. Pinning the frame's own height clipped the
         # file-type chips off the bottom edge the moment the stack grew.
-        self.input_section.rowconfigure(1, minsize=168)
+        self.input_section.rowconfigure(0, minsize=168)
         self._drop_zone = dz
 
-        IconTile(dz, "⬆", size=44).grid(row=0, column=0, pady=(22, 10))
+        create_button = primary_button(dz, "Create New Project", self._create_new_project,
+                                       width=200)
+        create_button.grid(row=0, column=0, padx=24, pady=(28, 0))
+
+        divider = ctk.CTkFrame(dz, fg_color="transparent")
+        divider.grid(row=1, column=0, sticky="ew", padx=34, pady=(24, 0))
+        divider.columnconfigure(0, weight=1)
+        divider.columnconfigure(2, weight=1)
+        for column in (0, 2):
+            ctk.CTkFrame(divider, height=1, corner_radius=0,
+                         fg_color=theme.BORDER_STRONG).grid(row=0, column=column, sticky="ew")
+        ctk.CTkLabel(divider, text="or", font=theme.ui_font(theme.SIZE["chip"]),
+                     text_color=theme.TEXT_SECOND).grid(row=0, column=1, padx=15)
+
+        IconTile(dz, "⬆", size=44).grid(row=2, column=0, pady=(18, 10))
         ctk.CTkLabel(
             dz, text="Drop a design file to start",
             font=theme.ui_font(theme.SIZE["drop_title"], "bold"),
             text_color=theme.TEXT,
-        ).grid(row=1, column=0)
+        ).grid(row=3, column=0)
 
         sub = ctk.CTkFrame(dz, fg_color="transparent")
-        sub.grid(row=2, column=0, pady=(3, 0))
+        sub.grid(row=4, column=0, pady=(3, 0))
         ctk.CTkLabel(sub, text="or ", font=theme.ui_font(theme.SIZE["chip"]),
                      text_color=theme.TEXT_SECOND).pack(side="left")
         ctk.CTkLabel(sub, text="browse…",
@@ -795,11 +806,15 @@ class App:
                      text_color=theme.ACCENT).pack(side="left")
 
         types = ctk.CTkFrame(dz, fg_color="transparent")
-        types.grid(row=3, column=0, pady=(12, 20))
+        types.grid(row=5, column=0, pady=(12, 26))
         for kind in ("PDF", "XLSX", "DMPS"):
             Chip(types, kind, size=theme.SIZE["label"]).pack(side="left", padx=3)
 
         def walk(widget):
+            # Keep the creation button's native command/canvas bindings intact.
+            # Only the import surface should open the file picker on click.
+            if widget is create_button:
+                return
             yield widget
             for child in widget.winfo_children():
                 yield from walk(child)

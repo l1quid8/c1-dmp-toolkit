@@ -463,7 +463,8 @@ def test_home_create_action_keeps_file_drop_and_browse(application):
                if isinstance(w, ctk.CTkButton) and w.cget("text") == "Create New Project"]
     assert len(buttons) == 1
     assert buttons[0].winfo_ismapped()
-    assert buttons[0].winfo_rooty() < application._drop_zone.winfo_rooty()
+    assert buttons[0].master is application._drop_zone
+    assert buttons[0].winfo_rooty() > application._drop_zone.winfo_rooty()
     assert {"PDF", "XLSX", "DMPS", "browse…"} <= set(labels(application.input_section))
 
 
