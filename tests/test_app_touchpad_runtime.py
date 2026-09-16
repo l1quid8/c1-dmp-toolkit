@@ -132,6 +132,10 @@ def test_site_lower_fields_reachable_at_minimum_window_size(project):
     for _ in range(30):
         gesture(canvas, dy=-24)
     assert canvas.yview()[1] == 1
+    gesture(canvas, dy=24)
+    assert canvas.yview()[1] < 1
+    gesture(canvas, dy=-24)
+    assert canvas.yview()[1] == 1
     project.root.update_idletasks()
     entries = [w for w in descendants(pane) if isinstance(w, ctk.CTkEntry)]
     bottom = max(w.winfo_rooty() + w.winfo_height() for w in entries)

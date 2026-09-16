@@ -44,9 +44,15 @@ def install_touchpad_scroll(root) -> None:
                         # CTk uses eight-pixel increments on macOS. Retain
                         # rounding loss so slow one-pixel gestures accumulate.
                         target = current[0] * extent + remainder - int(delta)
-                        target = max(0, min(target, (1 - current[1] + current[0]) * extent))
-                        move(target / extent)
-                        pending[axis] = (view(), extent, target - view()[0] * extent)
+                        # Tk's effective viewport can differ by a few pixels
+                        # at the edge; let Tk clamp against the real limit.
+                        move(max(0, target / extent))
+                        settled = view()
+                        pressed_edge = ((settled[0] == 0 and delta > 0)
+                                        or (settled[1] == 1 and delta < 0))
+                        remainder = (0 if pressed_edge
+                                     else target - settled[0] * extent)
+                        pending[axis] = (settled, extent, remainder)
                 widget._c1_touchpad_pending = pending
                 return "break"
             widget = widget.master
