@@ -51,7 +51,11 @@ jobs:
         # skipping the editor integration suite for lack of a Tk display.
         run: python -c "import tkinter as tk; from tkinterdnd2 import TkinterDnD; root = TkinterDnD.Tk(); root.withdraw(); print('Tk', root.tk.call('info', 'patchlevel')); root.update(); root.destroy()"
       - name: Run regression suite
-        run: python -m pytest -q -ra --junitxml=test-results/pytest.xml
+        # --no-gui keeps the suite background-safe: Tk creates no windows, so
+        # it cannot hang the runner's display. The conftest guard preserves
+        # explicit GUI coverage as skips for CI; a separate interactive run
+        # (no --no-gui) is used locally when a display is available.
+        run: python -m pytest -q -ra --no-gui --junitxml=test-results/pytest.xml
       - name: Upload test report
         if: always()
         uses: actions/upload-artifact@v4
