@@ -203,6 +203,26 @@ def test_site_address_fields_support_clearing_without_changing_riser_title(edito
     assert frame.session.design.riser_document.title_block == before_title
 
 
+def test_remotelink_account_address_edits_update_receipt_and_saved_project(editor):
+    """Removing the Account address controls would strand an OCR miss in the template."""
+    frame, _calls = editor
+    tab = frame.remotelink_tab
+
+    tab._address_vars["address_line1"].set("2700 EAST 41ST STREET")
+    tab._address_vars["address_line2"].set("TULSA, OK 74105")
+
+    assert frame.session.design.site_info.address_line1 == "2700 EAST 41ST STREET"
+    assert frame.session.design.site_info.address_line2 == "TULSA, OK 74105"
+    assert "2700 EAST 41ST STREET, TULSA, OK, 74105" in tab.receipt.get("1.0", "end")
+    assert frame.dirty
+
+    assert frame.save()
+    reopened = load_session(frame.session.path)
+    assert reopened.design.site_info.address_line1 == "2700 EAST 41ST STREET"
+    assert reopened.design.site_info.address_line2 == "TULSA, OK 74105"
+
+
+
 def test_generation_warning_sheet_combines_remotelink_and_topology_issues(editor):
     frame, _calls = editor
     frame._rl_comm_vars["port"].set("invalid")

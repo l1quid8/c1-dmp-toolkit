@@ -18,7 +18,12 @@ from topology_service import ensure_explicit_topology, reconnect
 
 def _combined_session(path):
     design = DMPDesign(
-        site_info=SiteInfo(school_name="MAPLEWOOD DEMO", school_code="9999"),
+        site_info=SiteInfo(
+            school_name="MAPLEWOOD DEMO",
+            school_code="9999",
+            address_line1="1500 SYCAMORE LANE",
+            address_line2="RIVERTON, CA 90000",
+        ),
         splitters=[Splitter("710-LX500-1", "LX", "MDF",
                             {"LX-Bus In": "500 BUS IN FROM XR/550"},
                             ["RSP-1", "Spare", "Spare"])],

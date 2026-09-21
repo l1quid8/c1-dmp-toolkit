@@ -86,6 +86,7 @@ class RemoteLinkTab(ctk.CTkFrame):
         self._danger_confirmed = False
         self._focus_targets: dict[str, ctk.CTkBaseClass] = {}
         self._identity_vars: dict[str, tk.StringVar] = {}
+        self._address_vars: dict[str, tk.StringVar] = {}
         self._advanced_open = False
 
         self.columnconfigure(0, weight=0, minsize=550)
@@ -142,6 +143,23 @@ class RemoteLinkTab(ctk.CTkFrame):
             entry.grid(row=1, column=column, sticky="ew",
                        padx=(0 if column == 0 else 6, 6 if column == 0 else 0))
             self._identity_vars[attr] = var
+            self._focus_targets[f"field:{attr}"] = entry
+
+        site = self.session.design.site_info
+        for column, (label, attr) in enumerate((
+            ("Street address", "address_line1"),
+            ("City, State ZIP", "address_line2"),
+        )):
+            _label(fields, label).grid(row=2, column=column, sticky="w",
+                                       padx=(0 if column == 0 else 6, 0),
+                                       pady=(theme.PAD["sm"], 0))
+            var = tk.StringVar(value=getattr(site, attr, None) or "")
+            var.trace_add("write", lambda *_a, a=attr, v=var:
+                          self._set_address(a, v.get()))
+            entry = _entry(fields, textvariable=var)
+            entry.grid(row=3, column=column, sticky="ew",
+                       padx=(0 if column == 0 else 6, 6 if column == 0 else 0))
+            self._address_vars[attr] = var
             self._focus_targets[f"field:{attr}"] = entry
 
     def _visible_users(self) -> list[RLUser]:
@@ -447,6 +465,12 @@ class RemoteLinkTab(ctk.CTkFrame):
                 self._building = False
         self._changed()
 
+    def _set_address(self, attr: str, value: str):
+        if self._building:
+            return
+        setattr(self.session.design.site_info, attr, value.strip())
+        self._changed()
+
     def _changed(self):
         if self._building:
             return
@@ -503,6 +527,12 @@ class RemoteLinkTab(ctk.CTkFrame):
                 if var is not None and var.get() != value:
                     var.set(value)
                     account_changed = account_changed or attr == "account_num"
+            site = self.session.design.site_info
+            for attr in ("address_line1", "address_line2"):
+                value = getattr(site, attr, None) or ""
+                var = self._address_vars.get(attr)
+                if var is not None and var.get() != value:
+                    var.set(value)
             if account_changed and not self.session.remotelink.users_customized:
                 self._build_users(1)
         finally:

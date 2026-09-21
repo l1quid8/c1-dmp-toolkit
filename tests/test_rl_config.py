@@ -360,13 +360,18 @@ def test_remotelink_refresh_updates_site_derived_identity_and_default_users():
             self.value = value
 
     tab = object.__new__(RemoteLinkTab)
-    tab.session = SimpleNamespace(
-        design=_design("3141"), remotelink=RemoteLinkConfig(),
-    )
+    design = _design("3141")
+    design.site_info.address_line1 = "2700 EAST 41ST STREET"
+    design.site_info.address_line2 = "TULSA, OK 74105"
+    tab.session = SimpleNamespace(design=design, remotelink=RemoteLinkConfig())
     tab._building = False
     tab._identity_vars = {
         "account_num": Value("2250"),
         "receiver_num": Value("1"),
+    }
+    tab._address_vars = {
+        "address_line1": Value("OLD STREET"),
+        "address_line2": Value("OLD CITY"),
     }
     rebuilt_users = []
     tab._build_users = lambda _row: rebuilt_users.extend(tab._visible_users())
@@ -375,6 +380,8 @@ def test_remotelink_refresh_updates_site_derived_identity_and_default_users():
     tab.refresh()
 
     assert tab._identity_vars["account_num"].get() == "3141"
+    assert tab._address_vars["address_line1"].get() == "2700 EAST 41ST STREET"
+    assert tab._address_vars["address_line2"].get() == "TULSA, OK 74105"
     assert [(user.number, user.code) for user in rebuilt_users] == [
         (1, "3141"), (9999, "13141"),
     ]
