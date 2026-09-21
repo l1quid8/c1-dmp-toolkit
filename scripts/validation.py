@@ -81,6 +81,12 @@ def _rule_zone_descriptions(design: DMPDesign, ctx: dict) -> Iterator[Issue]:
                 ref=f"zone:{z.number}",
                 message=f"Z{z.number} is still the 'NEW' placeholder",
             )
+        elif "LOCATION NEEDS REVIEW" in desc.upper():
+            yield Issue(
+                code="zone.location_review", severity="warning", tab=TAB_ZONES,
+                ref=f"zone:{z.number}",
+                message=f"Z{z.number} needs its sensor location reviewed",
+            )
         elif desc.upper() == "SPARE" and desc != "SPARE":
             yield Issue(
                 code="zone.spare_case", severity="error", tab=TAB_ZONES,

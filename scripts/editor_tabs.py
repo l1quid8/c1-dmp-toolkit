@@ -40,6 +40,8 @@ from hardware import (
     remove_expander,
     remove_keypad,
     remove_splitter,
+    renumber_expander,
+    renumber_expanders,
     renumber_splitter,
 )
 from session import Session
@@ -846,7 +848,7 @@ class SplittersTab(ctk.CTkFrame):
         self.on_hardware_change(
             lambda: remove_splitter(self.session.design, splitter.id))
 
-    def _renumber_clicked(self, splitter, entry):
+    def _renumber_clicked(self, splitter, entry, lx_bus=None, reset_bus=None):
         if not entry.winfo_exists():
             return  # widget already torn down by a prior rebuild
         text = entry.get().strip()
@@ -854,19 +856,22 @@ class SplittersTab(ctk.CTkFrame):
         if not text.isdigit():
             entry.delete(0, "end")
             entry.insert(0, cur_num)
-            return
+            return False
         new_number = int(text)
-        if str(new_number) == cur_num:
-            return  # unchanged
+        if str(new_number) == cur_num and (lx_bus is None or lx_bus == _lx_bus_number(splitter)):
+            return True  # unchanged
         try:
-            renumber_splitter(self.session.design, splitter.id, new_number)
+            renumber_splitter(self.session.design, splitter.id, new_number, lx_bus=lx_bus)
         except HardwareError as exc:
-            messagebox.showwarning("Can't renumber splitter", str(exc),
-                                   parent=self.winfo_toplevel())
             entry.delete(0, "end")
             entry.insert(0, cur_num)
-            return
+            if reset_bus is not None:
+                reset_bus()
+            messagebox.showwarning("Can't renumber splitter", str(exc),
+                                   parent=entry.winfo_toplevel())
+            return False
         self.on_structure_change()
+        return True
 
     # ---- splitter cards ----
 
@@ -914,21 +919,51 @@ class SplittersTab(ctk.CTkFrame):
 
         id_row = ctk.CTkFrame(card, fg_color="transparent")
         id_row.grid(row=0, column=0, sticky="w", padx=(12, 0), pady=(11, 0))
-        prefix = splitter.id.rsplit("-", 1)[0] + "-"
+        is_lx = splitter.splitter_type == "LX"
+        prefix = "710-LX" if is_lx else splitter.id.rsplit("-", 1)[0] + "-"
         ctk.CTkLabel(id_row, text=prefix, text_color=theme.TEXT,
                      font=theme.mono_font(13, "bold")).pack(side="left")
+        bus_entry = None
+        if is_lx:
+            bus_entry = _styled_entry(id_row, width=48,
+                                     height=theme.HEIGHT["control"],
+                                     justify="center", font=theme.mono_font(13, "bold"))
+            bus_entry.insert(0, _lx_bus_number(splitter))
+            bus_entry.pack(side="left")
+            attach_tooltip(bus_entry, "LX bus: 500, 600, 700, 800, or 900")
+            ctk.CTkLabel(id_row, text="-", text_color=theme.TEXT,
+                         font=theme.mono_font(13, "bold")).pack(side="left")
         num_entry = _styled_entry(id_row, width=40,
                                   height=theme.HEIGHT["control"],
-                                  justify="center",
-                                  font=theme.mono_font(13, "bold"))
-        cur_num = splitter.id.rsplit("-", 1)[-1]
-        num_entry.insert(0, cur_num)
+                                  justify="center", font=theme.mono_font(13, "bold"))
+        num_entry.insert(0, splitter.id.rsplit("-", 1)[-1])
         num_entry.pack(side="left")
-        num_entry.bind("<Return>",
-                       lambda _e, s=splitter, w=num_entry: self._renumber_clicked(s, w))
-        num_entry.bind("<FocusOut>",
-                       lambda _e, s=splitter, w=num_entry: self._renumber_clicked(s, w))
-        card.commit_pending = lambda: self._renumber_clicked(splitter, num_entry)
+
+        committing_id = False
+
+        def reset_bus():
+            if bus_entry is not None and bus_entry.winfo_exists():
+                bus_entry.delete(0, "end")
+                bus_entry.insert(0, _lx_bus_number(splitter))
+
+        def commit_id(_event=None):
+            nonlocal committing_id
+            if committing_id or not num_entry.winfo_exists():
+                return
+            committing_id = True
+            try:
+                bus = bus_entry.get().strip() if bus_entry is not None else None
+                result = self._renumber_clicked(splitter, num_entry, lx_bus=bus, reset_bus=reset_bus)
+                reset_bus()
+                return result
+            finally:
+                committing_id = False
+
+        for entry in (num_entry, bus_entry):
+            if entry is not None and parent is None:
+                entry.bind("<Return>", commit_id)
+                entry.bind("<FocusOut>", commit_id)
+        card.commit_pending = commit_id
 
         loc_var = tk.StringVar(value=splitter.location or "")
 
@@ -1327,18 +1362,24 @@ class KeypadsTab(ctk.CTkFrame):
                      font=theme.mono_font(13, "bold"),
                      ).grid(row=0, column=0, sticky="w", padx=12, pady=(11, 0))
 
-        loc_var = tk.StringVar(value=kp.location or "")
+        location = ctk.CTkTextbox(
+            card, height=60, wrap="word", border_width=1,
+            border_color=theme.BORDER_STRONG, fg_color=theme.SURFACE,
+            text_color=theme.TEXT, font=theme.ui_font(theme.SIZE["chip"]),
+            corner_radius=theme.RADIUS["button"])
+        location.insert("1.0", kp.location or "")
+        location.grid(row=0, column=1, sticky="ew",
+                      padx=(theme.PAD["sm"], theme.PAD["xs"]), pady=(11, 0))
+        location.edit_modified(False)
 
-        def loc_edited(*_a, k=kp):
-            k.location = loc_var.get().strip() or None
+        def loc_edited(_event=None, k=kp):
+            if not location.edit_modified():
+                return
+            location.edit_modified(False)
+            k.location = location.get("1.0", "end-1c").strip() or None
             self.on_change()
 
-        loc_var.trace_add("write", loc_edited)
-        _styled_entry(card, textvariable=loc_var,
-                      placeholder_text="Keypad location",
-                      ).grid(row=0, column=1, sticky="ew",
-                             padx=(theme.PAD["sm"], theme.PAD["xs"]),
-                             pady=(11, 0))
+        location.bind("<<Modified>>", loc_edited)
 
         remove_button(card, lambda k=kp: self._remove_clicked(k)).grid(
             row=0, column=2, padx=(0, theme.PAD["sm"]), pady=(11, 0))
@@ -1505,6 +1546,7 @@ class PowerTab(ctk.CTkFrame):
         # Accepted for a uniform tab contract; this tab has nothing to link to.
         self.on_navigate = on_navigate
         self._location_vars: dict[int, tk.StringVar] = {}
+        self._number_vars: dict[int, tk.StringVar] = {}
         self._syncing_locations = False
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
@@ -1517,6 +1559,9 @@ class PowerTab(ctk.CTkFrame):
 
     def refresh(self):
         self._location_vars.clear()
+        pending_numbers = {number: variable.get() for number, variable in self._number_vars.items()}
+        self._number_vars.clear()
+        self._pending_numbers = pending_numbers
         for w in self.body.winfo_children():
             w.destroy()
 
@@ -1547,6 +1592,24 @@ class PowerTab(ctk.CTkFrame):
         for i, rsp in enumerate(design.rsps):
             self._build_rsp_card(rsp, ps_by_number).grid(
                 row=i + 1, column=0, sticky="ew", pady=4)
+
+    def commit_numbers(self):
+        numbers = {}
+        try:
+            for number, variable in self._number_vars.items():
+                value = variable.get().strip()
+                if not value.isascii() or not value.isdigit():
+                    raise HardwareError("Enter whole RSP/PS numbers between 1 and 15.")
+                numbers[number] = int(value)
+            changed = any(old != new for old, new in numbers.items())
+            renumber_expanders(self.session.design, numbers)
+        except HardwareError as exc:
+            messagebox.showwarning("Can't save RSP/PS numbers", str(exc), parent=self.winfo_toplevel())
+            return False
+        if changed:
+            self._number_vars.clear()
+            self.on_structure_change()
+        return True
 
     def sync_locations(self):
         """Reflect external assignments without rebuilding fields or firing edits."""
@@ -1584,9 +1647,48 @@ class PowerTab(ctk.CTkFrame):
         card.columnconfigure(1, weight=1)
 
         zr = f"Z{min(rsp.zones)}–Z{max(rsp.zones)}" if rsp.zones else "no zones"
-        ctk.CTkLabel(card, text=f"RSP-{rsp.number} / PS-{rsp.number}",
-                     text_color=theme.TEXT, font=theme.mono_font(13, "bold"),
-                     ).grid(row=0, column=0, sticky="w", padx=12, pady=(11, 0))
+        id_row = ctk.CTkFrame(card, fg_color="transparent")
+        id_row.grid(row=0, column=0, sticky="w", padx=12, pady=(11, 0))
+        ctk.CTkLabel(id_row, text="RSP / PS", text_color=theme.TEXT,
+                     font=theme.mono_font(13, "bold")).pack(side="left", padx=(0, 6))
+        num_entry = _styled_entry(id_row, width=45, justify="center",
+                                  font=theme.mono_font(13, "bold"))
+        if parent is None:
+            number_var = tk.StringVar(value=self._pending_numbers.get(rsp.number, str(rsp.number)))
+            self._number_vars[rsp.number] = number_var
+            num_entry.configure(textvariable=number_var)
+            number_var.trace_add("write", lambda *_: self.on_change())
+        else:
+            num_entry.insert(0, str(rsp.number))
+        num_entry.pack(side="left")
+        attach_tooltip(num_entry, "Shared RSP and power supply number (1–15). Zone addresses stay the same.")
+        committing = False
+
+        def commit_number(_event=None):
+            nonlocal committing
+            if committing or not num_entry.winfo_exists():
+                return
+            committing = True
+            try:
+                value = num_entry.get().strip()
+                if value == str(rsp.number):
+                    return True
+                try:
+                    if not value.isascii() or not value.isdigit():
+                        raise HardwareError("Enter a whole RSP/PS number between 1 and 15.")
+                    renumber_expander(self.session.design, rsp.number, int(value))
+                except HardwareError as exc:
+                    num_entry.delete(0, "end")
+                    num_entry.insert(0, str(rsp.number))
+                    messagebox.showwarning("Can't renumber RSP/PS", str(exc),
+                                           parent=num_entry.winfo_toplevel())
+                    return False
+                self.on_structure_change()
+                return True
+            finally:
+                committing = False
+
+        card.commit_pending = self.commit_numbers if parent is None else commit_number
         meta = ctk.CTkFrame(card, fg_color="transparent")
         meta.grid(row=1, column=0, sticky="w", padx=12, pady=(4, 11))
         Chip(meta, rsp.model, variant="outline", pill=False,
@@ -1604,7 +1706,8 @@ class PowerTab(ctk.CTkFrame):
                 return
             value = loc_var.get().strip() or None
             r.location = value
-            ps = ps_by_number.get(r.number)
+            ps = next((ps for ps in self.session.design.power_supplies
+                       if ps.number == r.number), None)
             if ps is not None:
                 ps.location = value
             self.on_change()

@@ -28,6 +28,8 @@ from generate_dmp_ws import (
     DEFAULT_TEMPLATE,
 )
 from parse_dmp_worksheet import parse_dmp_worksheet, worksheet_looks_like_dmp
+from parse_bom import parse_bom, NotBOMError
+from bom_review_dialog import ask_bom_review
 from inject_door_chart import inject, _slugify
 from session import (
     SESSION_EXT,
@@ -92,7 +94,7 @@ make changes.
 Local code, two-line address, MSP location, sheet number, prepared by, and issue date \
 are optional. Create saves a collision-safe .dmps in Sessions and opens RISER with \
 the existing MSP/title block and no invented equipment or wiring. Cancel saves nothing.
-   Or drop/browse a PDF, DMP worksheet (.xlsx), or saved project (.dmps), or use File \
+   Or drop/browse a PDF, DMP worksheet or BOM (.xlsx), or saved project (.dmps), or use File \
 → Open (Cmd/Ctrl+O). PDF/XLSX imports and reopened projects start on ZONES, using the \
 same editor. Recent projects reopen without requesting the original source file.
 
@@ -807,7 +809,7 @@ class App:
 
         types = ctk.CTkFrame(dz, fg_color="transparent")
         types.grid(row=5, column=0, pady=(12, 26))
-        for kind in ("PDF", "XLSX", "DMPS"):
+        for kind in ("PDF", "XLSX", "BOM", "DMPS"):
             Chip(types, kind, size=theme.SIZE["label"]).pack(side="left", padx=3)
 
         def walk(widget):
@@ -1258,11 +1260,11 @@ class App:
 
     def _choose_pdf(self):
         path = filedialog.askopenfilename(
-            title="Choose design PDF, DMP worksheet, or saved project",
+            title="Choose design PDF, DMP worksheet, BOM, or saved project",
             filetypes=[
-                ("PDF, worksheet, or project", "*.pdf *.xlsx *.dmps"),
+                ("PDF, Excel, or project", "*.pdf *.xlsx *.dmps"),
                 ("PDF files", "*.pdf"),
-                ("DMP worksheet", "*.xlsx"),
+                ("DMP worksheet or BOM", "*.xlsx"),
                 ("Saved project", "*.dmps"),
                 ("All files", "*.*"),
             ],
@@ -1340,30 +1342,47 @@ class App:
         self._run_async(work, on_done, on_error)
 
     def _start_load_worksheet(self, xlsx_path: Path):
-        """Load an already-generated DMP worksheet (.xlsx) into the editor,
-        skipping PDF parsing.
+        """Load a DMP worksheet or a supported equipment BOM into the editor.
 
-        self.dmp_path points at the imported file, so 'Generate Door Chart' is
-        available immediately and builds from it as-is; generating a worksheet
-        revision re-points dmp_path at the new file.
+        Only a DMP worksheet becomes an immediate Door Chart source. A BOM
+        starts a draft and requires worksheet generation first.
         """
         self.dmp_path = xlsx_path
         self.pdf_path = None
         self.parsed_design = None
         self.state = "loading_xlsx"
         self._stop_spinners()
-        self._show_file_card(xlsx_path.name, parsing=True, busy_text=" Reading worksheet…")
+        self._show_file_card(xlsx_path.name, parsing=True, busy_text=" Reading Excel file…")
 
         def work():
             with contextlib.redirect_stdout(self._redirector), \
                  contextlib.redirect_stderr(self._redirector):
-                return parse_dmp_worksheet(xlsx_path)
+                design = parse_dmp_worksheet(xlsx_path)
+                if worksheet_looks_like_dmp(design):
+                    return design, None, True
+                try:
+                    return design, parse_bom(xlsx_path), False
+                except NotBOMError:
+                    return design, None, False
 
-        def on_done(design):
+        def on_done(result):
             if self.state != "loading_xlsx":
                 return
             self._stop_spinners()
-            if not worksheet_looks_like_dmp(design):
+            design, bom, is_dmp = result
+            if bom is not None:
+                self.dmp_path = None  # A BOM is never a generated worksheet.
+                if not ask_bom_review(self.root, bom.review_text):
+                    self.state = "idle"
+                    return
+                design = bom.design
+                self._show_file_card(xlsx_path.name, parsing=False,
+                                     school_name=design.site_info.school_name or "Unknown")
+                self._enter_editor(Session(design=design, source_kind="bom",
+                                           source_name=xlsx_path.name,
+                                           path=unique_session_path(design)))
+                return
+            if not is_dmp:
                 self.state = "idle"
                 self.dmp_path = None
                 self._show_parse_error(
@@ -1552,7 +1571,7 @@ class App:
         if self.session is not None:
             # A new/reopened manual project must generate its own worksheet;
             # a matching school slug on disk can belong to a different project.
-            if self.session.source_kind == "manual":
+            if self.session.source_kind in {"manual", "bom"}:
                 return None
             return latest_rev_path(self.output_dir, f"{self._school_slug()}_dmp")
         return None

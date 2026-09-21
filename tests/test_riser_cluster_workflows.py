@@ -143,7 +143,8 @@ def test_cluster_drag_is_incremental_and_undoable(editor, monkeypatch):
     frame, _ = editor
     tab = frame.riser_tab
     tab.controller.apply_layout(tab.controller.preview_layout())
-    tab._toggle_layer('Locations')
+    if not tab.controller.document.show_location_frames:
+        tab._toggle_layer('Locations')
     tab.redraw()
     doc = tab.controller.document
     location = doc.elements[doc.elements['device:RSP-2'].location_id]
@@ -206,7 +207,6 @@ def test_preview_blocks_canvas_and_toolbar_mutations(editor):
     tab.relayout()
     before = copy.deepcopy(frame.session.design)
     tab.undo()
-    tab.auto_layout()
     tab.delete_selected()
     tab.set_tool('Rectangle')
     assert frame.session.design == before

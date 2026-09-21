@@ -8,8 +8,9 @@ import pytest
 from test_riser_scene import branched_design
 from test_release_editor_integration import editor
 from riser_editor import RiserEditorController
-from riser_drawing import device_text
-from riser_scene import layout_riser, sync_riser_document, validate_riser
+from riser_drawing import device_text, location_text_runs
+from riser_scene import layout_riser, port_point, sync_riser_document, validate_riser
+from riser_symbols import detailed_size
 from riser_render import render_svg, render_pdf
 from session import Session, save_session, load_session
 
@@ -20,30 +21,31 @@ def approved_scene():
     return design, controller, controller.preview_layout()
 
 
-def test_preview_uses_compact_710s_and_electrical_levels_without_changing_project():
+def test_preview_uses_original_symbols_and_branch_order_without_changing_project():
     d = branched_design()
     old = layout_riser(d)
     snapshot = copy.deepcopy((d.connections, old))
     c = RiserEditorController(d, old)
     preview = c.preview_layout()
     assert preview.layout_version == 3
-    assert (preview.elements['device:710-LX500-1'].width,
-            preview.elements['device:710-LX500-1'].height) == (210, 135)
+    card = preview.elements['device:710-LX500-1']
+    assert card.symbol_style == 'detailed'
+    assert (card.width, card.height) == detailed_size(d, card.ref)
     assert preview.elements['device:MSP'].width == 440
     assert (d.connections, old) == snapshot
     assert not preview.show_location_frames
-    assert preview.elements['device:KEYPAD-1'].x < preview.elements['device:MSP'].x
-    assert preview.elements['device:710-KP-1'].x < preview.elements['device:710-LX500-1'].x
-    for e in d.connections:
-        if e.source.port_id != 'KP BUS':
-            assert preview.elements['device:'+e.target.device_id].y > preview.elements['device:'+e.source.device_id].y
+    assert preview.elements['device:KEYPAD-1'].location_id == preview.elements['device:MSP'].location_id
+    assert preview.elements['device:KEYPAD-2'].x < preview.elements['device:710-LX500-2'].x
+    assert set(preview.routes) == {edge.id for edge in d.connections}
 
 
-def test_compact_splitter_caption_remains_inside_and_readable():
+def test_splitter_ports_and_location_caption_are_readable():
     d, _, doc = approved_scene()
     element = doc.elements['device:710-LX500-2']
     runs = device_text(d, element, small=True)
     assert any(run.text == 'CLASSROOM 27' for run in runs)
+    group = doc.elements[element.location_id]
+    assert any('CLASSROOM 27' in run.text for run in location_text_runs(group))
     for run in runs:
         width = fitz.get_text_length(run.text, fontname='hebo' if run.bold else 'helv', fontsize=run.size)
         left = run.x-width/2 if run.anchor=='middle' else run.x
@@ -71,7 +73,7 @@ def test_svg_contains_keypad_face_chamfered_splitters_and_structured_sheet(tmp_p
 
 def test_style_and_frame_visibility_roundtrip_apply_undo(tmp_path):
     d,c,preview = approved_scene()
-    assert getattr(preview,'show_location_frames',True) is False
+    assert not preview.show_location_frames
     old=copy.deepcopy(c.document)
     c.apply_layout(preview)
     save_session(Session(d),tmp_path/'style.dmps')
@@ -119,12 +121,12 @@ def test_old_manual_geometry_and_classic_style_are_not_silently_replaced():
     assert getattr(doc.elements['device:710-KP-1'],'symbol_style',None)=='classic'
 
 
-def test_service_keypad_feed_is_horizontal_and_panel_outputs_are_distinct():
+def test_service_keypad_feed_uses_its_named_port_and_panel_outputs_are_distinct():
     d,_,doc=approved_scene()
     edge=next(e for e in d.connections if e.source.port_id=='KP BUS')
     points=doc.routes[edge.id].points
-    assert len({y for _,y in points})==1
-    from riser_scene import port_point
+    assert points[0] == port_point(doc.elements['device:MSP'],'KP BUS',output=True)
+    assert points[-1] == port_point(doc.elements['device:KEYPAD-1'],'IN',output=False)
     panel=doc.elements['device:MSP']
     a=port_point(panel,'PROG',output=True)
     b=port_point(panel,'LX500',output=True)
@@ -144,25 +146,29 @@ def test_frame_toggle_updates_export_and_is_undoable(editor,tmp_path):
     assert tab._layer_switches['Locations'].get()==0
 
 
-def test_long_locations_expand_body_and_remain_inside_after_resize():
+def test_long_locations_expand_group_heading_without_shrinking_device_text():
     d=branched_design()
     d.splitters[1].location='MAIN BUILDING THIRD FLOOR VERY LONG ELECTRICAL EQUIPMENT STORAGE ROOM'
     c=RiserEditorController(d,layout_riser(d)); c.apply_layout(c.preview_layout())
     e=c.document.elements['device:710-LX500-1']
-    assert e.height>135
+    group=c.document.elements[e.location_id]
+    assert group.heading_height > 34
     c.resize_element(e.id,40,30)
+    assert e.height >= detailed_size(d,e.ref)[1]
     runs=device_text(d,e,small=True)
     assert all(e.y<=r.y-r.size and r.y+r.size*.25<=e.y+e.height for r in runs)
 
 
-def test_validation_catches_caption_wire_overlap_and_overlong_title():
+def test_validation_catches_heading_wire_overlap_and_overlong_title():
     d,_,doc=approved_scene()
-    kp=doc.elements['device:KEYPAD-2']
+    doc.show_location_frames = True
+    heading=doc.elements[doc.elements['device:KEYPAD-2'].location_id]
     route=next(iter(doc.routes.values()))
-    route.points=[(kp.x-80,kp.y+kp.height+23),(kp.x+kp.width+80,kp.y+kp.height+23)]
+    y=heading.y+heading.heading_height/2
+    route.points=[(heading.x-80,y),(heading.x+heading.width+80,y)]
     doc.title_block.school_name='SCHOOL '*300
     codes={i.code for i in validate_riser(d,doc)}
-    assert 'scene.caption_overlap' in codes
+    assert 'scene.cable_through_heading' in codes
     assert 'title.overflow' in codes
 
 
@@ -199,14 +205,17 @@ def test_connect_mode_labels_unused_msp_ports(editor):
         assert name in labels
 
 
-def test_global_caption_edit_grows_detailed_body_and_reattaches_ports():
+def test_global_location_edit_updates_group_heading_and_preserves_port_attachment():
     from riser_symbols import text_bounds
     from riser_scene import port_point
     d,c,doc=approved_scene(); c.apply_layout(doc)
     ref='710-LX500-2'; element=c.document.elements['device:'+ref]
     d.splitters[2].location='MAIN BUILDING THIRD FLOOR VERY LONG ELECTRICAL EQUIPMENT STORAGE ROOM'
     c.sync_external()
-    assert element.height>135
+    assert element.height >= detailed_size(d,ref)[1]
+    frame=c.document.elements[element.location_id]
+    assert 'MAIN BUILDING' in frame.ref
+    assert frame.heading_height > 34
     assert all(text_bounds(r)[3]<element.y+element.height for r in device_text(d,element))
     edge=next(e for e in d.connections if e.source.device_id==ref)
     assert c.document.routes[edge.id].points[0]==port_point(element,edge.source.port_id,output=True)

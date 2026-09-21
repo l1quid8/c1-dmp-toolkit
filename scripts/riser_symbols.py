@@ -30,9 +30,20 @@ def detailed_size(design, ref):
     return w, max(h,baseline+(len(lines)-1)*size*1.3+size*.25+44)
 
 
+def grouped_size(design, ref, *, compact=False):
+    """Location headings own the room text, so card bodies can stay legible and small."""
+    if ref == 'MSP':
+        return 440., 150. if compact else 170.
+    if ref.startswith('RSP-'):
+        return (235., 108.) if compact else (255., 124.)
+    if any(s.id == ref for s in design.splitters):
+        return (170., 94.) if compact else (185., 108.)
+    return (132., 84.) if compact else (148., 102.)
+
+
 def symbol_parts(design, element):
     x,y,w,h=element.x,element.y,element.width,element.height
-    if element.symbol_style != 'detailed':
+    if element.symbol_style not in {'detailed', 'grouped'}:
         shape='ellipse' if element.ref.startswith('KEYPAD-') else 'rectangle'
         return [SymbolPart(shape,(x,y,x+w,y+h),True,2)]
     if any(s.id==element.ref for s in design.splitters):
@@ -91,6 +102,34 @@ def detailed_text(design, element):
     return result
 
 
+def grouped_text(design, element):
+    """Schematic and port hierarchy without repeating each group's location."""
+    x,y,w,h=element.x,element.y,element.width,element.height
+    cx=x+w/2
+    if element.ref=='MSP':
+        result=[TextRun(cx,y+h*.43,'MSP',46,True),
+                TextRun(x+12,y+h/2-7,'KP BUS',16,True,'start')]
+        from riser_scene import port_point
+        for name in sorted({e.source.port_id for e in design.connections
+                            if e.source.device_id=='MSP'}-{'KP BUS'}):
+            px,py=port_point(element,name,output=True)
+            result.append(TextRun(px,py-15,name,16,True))
+        return result
+    if element.ref.startswith('KEYPAD-'):
+        return [TextRun(cx,y+h*.27,element.ref,17,True)]
+    if any(s.id==element.ref for s in design.splitters):
+        return [TextRun(cx,y+18,'IN',16),
+                TextRun(cx,y+h*.53,element.ref,18,True),
+                *(TextRun(x+w*i/4,y+h-14,str(i),16,True) for i in range(1,4))]
+    rsp=next((r for r in design.rsps if f'RSP-{r.number}'==element.ref),None)
+    result=[TextRun(cx,y+h*.58,element.ref,32,True)]
+    if rsp:
+        result.append(TextRun(cx,y+21,rsp.model,16,True))
+        if rsp.zones:
+            result.append(TextRun(cx,y+h-13,f'Z{min(rsp.zones)}-Z{max(rsp.zones)}',16))
+    return result
+
+
 def text_bounds(run):
     import fitz
     width=fitz.get_text_length(run.text,fontname='hebo' if run.bold else 'helv',fontsize=run.size)
@@ -99,7 +138,7 @@ def text_bounds(run):
 
 
 def terminal_parts(design, element):
-    if element.symbol_style != 'detailed':
+    if element.symbol_style not in {'detailed', 'grouped'}:
         return []
     from riser_scene import port_point
     if element.ref=='MSP':

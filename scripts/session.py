@@ -293,6 +293,7 @@ def _riser_document_from_dict(d: dict | None) -> RiserDocument | None:
         page_height=float(d.get("page_height", 24 * 72)),
         layout_version=int(d.get('layout_version', 1)),
         show_location_frames=bool(d.get('show_location_frames', True)),
+        fit_warnings=list(d.get('fit_warnings') or []),
     )
 
 

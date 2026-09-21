@@ -45,6 +45,41 @@ def test_label_changes_roundtrip_undo_and_preserve_wiring(tmp_path):
     assert not c.document.routes[key].label_hidden
 
 
+def test_bulk_hide_and_show_labels_is_one_undoable_presentation_change(tmp_path):
+    design, controller, key = setup_callout()
+    before_connections = copy.deepcopy(design.connections)
+    before_points = {rid: list(route.points)
+                     for rid, route in controller.document.routes.items()}
+    controller.set_all_labels(hidden=True)
+    assert all(route.label_hidden for route in controller.document.routes.values())
+    assert design.connections == before_connections
+    assert {rid: route.points for rid, route in controller.document.routes.items()} == before_points
+    svg = tmp_path / 'all-hidden.svg'
+    render_svg(design, controller.document, svg)
+    assert 'UNIQUE-CALLOUT' not in ''.join(ET.parse(svg).getroot().itertext())
+    assert controller.undo()
+    assert not any(route.label_hidden for route in controller.document.routes.values())
+    controller.set_all_labels(hidden=True)
+    save_session(Session(design=design), tmp_path / 'all-hidden.dmps')
+    loaded = load_session(tmp_path / 'all-hidden.dmps').design
+    assert all(route.label_hidden for route in loaded.riser_document.routes.values())
+    controller.set_all_labels(hidden=False)
+    assert not any(route.label_hidden for route in controller.document.routes.values())
+
+
+def test_bulk_wire_label_button_updates_canvas_without_removing_cables(editor):
+    frame, _ = editor
+    tab = frame.riser_tab
+    before = copy.deepcopy(frame.session.design.connections)
+    button(tab, 'Hide all wire labels').invoke()
+    assert all(route.label_hidden for route in tab.controller.document.routes.values())
+    assert not any(any(tag.startswith('label|') for tag in tab.canvas.gettags(item))
+                   for item in tab.canvas.find_all())
+    assert frame.session.design.connections == before
+    button(tab, 'Show all wire labels').invoke()
+    assert not any(route.label_hidden for route in tab.controller.document.routes.values())
+
+
 def test_rerouting_preserves_manual_callout_state():
     d, c, key = setup_callout()
     c.update_label(key, offset=(90, -36), hidden=True)

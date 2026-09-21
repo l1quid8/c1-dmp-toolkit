@@ -26,7 +26,7 @@ from location_model import location_key
 from ui_widgets import SearchableComboBox
 from riser_drawing import (TextRun, device_shape, device_text, location_text_runs,
                            title_bounds, logo_bounds, title_text)
-from riser_symbols import symbol_parts, modern_title, detailed_size
+from riser_symbols import symbol_parts, modern_title, detailed_size, grouped_size
 from riser_presentation import layout_presentation
 from riser_model import DevicePortRef, RiserAnnotation, RiserDocument
 from riser_scene import (
@@ -144,7 +144,7 @@ class RiserEditorController:
         self._external_locations = location_values(self.design)
         self._external_registry = self._registry_snapshot()
 
-    def _mutate(self, operation):
+    def _mutate(self, operation, *, preserve_fit_warnings=False):
         self._rebase_external_history()
         before = self._snapshot()
         try:
@@ -153,6 +153,9 @@ class RiserEditorController:
             self._restore(before, before[2], True)
             raise
         after = self._snapshot()
+        if before != after and not preserve_fit_warnings and self.document.fit_warnings:
+            self.document.fit_warnings.clear()
+            after = self._snapshot()
         self._external_signature = self._topology_signature()
         self._external_locations = location_values(self.design)
         self._external_registry = self._registry_snapshot()
@@ -232,7 +235,7 @@ class RiserEditorController:
         def operation():
             for field in fields(RiserDocument):
                 setattr(self.document, field.name, copy.deepcopy(getattr(preview, field.name)))
-        self._mutate(operation)
+        self._mutate(operation, preserve_fit_warnings=True)
         self._preview_basis = None
 
     def move_element(self, element_id: str, dx: float, dy: float) -> bool:
@@ -345,8 +348,10 @@ class RiserEditorController:
         element = self.document.elements[element_id]
         minimum_height = 54.0 if element.kind == "location" else 28.0
         width, height = max(36.0, width), max(minimum_height, height)
-        if element.kind == 'device' and element.symbol_style == 'detailed':
-            minimum_width, minimum_height = detailed_size(self.design, element.ref)
+        if element.kind == 'device' and element.symbol_style in {'detailed', 'grouped'}:
+            sizing = detailed_size if element.symbol_style == 'detailed' else grouped_size
+            minimum_width, minimum_height = sizing(self.design, element.ref,
+                **({'compact': True} if element.symbol_style == 'grouped' else {}))
             width, height = max(width,minimum_width), max(height,minimum_height)
         if element.width == width and element.height == height:
             return False
@@ -617,6 +622,17 @@ class RiserEditorController:
                 route.label_hidden = bool(hidden)
         self._mutate(operation)
 
+    def set_all_labels(self, *, hidden: bool) -> None:
+        """Toggle every cable callout as one undoable drawing-only change."""
+        if not self.document.routes or all(
+                route.label_hidden == hidden for route in self.document.routes.values()):
+            return
+
+        def operation():
+            for route in self.document.routes.values():
+                route.label_hidden = hidden
+        self._mutate(operation)
+
     def update_title_block(self, **changes) -> None:
         allowed = {field.name for field in fields(type(self.document.title_block))}
         if set(changes) - allowed:
@@ -783,7 +799,7 @@ class RiserEditorController:
             self.design.riser_document = self.document
         self._mutate(operation)
 
-    def _insert_missing_clusters(self, replacement):
+    def _insert_missing_clusters(self, replacement, device_ids=None):
         """Fit only new equipment into clear space; retain everything else."""
         from riser_scene import PAGE_MARGIN, TITLE_BLOCK_WIDTH, _boxes_overlap
 
@@ -846,22 +862,28 @@ class RiserEditorController:
                     obstacles = [box(e) for e in self.document.elements.values()
                                  if e.kind == 'device'] + cable_boxes
                     found = position(item, bounds, obstacles)
+                    if found is None and device_ids is not None:
+                        found = position(item, page, obstacles)
                     if found is not None:
                         item.x, item.y = found
                         item.location_id = owner.id
                         self.document.elements[item.id] = item
                         self.document.z_order.append(item.id)
 
-    def auto_layout(self) -> None:
+    def auto_layout(self, device_ids=None) -> None:
         """Place only missing items while retaining every existing object/route."""
         def operation():
             repair_generated_scene(self.design, self.document)
             sync_riser_document(self.design, self.document)
             replacement = self._layout()
+            if device_ids is not None:
+                replacement.elements = {
+                    key: element for key, element in replacement.elements.items()
+                    if element.kind != 'device' or element.ref in device_ids}
             existing_locations = {_normal_location(e.ref) for e in self.document.elements.values()
                                   if e.kind == "location"}
             if self.document.layout_version >= 2:
-                self._insert_missing_clusters(replacement)
+                self._insert_missing_clusters(replacement, device_ids)
             for element_id, element in (replacement.elements.items()
                                         if self.document.layout_version < 2 else ()):
                 if element_id not in self.document.elements:
@@ -871,6 +893,12 @@ class RiserEditorController:
                     self.document.z_order.append(element_id)
             sync_location_ownership(self.design, self.document)
             for route_id in replacement.routes:
+                if device_ids is not None:
+                    edge = next(e for e in self.design.connections if e.id == route_id)
+                    endpoints = {edge.source.device_id, edge.target.device_id}
+                    if not endpoints & device_ids or any(
+                            f'device:{ref}' not in self.document.elements for ref in endpoints):
+                        continue
                 if route_id not in self.document.routes:
                     # Replacement routes terminate at replacement geometry.
                     # Retained manual devices and locations may have moved, so
@@ -1026,10 +1054,6 @@ class RiserTab(ctk.CTkFrame):
                       fg_color="transparent", hover_color=theme.HOVER_SUBTLE,
                       text_color=theme.TEXT, command=self.relayout).pack(
                           side="right", padx=(0, 2), pady=7)
-        ctk.CTkButton(actions_row, text="Auto-layout", width=90, height=28,
-                      fg_color="transparent", hover_color=theme.HOVER_SUBTLE,
-                      text_color=theme.TEXT, command=self.auto_layout).pack(
-                          side="right", pady=7)
         self._zoom_label = ctk.CTkLabel(
             actions_row, text="42%", width=46, text_color=theme.TEXT_SECOND,
             font=theme.ui_font(theme.SIZE["meta"]))
@@ -1111,7 +1135,9 @@ class RiserTab(ctk.CTkFrame):
         body.rowconfigure(1, weight=1)
         self._preview_bar = ctk.CTkFrame(body, fg_color=theme.ACCENT_TINT)
         self._preview_bar.grid(row=0, column=0, columnspan=2, sticky='ew')
-        ctk.CTkLabel(self._preview_bar, text='LAYOUT PREVIEW — project unchanged').pack(side='left', padx=12)
+        self._preview_status = ctk.CTkLabel(
+            self._preview_bar, text='LAYOUT PREVIEW — project unchanged')
+        self._preview_status.pack(side='left', padx=12)
         ctk.CTkButton(self._preview_bar, text='Apply layout', width=105,
                      command=self.apply_preview).pack(side='right', padx=6, pady=6)
         ctk.CTkButton(self._preview_bar, text='Cancel preview', width=110,
@@ -1184,6 +1210,15 @@ class RiserTab(ctk.CTkFrame):
             self._layer_switches[name] = switch
             switch.grid(row=column // 2, column=column % 2, sticky="w", pady=2)
 
+        self._all_labels_button = ctk.CTkButton(
+            layers, text="Hide all wire labels", height=28,
+            fg_color=theme.SURFACE_CHIP, hover_color=theme.HOVER_SUBTLE,
+            text_color=theme.TEXT, corner_radius=theme.RADIUS["button"],
+            font=theme.ui_font(theme.SIZE["meta"]),
+            command=self._toggle_all_labels)
+        self._all_labels_button.grid(row=3, column=0, columnspan=2,
+                                     sticky="ew", pady=(8, 2))
+
         self._section("Title block", 4)
         title = ctk.CTkFrame(self.inspector, fg_color="transparent")
         title.grid(row=5, column=0, sticky="ew", padx=10)
@@ -1225,11 +1260,6 @@ class RiserTab(ctk.CTkFrame):
         self.validation_frame = ctk.CTkFrame(self.inspector, fg_color="transparent")
         self.validation_frame.grid(row=7, column=0, sticky="ew", padx=10)
         self.validation_frame.columnconfigure(0, weight=1)
-        self._section("Unplaced", 8)
-        self.unplaced_frame = ctk.CTkFrame(self.inspector, fg_color="transparent")
-        self.unplaced_frame.grid(row=9, column=0, sticky="ew", padx=10,
-                                 pady=(0, 14))
-        self.unplaced_frame.columnconfigure(0, weight=1)
 
     def _bind_keys(self):
         for shortcut in ("<Control-a>", "<Command-a>"):
@@ -1284,6 +1314,10 @@ class RiserTab(ctk.CTkFrame):
         self._reconcile_selection()
         self.canvas.delete("all")
         doc = self._layout_preview or self.controller.document
+        self._all_labels_button.configure(text=(
+            "Hide all wire labels" if any(not route.label_hidden
+                                           for route in doc.routes.values())
+            else "Show all wire labels"))
         self.layer_visibility['Locations'] = doc.show_location_frames
         switch = self._layer_switches.get('Locations')
         if switch:
@@ -1399,7 +1433,7 @@ class RiserTab(ctk.CTkFrame):
                                     tags=(port_tag, "port", visual_tag,
                           f'input-side|{element.id}|{element.input_side}' if element.ref.startswith(('RSP-', 'KEYPAD-')) and not output else ''))
             unused = not any(e.source == ref for e in self.design.connections)
-            if (element.ref == "MSP" and (element.symbol_style != 'detailed' or self.tool == 'Connect' and unused) and
+            if (element.ref == "MSP" and (element.symbol_style not in {'detailed', 'grouped'} or self.tool == 'Connect' and unused) and
                     ref.port_id != 'KP BUS' and
                     (self.zoom >= 0.55 or selected or self.tool == "Connect")):
                 self.canvas.create_text(
@@ -2477,6 +2511,10 @@ class RiserTab(ctk.CTkFrame):
         self.cancel(redraw=False)
         self._layout_preview = self.controller.preview_layout()
         self.selected = None
+        warnings = self._layout_preview.fit_warnings
+        self._preview_status.configure(text=(
+            f'LAYOUT PREVIEW — {len(warnings)} one-sheet fit warning(s); see Validation'
+            if warnings else 'LAYOUT PREVIEW — fits one sheet; project unchanged'))
         self._preview_bar.grid()
         for entry in self._title_entries.values():
             entry.configure(state='disabled')
@@ -2499,11 +2537,6 @@ class RiserTab(ctk.CTkFrame):
             self.cancel()
             return
         self.cancel(redraw=False)
-        self._changed()
-
-    @live_edit_only
-    def auto_layout(self):
-        self.controller.auto_layout()
         self._changed()
 
     def set_zoom(self, value):
@@ -2602,6 +2635,14 @@ class RiserTab(ctk.CTkFrame):
             return
         self.layer_visibility[name] = not self.layer_visibility[name]
         self.redraw()
+
+    @live_edit_only
+    def _toggle_all_labels(self):
+        self.cancel(redraw=False)
+        routes = self.controller.document.routes.values()
+        self.controller.set_all_labels(hidden=any(not route.label_hidden
+                                                   for route in routes))
+        self._changed()
 
     @live_edit_only
     def copy_title_from_site(self):
@@ -2808,18 +2849,6 @@ class RiserTab(ctk.CTkFrame):
                 text_color=theme.WARNING, command=lambda i=issue: self.goto_issue(i))
             button.grid(row=row, column=0, sticky="ew", pady=2)
 
-        self._clear_frame(self.unplaced_frame)
-        if not self.controller.document.unplaced:
-            ctk.CTkLabel(self.unplaced_frame, text="No unplaced devices",
-                         anchor="w", text_color=theme.TEXT_TERTIARY).grid(
-                row=0, column=0, sticky="ew")
-        for row, device_id in enumerate(self.controller.document.unplaced):
-            ctk.CTkButton(
-                self.unplaced_frame, text=f"Place  {device_id}", anchor="w",
-                height=30, fg_color=theme.SURFACE_CHIP,
-                hover_color=theme.HOVER_SUBTLE, text_color=theme.TEXT,
-                command=lambda d=device_id: self._place_unplaced(d)).grid(
-                    row=row, column=0, sticky="ew", pady=2)
 
     def _entry_row(self, row, label, value, callback):
         ctk.CTkLabel(self.properties, text=label, anchor="w",
@@ -2943,14 +2972,6 @@ class RiserTab(ctk.CTkFrame):
         self.controller.arrange_annotation(annotation_id, where)
         self._changed()
 
-    @live_edit_only
-    def _place_unplaced(self, device_id):
-        x = self.controller.document.page_width / 2
-        y = self.controller.document.page_height / 2
-        element = self.controller.place_unplaced(device_id, x, y)
-        self.selected = ("element", element.id)
-        self._changed()
-
     def goto_issue(self, issue):
         ref = issue.ref
         if ref in self._title_entries:
@@ -2970,8 +2991,18 @@ class RiserTab(ctk.CTkFrame):
         elif any(a.id == ref for a in self.controller.document.annotations):
             self.selected = ("annotation", ref)
         elif ref in self.controller.document.unplaced:
-            with contextlib.suppress(Exception):
-                self.inspector._parent_canvas.yview_moveto(1.0)
+            if self._layout_preview is not None:
+                return
+            self.controller.auto_layout(device_ids={ref})
+            if ref in self.controller.document.unplaced:
+                messagebox.showwarning(
+                    'Device could not be placed',
+                    f'{ref} could not fit on the drawing. Make room, then click its '
+                    'validation warning to retry automatic placement.',
+                    parent=self.winfo_toplevel())
+            else:
+                self.selected = ('element', f'device:{ref}')
+            self._changed()
             return
         self.redraw()
         self.after_idle(self._center_ref_in_view, ref)

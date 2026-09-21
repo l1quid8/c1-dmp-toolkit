@@ -23,6 +23,7 @@ https://github.com/user-attachments/assets/fbbad379-596e-4965-9399-51c9bf878d3e
 
 - a security design PDF (OCR'd automatically if it isn't searchable),
 - an existing DMP worksheet (`.xlsx`), or
+- an equipment BOM (`.xlsx`) with **BOM** and **BOM Breakdown** sheets, or
 - a saved project (`.dmps`) from a previous visit.
 
 Or choose **Create New Project** to start without a source file.
@@ -54,6 +55,14 @@ Or drop/browse a PDF, XLSX, or DMPS, or use **File → Open** (`Cmd/Ctrl+O`).
 PDFs are OCR'd if needed, then parsed for the zone schedule, splitter topology,
 RSPs, and keypads. Imported and reopened projects start on **ZONES** and retain
 their saved drawing. Recent projects reopen directly without requesting a source file.
+
+For a supported BOM, a review window lists the source rows before creating a
+draft project. It imports RSP/paired power-supply locations, zone ranges, and
+marked motion points. Unknown sensor rooms remain marked **LOCATION NEEDS
+REVIEW** in ZONES. Keypad destinations and equipment counts appear in the
+review; equipment whose type or wiring cannot be identified is left for manual
+entry. A BOM is not treated as a generated DMP worksheet, so generate a
+worksheet before making a Door Chart.
 
 The screenshots and feature tours show the earlier import workflow; the text
 here describes the current Create New Project action.
@@ -104,8 +113,7 @@ artifacts and are never re-imported.
   an explicit warning.
 - **RISER** — balanced KP/LX auto-layout on one `INT-5.0` sheet, direct device
   and cable editing, topology-aware connect/reconnect, orthogonal route handles,
-  markup tools, title-block fields, undo/redo, validation jumps, and an Unplaced
-  tray. Electrical changes appear immediately in SPLITTERS and worksheet output.
+  markup tools, title-block fields, undo/redo, validation jumps, and actionable placement warnings. Electrical changes appear immediately in SPLITTERS and worksheet output.
   **Hide panel / Show panel** collapses the right-side controls to give the
   drawing more room while retaining selections and entered values. **Full screen**
   is available in the riser toolbar and View menu; press **Escape** to exit,
@@ -259,7 +267,8 @@ or hides group outlines in both the editor and exports; detailed drawings hide
 these outlines by default. Electrical connections remain unchanged.
 
 - **Add Device** opens the existing splitter, keypad, or RSP/power-supply creation
-  form. New equipment appears in **Unplaced**; existing drawing positions stay put.
+  form. Finishing the form automatically places new equipment in clear space;
+  existing drawing positions stay put. If no space fits, a device warning lets you retry after making room.
 - Select a device and choose **Edit Device**, or double-click its symbol. The same
   forms used by the domain tabs edit the shared project immediately. **Done** closes
   the form; it is not a separate draft. **Remove from Project** uses the existing

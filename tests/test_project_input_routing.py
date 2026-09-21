@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import app as app_module
 import session as session_module
 from parse_dmp_worksheet import DMPDesign, SiteInfo
+from parse_bom import BOMImport
 from riser_model import RiserElement
 from session import create_blank_session, load_session, save_session, write_recovery
 
@@ -119,6 +120,44 @@ def test_xlsx_route_retains_shape_guard_and_own_chart_source(controller, boundar
         assert controller.errors[0][1]["title"] == "Not a DMP worksheet"
     for name in ("build_dmp_design_from_pdf", "load_session", "load_recovery"):
         boundaries[name].assert_not_called()
+
+
+def test_bom_xlsx_requires_review_and_is_not_a_worksheet(controller, boundaries, monkeypatch, tmp_path):
+    source = tmp_path / "site.xlsx"
+    source.touch()
+    boundaries["parse_dmp_worksheet"].side_effect = None
+    boundaries["parse_dmp_worksheet"].return_value = DMPDesign()
+    draft = DMPDesign(site_info=SiteInfo(school_name="BOM SCHOOL"))
+    monkeypatch.setattr(app_module, "parse_bom", lambda path: BOMImport(draft, "RSP-1 — row S1"))
+    seen = []
+    monkeypatch.setattr(app_module, "ask_bom_review", lambda root, text:
+                        seen.append(text) or True)
+
+    controller._start_input(source)
+
+    assert seen == ["RSP-1 — row S1"]
+    project, tab = controller.entered[0]
+    assert (project.source_kind, project.source_name, tab) == ("bom", "site.xlsx", "ZONES")
+    assert project.path == tmp_path / "Sessions" / "BOM_SCHOOL.dmps"
+    assert controller.dmp_path is None
+    assert controller._latest_worksheet_path() is None
+    assert not controller.errors
+
+
+def test_cancel_bom_review_creates_no_project(controller, boundaries, monkeypatch, tmp_path):
+    source = tmp_path / "site.xlsx"
+    source.touch()
+    boundaries["parse_dmp_worksheet"].side_effect = None
+    boundaries["parse_dmp_worksheet"].return_value = DMPDesign()
+    monkeypatch.setattr(app_module, "parse_bom", lambda path: BOMImport(
+        DMPDesign(site_info=SiteInfo(school_name="BOM SCHOOL")), "review"))
+    monkeypatch.setattr(app_module, "ask_bom_review", lambda root, text: False)
+
+    controller._start_input(source)
+
+    assert controller.state == "idle"
+    assert controller.dmp_path is None
+    assert not controller.entered
 
 
 @pytest.mark.parametrize("recovery_choice", [None, False, True])
