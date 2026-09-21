@@ -9,6 +9,7 @@ when it exists and the new one does not.
 
 Run: pytest tests/test_output_dir_rename.py
 """
+import json
 from pathlib import Path
 import sys
 
@@ -65,6 +66,6 @@ def test_explicit_pref_overrides_both(fake_home, monkeypatch, tmp_path):
     (_docs(fake_home) / paths._LEGACY_APP_NAME).mkdir()
     chosen = tmp_path / "chosen"
     prefs = tmp_path / "prefs.json"
-    prefs.write_text('{"output_dir": "%s"}' % chosen)
+    prefs.write_text(json.dumps({"output_dir": str(chosen)}))
     monkeypatch.setattr(paths, "_PREFS_PATH", prefs)
     assert paths.output_dir() == chosen
