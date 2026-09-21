@@ -121,8 +121,9 @@ def _apply_account_edits(doc: AccountDoc, acct, sentinel: int) -> None:
         ("ZIP", acct.zip_code),
         ("PHONE", acct.phone),
     ):
-        if value:
-            account.set(tag, value)
+        # Always replace the scrubbed template values. An OCR miss must render
+        # blank in the receipt, never as the template's sample school data.
+        account.set(tag, value or "")
 
     areas = doc.find_table("AreaInfoList")
     if areas is not None:
@@ -564,6 +565,26 @@ def _atomic_write_text(path: Path, text: str, encoding: str) -> None:
             temp_path.unlink()
 
 
+def _require_project_address(doc: AccountDoc) -> None:
+    """Reject blank, malformed, or bundled-template addresses before writing."""
+    account = doc.row("Account")
+    values = {
+        name: (account.text(name) or "").strip()
+        for name in ("ADDRESS", "CITY", "STATE", "ZIP")
+    }
+    template_address = (
+        values["ADDRESS"].upper() == "1 EXAMPLE ST"
+        and values["CITY"].upper() == "ANYTOWN"
+        and values["STATE"].upper() == "CA"
+        and values["ZIP"] == "00000"
+    )
+    if template_address or not all(values.values()):
+        raise InjectorError(
+            "RemoteLink account address is incomplete. Enter Street address "
+            "and City, State ZIP in the REMOTELINK Account section."
+        )
+
+
 # ------------------------------------------------------------------- public ---
 
 def generate_account_xml(design, account_num, receiver_num: str = "", *,
@@ -610,6 +631,7 @@ def generate_configured_account_xml(
     doc = build_configured_account_doc(
         design, config, template_xml, sentinel=sentinel,
     )
+    _require_project_address(doc)
     encoded = encode_account(doc.serialize(), passphrase)
     readback = parse_account_xml(decode_account(encoded, passphrase))
     _verify_final_account(readback, design, config)

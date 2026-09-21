@@ -602,6 +602,56 @@ def test_preview_uses_same_configured_generation_path():
     assert "7 total" in text
 
 
+def test_preview_never_inherits_template_address_when_project_address_is_blank():
+    design = _rl_design()
+    design.site_info.address_line1 = ""
+    design.site_info.address_line2 = ""
+
+    text = preview_account_summary(
+        design, _configured_account(), BUNDLED_TEMPLATE,
+    )
+
+    assert "1 EXAMPLE ST" not in text
+    assert "ANYTOWN" not in text
+    assert "Address   not present" in text
+
+
+def test_manual_project_address_reaches_encrypted_account(tmp_path):
+    design = _rl_design()
+    design.site_info.address_line1 = "2700 EAST 41ST STREET"
+    design.site_info.address_line2 = "TULSA, OK 74105"
+
+    output = generate_configured_account_xml(
+        design, _configured_account(), template_path=BUNDLED_TEMPLATE,
+        passphrase="secret", out_dir=tmp_path,
+    )
+
+    summary = inspect_account(output, "secret")
+    assert summary.address == "2700 EAST 41ST STREET"
+    assert (summary.city, summary.state, summary.zip_code) == ("TULSA", "OK", "74105")
+
+
+@pytest.mark.parametrize(("line1", "line2"), [
+    ("", "TULSA, OK 74105"),
+    ("2700 EAST 41ST STREET", ""),
+    ("2700 EAST 41ST STREET", "TULSA OK"),
+    ("1 EXAMPLE ST", "ANYTOWN, CA 00000"),
+])
+def test_generation_rejects_missing_invalid_or_template_address(
+        tmp_path, line1, line2):
+    design = _rl_design()
+    design.site_info.address_line1 = line1
+    design.site_info.address_line2 = line2
+
+    with pytest.raises(InjectorError, match="address"):
+        generate_configured_account_xml(
+            design, _configured_account(), template_path=BUNDLED_TEMPLATE,
+            passphrase="secret", out_dir=tmp_path,
+        )
+
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_inspector_rejects_non_hex_file_cleanly(tmp_path):
     path = tmp_path / "not_export.xml"
     path.write_text("not a RemoteLink export")
