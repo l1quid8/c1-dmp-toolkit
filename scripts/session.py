@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from paths import output_dir
 from parse_dmp_worksheet import (
@@ -69,7 +69,7 @@ class Session:
     """A DMPDesign plus the editing state that must survive app restarts."""
     design: DMPDesign
     remotelink: RemoteLinkConfig = field(default_factory=RemoteLinkConfig)
-    source_kind: str = ""            # "pdf" | "xlsx" | ""
+    source_kind: str = ""            # "pdf" | "xlsx" | "manual" | ""
     source_name: str = ""            # original input filename, display only
     topology_confirmed: bool = False
     saved_at: Optional[str] = None   # ISO timestamp of last clean save
@@ -83,6 +83,27 @@ class SessionSummary:
     school_name: str
     saved_at: Optional[str]
     source_name: str
+
+
+def create_blank_session(
+    site_info: SiteInfo,
+    *,
+    title_block_updates: Mapping[str, str] | None = None,
+) -> Session:
+    """Create a manual project from site metadata without touching disk.
+
+    The returned project uses the existing design, topology, riser, and
+    persistence models.  Hardware and wiring remain empty until the editor
+    authoring flow adds them.
+    """
+    design = DMPDesign(site_info=site_info, topology_source="manual")
+    document = default_riser_document(design)
+    title_fields = {f.name for f in dataclasses.fields(RiserTitleBlock)}
+    for field_name, value in (title_block_updates or {}).items():
+        if field_name in title_fields:
+            setattr(document.title_block, field_name, value)
+    design.riser_document = document
+    return Session(design=design, source_kind="manual", source_name="")
 
 
 # -------- dirs / naming --------
@@ -102,7 +123,11 @@ def _slugify(name: str) -> str:
 
 
 def default_session_path(design: DMPDesign) -> Path:
-    return sessions_dir() / f"{_slugify(design.site_info.school_name or '')}{SESSION_EXT}"
+    stem = _slugify(design.site_info.school_name or '')
+    # Generated filenames must be portable, even when created on macOS.
+    if re.fullmatch(r"CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]", stem, re.IGNORECASE):
+        stem = "_" + stem
+    return sessions_dir() / f"{stem}{SESSION_EXT}"
 
 
 def unique_session_path(design: DMPDesign) -> Path:
@@ -111,15 +136,16 @@ def unique_session_path(design: DMPDesign) -> Path:
     Importing a worksheet (.xlsx) starts a *new* project, but default_session_path
     keys only on the school name — so a second project for the same school would
     overwrite the first. When the default slot is already taken on disk, fall back
-    to ' (2)', ' (3)', … leaving the prior project's .dmps intact.
+    to ' (2)', ' (3)', … leaving the prior project's .dmps intact. Recovery-only
+    slots are reserved too, so initial saving never clears older unsaved work.
     """
     base = default_session_path(design)
-    if not base.exists():
+    if not base.exists() and not recovery_path(base).exists():
         return base
     n = 2
     while True:
         cand = base.parent / f"{base.stem} ({n}){base.suffix}"
-        if not cand.exists():
+        if not cand.exists() and not recovery_path(cand).exists():
             return cand
         n += 1
 
@@ -267,6 +293,7 @@ def _riser_document_from_dict(d: dict | None) -> RiserDocument | None:
         page_height=float(d.get("page_height", 24 * 72)),
         layout_version=int(d.get('layout_version', 1)),
         show_location_frames=bool(d.get('show_location_frames', True)),
+        fit_warnings=list(d.get('fit_warnings') or []),
     )
 
 
@@ -450,15 +477,18 @@ def _atomic_write(path: Path, text: str) -> None:
 
 
 def save_session(session: Session, path: Path | None = None) -> Path:
-    """Explicit save: commit the session and clear any recovery file."""
+    """Write first, then commit the path/timestamp and clear target recovery."""
     target = path or session.path or default_session_path(session.design)
     ensure_explicit_topology(session.design)
     project_legacy_topology(session.design)
     sync_master_zones(session.design)
-    session.saved_at = datetime.now().isoformat(timespec="seconds")
-    session.path = target
+    saved_at = datetime.now().isoformat(timespec="seconds")
+    payload = _session_to_dict(session)
+    payload["saved_at"] = saved_at
     target.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(target, json.dumps(_session_to_dict(session), indent=1))
+    _atomic_write(target, json.dumps(payload, indent=1))
+    session.path = target
+    session.saved_at = saved_at
     clear_recovery(target)
     return target
 

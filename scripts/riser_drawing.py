@@ -25,6 +25,9 @@ def device_text(design, element, *, small=False):
     if element.symbol_style == 'detailed':
         from riser_symbols import detailed_text
         return detailed_text(design, element)
+    if element.symbol_style == 'grouped':
+        from riser_symbols import grouped_text
+        return grouped_text(design, element)
     x, y, w, h = element.x, element.y, element.width, element.height
     result = [TextRun(x + w / 2, y + h / 2 - 3, element.ref, 18, True)]
     if element.ref == 'MSP':
@@ -78,11 +81,15 @@ def logo_bounds(document):
 
 def wrap_text(text, width, size, bold=False):
     """Wrap against the same font metrics used in vector export."""
+    text = str(text or '').replace('\r\n', '\n').replace('\r', '\n')
+    if '\n' in text:
+        return [line for paragraph in text.split('\n')
+                for line in wrap_text(paragraph, width, size, bold)]
     font = "hebo" if bold else "helv"
     def fits(value):
         return fitz.get_text_length(value, fontname=font, fontsize=size) <= width
     lines, current = [], ""
-    for word in str(text or "").replace("\n", " ").split():
+    for word in text.split():
         candidate = f"{current} {word}".strip()
         if current and not fits(candidate):
             lines.append(current)

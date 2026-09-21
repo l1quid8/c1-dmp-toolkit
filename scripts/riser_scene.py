@@ -867,17 +867,38 @@ def route_topology_connection(edge, source: RiserElement, target: RiserElement,
             for segment in segments
             for reserved in reserved_segments
         )
+        # A perpendicular contact too close to either bend cannot receive a
+        # bridge hop; to a reader it looks like an electrical junction. Count
+        # these separately from ordinary (bridgeable) crossings.
+        close_contacts = 0
+        for first, second in segments:
+            for earlier_first, earlier_second in reserved_segments:
+                if first[1] == second[1] and earlier_first[0] == earlier_second[0]:
+                    x, y = earlier_first[0], first[1]
+                    horizontal = (first, second)
+                    vertical = (earlier_first, earlier_second)
+                elif first[0] == second[0] and earlier_first[1] == earlier_second[1]:
+                    x, y = first[0], earlier_first[1]
+                    horizontal = (earlier_first, earlier_second)
+                    vertical = (first, second)
+                else:
+                    continue
+                if (min(horizontal[0][0], horizontal[1][0]) <= x <= max(horizontal[0][0], horizontal[1][0])
+                        and min(vertical[0][1], vertical[1][1]) <= y <= max(vertical[0][1], vertical[1][1])
+                        and min(abs(x-horizontal[0][0]), abs(x-horizontal[1][0]),
+                                abs(y-vertical[0][1]), abs(y-vertical[1][1])) < BRIDGE_HALF_WIDTH):
+                    close_contacts += 1
         length = sum(
             abs(second[0] - first[0]) + abs(second[1] - first[1])
             for first, second in segments
         )
-        return crossings, overlap, length, len(segments), preference
+        return crossings, overlap, close_contacts, length, len(segments), preference
 
     standard = build(
         [start, start_lead], start_lead,
         target_lead, [target_lead, end],
     )
-    if score(standard, 0)[:2] == (0, 0):
+    if score(standard, 0)[:3] == (0, 0, 0):
         return standard
 
     def side_leads(element, endpoint, *, downward):
@@ -1249,6 +1270,11 @@ def sync_riser_document(design, document: RiserDocument) -> None:
                 minimum_width,minimum_height=detailed_size(design,element.ref)
                 element.width=max(element.width,minimum_width)
                 element.height=max(element.height,minimum_height)
+            elif element.symbol_style == 'grouped' and not element.stale:
+                from riser_symbols import grouped_size
+                minimum_width,minimum_height=grouped_size(design,element.ref,compact=True)
+                element.width=max(element.width,minimum_width)
+                element.height=max(element.height,minimum_height)
     for device_id in sorted(live - existing):
         if device_id not in document.unplaced:
             document.unplaced.append(device_id)
@@ -1365,7 +1391,8 @@ def _place_route_labels(design, document: RiserDocument) -> None:
     offsets = [(0.0, 0.0), (-72.0, 0.0), (72.0, 0.0)]
     offsets.extend(
         (dx, dy)
-        for dy in (-28.0, 28.0, -56.0, 56.0, -84.0, 84.0, -112.0, 112.0)
+        for dy in (-28.0, 28.0, -34.0, 34.0, -56.0, 56.0,
+                   -84.0, 84.0, -112.0, 112.0)
         for dx in (0.0, -72.0, 72.0, -144.0, 144.0, -216.0, 216.0)
     )
     for edge in sorted(design.connections, key=_connection_sort_key):
@@ -1423,6 +1450,24 @@ def _graph_cycle(design) -> bool:
 def validate_riser(design, document: RiserDocument) -> list[RiserIssue]:
     issues: list[RiserIssue] = []
     drawing_right = title_bounds(document)[0]
+    for rsp in design.rsps:
+        # RSP zone numbers are physical LX bus addresses. A module cannot
+        # have its last points silently printed on the next bus.
+        if not rsp.zones:
+            continue
+        first = min(rsp.zones)
+        bus_end = (first + 100 if first % 100 == 0 else
+                   ((first - 1) // 100 + 1) * 100)
+        overflow = sorted(zone for zone in rsp.zones if zone > bus_end)
+        if overflow:
+            span = (str(overflow[0]) if len(overflow) == 1 else
+                    f'{overflow[0]}–{overflow[-1]}')
+            issues.append(RiserIssue(
+                'zones.cross_bus',
+                f'RSP-{rsp.number} zones {span} cross the LX{bus_end - 100} '
+                f'boundary into LX{bus_end}; reassign a complete module '
+                'and verify its physical bus feed.',
+                f'RSP-{rsp.number}', 'error'))
     if _graph_cycle(design):
         issues.append(RiserIssue("topology.cycle", "Topology contains a cycle"))
     incoming: dict[tuple[str, str], int] = {}
@@ -1455,8 +1500,11 @@ def validate_riser(design, document: RiserDocument) -> list[RiserIssue]:
         if edge.id not in document.routes:
             issues.append(RiserIssue(
                 "scene.missing_route", "Connected cable has no drawing route", edge.id))
-    if document.unplaced:
-        issues.append(RiserIssue("scene.unplaced", "Drawing has unplaced devices", document.unplaced[0]))
+    for device_id in document.unplaced:
+        issues.append(RiserIssue(
+            "scene.unplaced",
+            f"{device_id} needs room on the drawing. Make room, then click to retry automatic placement.",
+            device_id))
     for element in document.elements.values():
         if element.stale:
             issues.append(RiserIssue("scene.stale", "Drawing references removed hardware", element.ref))
@@ -1583,6 +1631,17 @@ def validate_riser(design, document: RiserDocument) -> list[RiserIssue]:
                     "scene.cable_through_device",
                     f"Cable crosses the {obstacle.ref} footprint", route_id))
                 break
+        for location_ref, heading_box in location_heading_boxes:
+            heading = RiserElement('heading', 'heading', location_ref,
+                                   heading_box[0], heading_box[1],
+                                   heading_box[2] - heading_box[0],
+                                   heading_box[3] - heading_box[1])
+            if any(_segment_hits_rect(a, b, heading, clearance=0.0)
+                   for a, b in _segments(route.points)):
+                issues.append(RiserIssue(
+                    'scene.cable_through_heading',
+                    f'Cable crosses the {location_ref} location heading', route_id))
+                break
     for index, (first_id, first_box) in enumerate(label_boxes):
         for _second_id, second_box in label_boxes[index + 1:]:
             if _boxes_overlap(first_box, second_box):
@@ -1634,4 +1693,6 @@ def validate_riser(design, document: RiserDocument) -> list[RiserIssue]:
         title_runs=title_text(document,small=True)
         if any((lambda b:b[0]<left or b[2]>right or b[1]<top or b[3]>bottom)(text_bounds(r)) for r in title_runs):
             issues.append(RiserIssue('title.overflow','Title-block text does not fit the sheet; shorten the metadata','titleblock'))
+    for warning in document.fit_warnings:
+        issues.append(RiserIssue('layout.fit', f'One-sheet fit: {warning}'))
     return issues

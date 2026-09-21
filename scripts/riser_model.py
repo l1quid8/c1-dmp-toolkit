@@ -114,6 +114,7 @@ class RiserDocument:
     page_height: float = 24 * 72
     layout_version: int = 1
     show_location_frames: bool = True
+    fit_warnings: list[str] = field(default_factory=list)
 
 
 _NAMESPACE = uuid.UUID("5de56b6e-4ae2-4b45-b2a6-31f8e1729898")

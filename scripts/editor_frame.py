@@ -14,14 +14,15 @@ through the on_status_change / on_validation_change callbacks.
 from __future__ import annotations
 
 import contextlib
-from datetime import datetime
+from datetime import date, datetime
+from pathlib import Path
 from tkinter import messagebox
 
 import customtkinter as ctk
 
 import theme
 from topology_service import project_legacy_topology, prune_unknown_connections
-from hardware import snapshot_refs, diff_refs
+from hardware import HardwareError, snapshot_refs, diff_refs, sync_rsp_zone_buses
 from session import Session, save_session, sync_master_zones, write_recovery, clear_recovery
 from validation import validate_design, badge_counts, badge_counts_by_severity
 from editor_zones import ZonesTab
@@ -72,6 +73,17 @@ def _format_install_date(d) -> str:
     # 11th/12th/13th are the ordinal exceptions; otherwise key off the last digit.
     suffix = "th" if 11 <= n % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
     return f"{d.strftime('%B').upper()} {n}{suffix} {d.year}"
+
+
+def _site_defaults(prefs: dict) -> dict[str, str]:
+    """Machine-stable defaults shared by import and blank-project entry."""
+    return {
+        "install_tech": prefs.get("install_tech", ""),
+        "install_date": _format_install_date(date.today()),
+        "ip_address": prefs.get("ip_address", ""),
+        "default_gateway": prefs.get("default_gateway", ""),
+    }
+
 
 TAB_TITLES = ["SITE", "ZONES", "SPLITTERS", "KEYPADS", "RSP/POWER", "REMOTELINK", "RISER"]
 
@@ -310,10 +322,12 @@ class EditorFrame(ctk.CTkFrame):
                  on_generate_worksheet=None, on_generate_chart=None,
                  on_generate_remotelink=None, on_generate_riser=None,
                  on_toggle_fullscreen=None,
-                 on_status_change=None, on_validation_change=None):
+                 on_status_change=None, on_validation_change=None,
+                 initial_tab: str = "ZONES"):
         super().__init__(master, fg_color="transparent")
         self.root = root
         self.session = session
+        self._initial_tab = initial_tab
         self._topology_signature = _graph_signature(session.design)
         self._location_signature = location_values(session.design)
         self.dirty = False
@@ -336,6 +350,13 @@ class EditorFrame(ctk.CTkFrame):
         # a second one opening on top of the first — this is the interlock.
         self._sheet: dict | None = None
 
+        try:
+            recovered_zone_ranges = sync_rsp_zone_buses(session.design)
+        except HardwareError as exc:
+            recovered_zone_ranges = 0
+            self.after_idle(lambda message=str(exc): messagebox.showwarning(
+                "LX zone ranges need review", message, parent=self.root))
+
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
         # Closing the project with the sheet open would strand its Escape
@@ -346,7 +367,7 @@ class EditorFrame(ctk.CTkFrame):
         self.refresh_validation()
 
         # New, never-saved projects start dirty — there is unsaved work by definition.
-        if session.saved_at is None:
+        if session.saved_at is None or recovered_zone_ranges:
             self.mark_dirty(write_recovery_now=False)
         else:
             self._notify_status()
@@ -359,10 +380,14 @@ class EditorFrame(ctk.CTkFrame):
         self.dirty = True
         self.edit_epoch += 1
         self._notify_status()
+        self._schedule_recovery(write_now=write_recovery_now)
+
+    def _schedule_recovery(self, *, write_now: bool = False):
+        """Schedule a snapshot without adding an edit or changing dirty state."""
         if self._recovery_job is not None:
             with contextlib.suppress(Exception):
                 self.root.after_cancel(self._recovery_job)
-        delay = 0 if write_recovery_now else RECOVERY_DEBOUNCE_MS
+        delay = 0 if write_now else RECOVERY_DEBOUNCE_MS
         self._recovery_job = self.root.after(delay, self._write_recovery)
 
     def _write_recovery(self):
@@ -374,15 +399,21 @@ class EditorFrame(ctk.CTkFrame):
         with contextlib.suppress(Exception):
             write_recovery(self.session)
 
-    def save(self) -> bool:
+    def save(self, path: Path | None = None) -> bool:
+        """Save the current project, optionally switching to a new file."""
+        if hasattr(self, "power_tab") and self.power_tab.commit_numbers() is False:
+            return False
         self.flush_design_refresh()
         if hasattr(self, "riser_tab"):
             self.riser_tab.cancel(redraw=False)
+        old_path = self.session.path
         try:
-            save_session(self.session)
+            save_session(self.session, path)
         except Exception as exc:
             messagebox.showerror("Save failed", str(exc))
             return False
+        if old_path is not None and old_path != self.session.path:
+            clear_recovery(old_path)
         self.dirty = False
         if self._recovery_job is not None:
             with contextlib.suppress(Exception):
@@ -448,7 +479,7 @@ class EditorFrame(ctk.CTkFrame):
             self.tabs.add(title)
             self.tabs.tab(title).columnconfigure(0, weight=1)
             self.tabs.tab(title).rowconfigure(0, weight=1)
-        self.tabs.set("ZONES")  # the common field-correction surface lands first
+        self.tabs.set(self._initial_tab)
 
         self._build_site_tab(self.tabs.tab("SITE"))
 
@@ -463,10 +494,14 @@ class EditorFrame(ctk.CTkFrame):
             programming_options = (
                 {"on_programming_change": self._on_keypad_programming_edit}
                 if cls is KeypadsTab else {})
+            extra_options = (
+                {"on_renumber": self._on_expander_renumber}
+                if cls is PowerTab else {})
             widget = cls(self.tabs.tab(title), self.session, self._on_design_edit,
                          on_structure_change=self._on_structure_change,
                          on_hardware_change=self.apply_hardware_change,
-                         on_navigate=self.tabs.set, **programming_options)
+                         on_navigate=self.tabs.set, **programming_options,
+                         **extra_options)
             widget.grid(row=0, column=0, sticky="nsew")
             setattr(self, attr, widget)
 
@@ -504,7 +539,7 @@ class EditorFrame(ctk.CTkFrame):
         self._close_hardware_dialog()
         win = self._hardware_dialog = _dialog_shell(self.root, 'Add Device')
         _dialog_title(win, 'Add hardware to the shared project')
-        ctk.CTkLabel(win, text='New devices appear in the RISER Unplaced tray.',
+        ctk.CTkLabel(win, text='New devices are placed on the riser automatically.',
                      wraplength=330).pack(padx=20, pady=6)
 
         def choose(callback):
@@ -547,8 +582,9 @@ class EditorFrame(ctk.CTkFrame):
         elif keypad:
             self.keypads_tab._build_keypad_card(keypad, parent=body).pack(fill='x')
         elif rsp:
-            self.power_tab._build_rsp_card(rsp,
-                {ps.number: ps for ps in design.power_supplies}, parent=body).pack(fill='x')
+            card = self.power_tab._build_rsp_card(rsp,
+                {ps.number: ps for ps in design.power_supplies}, parent=body)
+            card.pack(fill='x')
         else:
             ctk.CTkLabel(body, text='XR550 / MSP location').pack(anchor='w', padx=10)
             ctk.CTkEntry(body, textvariable=self._site_vars['xr550_location']).pack(
@@ -557,8 +593,9 @@ class EditorFrame(ctk.CTkFrame):
 
         def done():
             # FocusOut is asynchronous; explicitly commit before destroying widgets.
-            if splitter and card.winfo_exists():
-                card.commit_pending()
+            if (splitter or rsp) and card.winfo_exists():
+                if card.commit_pending() is False:
+                    return
             self._close_hardware_dialog()
             self.refresh_all_tabs()
 
@@ -693,6 +730,11 @@ class EditorFrame(ctk.CTkFrame):
 
     def _on_design_edit(self):
         """Splitter/keypad/power edits: RSP locations feed master rows too."""
+        try:
+            moved_zone_ranges = sync_rsp_zone_buses(self.session.design)
+        except HardwareError as exc:
+            moved_zone_ranges = 0
+            messagebox.showwarning("LX zone ranges need review", str(exc), parent=self.root)
         sync_project_locations(self.session.design)
         topology_changed = self._sync_topology_review()
         self._location_signature = location_values(self.session.design)
@@ -700,6 +742,9 @@ class EditorFrame(ctk.CTkFrame):
         self.mark_dirty()
         if hasattr(self, "power_tab"):
             self.power_tab.sync_locations()
+        if moved_zone_ranges:
+            self.zones.refresh()
+            self.power_tab.refresh()
         self._cancel_design_refresh()
         if topology_changed:
             self._refresh_design_views()
@@ -743,16 +788,24 @@ class EditorFrame(ctk.CTkFrame):
 
     def _on_riser_edit(self):
         """Canvas topology edits must be visible in the legacy cards at once."""
+        try:
+            moved_zone_ranges = sync_rsp_zone_buses(self.session.design)
+        except HardwareError as exc:
+            moved_zone_ranges = 0
+            messagebox.showwarning("LX zone ranges need review", str(exc), parent=self.root)
         topology_changed = self._sync_topology_review()
         locations = location_values(self.session.design)
         locations_changed = locations != self._location_signature
         self._location_signature = locations
         self.mark_dirty()
-        if topology_changed or locations_changed:
+        if topology_changed or locations_changed or moved_zone_ranges:
             sync_master_zones(self.session.design)
             self.refresh_validation()
             self.splitters_tab.refresh()
             self.keypads_tab.refresh()
+        if moved_zone_ranges:
+            self.power_tab.refresh()
+            self.zones.refresh()
         if locations_changed:
             self.power_tab.sync_locations()
             suspended = self._suspend_traces
@@ -774,17 +827,45 @@ class EditorFrame(ctk.CTkFrame):
         self._topology_signature = signature
         return changed
 
-    def _on_structure_change(self):
-        """Hardware was added or removed: every tab's choices and rows shift."""
-        self._close_hardware_dialog()
-        sync_project_locations(self.session.design)
-        prune_unknown_connections(self.session.design)
-        project_legacy_topology(self.session.design)
+    def _on_expander_renumber(self):
+        """A pair rename keeps zone addresses, wiring, and riser geometry,
+        so only the identity-dependent views need to refresh."""
         self.session.topology_confirmed = False
         sync_master_zones(self.session.design)
         self.mark_dirty()
         self.refresh_validation()
         self.refresh_all_tabs()
+
+    def _on_structure_change(self):
+        """Hardware was added or removed: every tab's choices and rows shift."""
+        document = self.riser_tab.controller.document
+        known_devices = set(document.unplaced) | {
+            e.ref for e in document.elements.values() if e.kind == 'device'}
+        self._close_hardware_dialog()
+        sync_project_locations(self.session.design)
+        prune_unknown_connections(self.session.design)
+        project_legacy_topology(self.session.design)
+        try:
+            sync_rsp_zone_buses(self.session.design)
+        except HardwareError as exc:
+            messagebox.showwarning("LX zone ranges need review", str(exc), parent=self.root)
+        self.session.topology_confirmed = False
+        sync_master_zones(self.session.design)
+        self.mark_dirty()
+        self.refresh_validation()
+        self.refresh_all_tabs()
+        added = set(document.unplaced) - known_devices
+        if added:
+            self.riser_tab.controller.auto_layout(device_ids=added)
+            self.riser_tab.selected = ('element', f'device:{sorted(added)[0]}')
+            self.riser_tab.redraw()
+            failed = sorted(added & set(document.unplaced))
+            if failed:
+                messagebox.showwarning(
+                    'Device could not be placed',
+                    f"Could not fit {', '.join(failed)} on the drawing. Make room, then "
+                    'click the device warning to retry automatic placement.',
+                    parent=self.root)
 
     def apply_hardware_change(self, mutate):
         """Run a removal that may cascade, then surface what it rewired.
@@ -892,6 +973,8 @@ class EditorFrame(ctk.CTkFrame):
     def _guard_generation(self, callback):
         def guarded():
             if self.generation_allowed() and callback:
+                if hasattr(self, "power_tab") and self.power_tab.commit_numbers() is False:
+                    return
                 return callback()
         return guarded
 
@@ -1119,6 +1202,8 @@ class EditorFrame(ctk.CTkFrame):
     _SITE_FIELDS = [
         ("School name",       "school_name"),
         ("School code",       "school_code"),
+        ("Address line 1",    "address_line1"),
+        ("Address line 2",    "address_line2"),
         ("Main phone",        "phone"),
         ("Install tech name", "install_tech"),
         ("Install date",      "install_date"),
@@ -1166,7 +1251,7 @@ class EditorFrame(ctk.CTkFrame):
             self._site_vars[attr] = var
 
         panel = Card(holder)
-        panel.grid(row=4, column=0, columnspan=2, sticky="ew",
+        panel.grid(row=(len(self._SITE_FIELDS) + 1) // 2, column=0, columnspan=2, sticky="ew",
                    pady=(theme.PAD["md"], 0))
         panel.columnconfigure(0, weight=1)
         panel.columnconfigure(1, weight=1)
@@ -1281,13 +1366,7 @@ class EditorFrame(ctk.CTkFrame):
         machine-stable tech/IP/gateway, a date carried forward is always stale
         (it produced yesterday's date on today's job). It defaults to today,
         formatted the way techs write it, and stays fully editable."""
-        from datetime import date as _date
-        defaults = {
-            "install_tech": prefs.get("install_tech", ""),
-            "install_date": _format_install_date(_date.today()),
-            "ip_address": prefs.get("ip_address", ""),
-            "default_gateway": prefs.get("default_gateway", ""),
-        }
+        defaults = _site_defaults(prefs)
         self._suspend_traces = True
         site = self.session.design.site_info
         for attr, value in defaults.items():

@@ -7,7 +7,7 @@ import pytest
 from test_riser_drag_performance import tab
 from test_riser_app_integration import _event_for_world
 from riser_model import RiserAnnotation
-from test_release_editor_integration import editor
+from test_release_editor_integration import editor, button
 from tkinter import simpledialog
 from types import SimpleNamespace
 
@@ -112,6 +112,63 @@ def test_title_edit_undo_redo_updates_visible_fields(tab):
     assert tab._title_vars['drawn_by'].get() == old
     tab.redo()
     assert tab._title_vars['drawn_by'].get() == 'TC'
+
+
+@pytest.mark.parametrize("field, value", [
+    ("school_name", "RISER SCHOOL"), ("local_code", "RISER CODE"),
+    ("address", "RISER ADDRESS"), ("project_title", "RISER PROJECT"),
+])
+def test_title_edits_remain_riser_only_without_rewriting_site(editor, field, value):
+    frame, _calls = editor
+    before_site = copy.deepcopy(frame.session.design.site_info)
+    tab = frame.riser_tab
+    tab._title_vars[field].set(value)
+
+    tab._save_title(field, tab._title_vars[field])
+
+    assert getattr(tab.controller.document.title_block, field) == value
+    assert frame.session.design.site_info == before_site
+    assert frame.dirty
+
+
+@pytest.mark.parametrize("confirm", [False, True])
+def test_copy_from_site_button_confirms_conflict_before_any_mutation(editor, monkeypatch, confirm):
+    frame, _calls = editor
+    tab = frame.riser_tab
+    tab.controller.update_title_block(project_title="Independent project")
+    tab._sync_title_fields()
+    tab.controller.clear_history()
+    frame._site_vars["school_name"].set("UPDATED SITE")
+    frame._site_vars["school_code"].set("LC-9")
+    frame._site_vars["address_line1"].set("1500 Sycamore Lane")
+    frame._site_vars["address_line2"].set("Riverton, CA 90000")
+    frame.dirty = False
+    before = copy.deepcopy(tab.controller.document)
+    prompts = []
+
+    def askyesno(title, message, **kwargs):
+        prompts.append(message)
+        return confirm
+
+    monkeypatch.setattr(messagebox, "askyesno", askyesno)
+    button(tab, "Copy from SITE").invoke()
+
+    assert len(prompts) == 1
+    assert "Independent project" in prompts[0] and "UPDATED SITE" in prompts[0]
+    if not confirm:
+        assert tab.controller.document == before
+        assert tab._title_vars["project_title"].get() == "Independent project"
+        assert not tab.controller.can_undo
+        assert not frame.dirty
+        return
+    assert tab._title_vars["school_name"].get() == "UPDATED SITE"
+    assert tab._title_vars["local_code"].get() == "LC-9"
+    assert tab._title_vars["address"].get() == "1500 Sycamore Lane\nRiverton, CA 90000"
+    assert tab._title_vars["project_title"].get() == "UPDATED SITE"
+    assert frame.dirty
+    tab.undo()
+    assert tab.controller.document == before
+    assert tab._title_vars["project_title"].get() == "Independent project"
 
 
 @pytest.mark.parametrize('name,tag', [('Locations','element|location:WING 1 ROOM 3'),

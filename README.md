@@ -1,6 +1,7 @@
 # C1 DMP Toolkit
 
-Desktop app (macOS + Windows) that turns a security-system design PDF into a
+Desktop app (macOS + Windows) for creating a project from scratch or turning a
+security-system design PDF into a
 **DMP Installation Worksheet**, **Door Chart**, editable **Riser Diagram**, and
 encrypted **RemoteLink Account** —
 with a built-in editor for correcting the design in the field before anything
@@ -22,7 +23,10 @@ https://github.com/user-attachments/assets/fbbad379-596e-4965-9399-51c9bf878d3e
 
 - a security design PDF (OCR'd automatically if it isn't searchable),
 - an existing DMP worksheet (`.xlsx`), or
+- an equipment BOM (`.xlsx`) with **BOM** and **BOM Breakdown** sheets, or
 - a saved project (`.dmps`) from a previous visit.
+
+Or choose **Create New Project** to start without a source file.
 
 **Outputs** — revision-numbered files, generated on demand from the
 editor:
@@ -38,29 +42,55 @@ review with the site superintendent → edit → regenerate.**
 
 ## Workflow
 
-### 1. Import
+### 1. Create New Project or Import/Open
 
-Drop a file on the home screen. PDFs are OCR'd if needed, then parsed for the
-zone schedule, splitter topology, RSPs, and keypads. The home screen lists
-recent projects for one-click reopening across days and site visits.
+Choose **Create New Project** on the home screen or File menu (`Cmd/Ctrl+N`).
+Only the site / school name is required; local code, two-line address, MSP
+location, sheet number, prepared by, and issue date can be filled in now or later.
+Create saves an ordinary, collision-safe `.dmps` in Sessions and opens **RISER**
+with the existing MSP and title block, but no invented hardware or wiring.
+Cancel creates nothing. No PDF, worksheet, or earlier project is needed.
+
+Or drop/browse a PDF, XLSX, or DMPS, or use **File → Open** (`Cmd/Ctrl+O`).
+PDFs are OCR'd if needed, then parsed for the zone schedule, splitter topology,
+RSPs, and keypads. Imported and reopened projects start on **ZONES** and retain
+their saved drawing. Recent projects reopen directly without requesting a source file.
+
+For a supported BOM, a review window lists the source rows before creating a
+draft project. It imports RSP/paired power-supply locations, zone ranges, and
+marked motion points. Unknown sensor rooms remain marked **LOCATION NEEDS
+REVIEW** in ZONES. Keypad destinations and equipment counts appear in the
+review; equipment whose type or wiring cannot be identified is left for manual
+entry. A BOM is not treated as a generated DMP worksheet, so generate a
+worksheet before making a Door Chart.
+
+The screenshots and feature tours show the earlier import workflow; the text
+here describes the current Create New Project action.
 
 ![Home screen](docs/screenshots/home.png)
 
 ### 2. Edit
 
-Parsing lands in a tabbed editor — **SITE / ZONES / SPLITTERS / KEYPADS /
+Both entry paths use the same tabbed editor — **SITE / ZONES / SPLITTERS / KEYPADS /
 RSP/POWER / REMOTELINK / RISER** — which is the working document; generated files are
 artifacts and are never re-imported.
 
-- **SITE** — school details plus RemoteLink panel connection, IP, port, and
-  serial-number settings.
+- **SITE** — school name, local code, address line 1 and city/state/ZIP, phone,
+  tech, install date, MSP location, network, and RemoteLink panel settings.
+  Setup seeds the RISER title, but subsequent SITE and title-block edits are
+  intentionally independent. **RISER → Copy from SITE** explicitly copies
+  school, local code, address, and school name as the project title (confirming
+  replacement of a different nonempty project title). Other drawing fields stay
+  unchanged; title edits never overwrite SITE, including after save/reopen.
 - **ZONES** — searchable grid with inline editing and filter chips (All /
   Needs attention / Spares / Errors), including the RemoteLink zone type that
   will be programmed for each zone.
 - **SPLITTERS** — the wiring topology, CAD-print conflict resolution, and a
   "Wiring reviewed against the riser diagram" checkbox. A read-only **topology
   tree** sits beside the cards so you can verify the derived 710-bus wiring at a
-  glance — click any node to jump to the card (or tab) that owns it.
+  glance — click any node to jump to the card (or tab) that owns it. For a manually
+  authored project, review the connections you created and tick **Wiring reviewed**;
+  manual topology is not a failed PDF extraction.
 - **Hardware changes** — add or remove **714-16/714-8 expanders** (each brings
   its RSP + power supply + consecutive 16- or 8-zone block), **710 splitters**
   (LX or KP), and **keypads**. New expanders use the first available range that
@@ -70,17 +100,20 @@ artifacts and are never re-imported.
   dependent wiring to Spare and pops a review summary that routes you to the
   affected connections. Location fields autocomplete from locations already in
   the project. Template capacities are enforced: 15 expanders, 12 splitters
-  per type, 28 keypads.
+  per type, 28 keypads. LX splitters can be added on **LX500–LX900**; numbering
+  is independent per bus and connections must use the matching bus. RSP module
+  numbers and zone addresses are separate; deleting hardware does not renumber
+  existing devices.
 - **KEYPADS** — keypad name, device type, displayed areas, and derived bus
-  communication settings.
+  communication settings. **Keypad 1 sourced directly from MSP** is the normal
+  service-keypad convention, using the existing keypad model (not a new device type).
 - **REMOTELINK** — account and receiver numbers, users, arming model, and a
   live read-back receipt of exactly what the generated account will contain.
   Advanced settings that can make a panel act on its own stay collapsed behind
   an explicit warning.
 - **RISER** — balanced KP/LX auto-layout on one `INT-5.0` sheet, direct device
   and cable editing, topology-aware connect/reconnect, orthogonal route handles,
-  markup tools, title-block fields, undo/redo, validation jumps, and an Unplaced
-  tray. Electrical changes appear immediately in SPLITTERS and worksheet output.
+  markup tools, title-block fields, undo/redo, validation jumps, and actionable placement warnings. Electrical changes appear immediately in SPLITTERS and worksheet output.
   **Hide panel / Show panel** collapses the right-side controls to give the
   drawing more room while retaining selections and entered values. **Full screen**
   is available in the riser toolbar and View menu; press **Escape** to exit,
@@ -108,19 +141,29 @@ artifacts and are never re-imported.
 
 Buttons at the bottom of the editor (also Worksheet menu / keyboard):
 
-- **Generate Worksheet** (`Cmd/Ctrl+E`) — writes the next worksheet revision.
+- **Generate Worksheet** (`Cmd/Ctrl+E`) — writes the next worksheet revision
+  from the shared manual or imported design. Missing site fields, RSPs/zones, or
+  wiring review produce nonblocking guidance; no conversion or source PDF is needed.
 - **Generate Door Chart** (`Cmd/Ctrl+D`) — builds the chart from the newest
   worksheet, warning if the design has changed since that worksheet was
-  generated.
+  generated. Manual projects must generate their own worksheet in the current
+  runtime before charting, **including after reopen**; another same-named site's
+  worksheet is never substituted. An imported XLSX can be charted immediately;
+  existing imported-project worksheet fallback remains unchanged.
 - **Generate Riser** (`Cmd/Ctrl+R`) — choose 11×17 PDF (default), 24×36 PDF,
   and/or editable SVG. Only selected files are generated. Format choices are
   remembered, and the saved output folder is reused automatically; Change folder
-  is optional.
+  is optional. Available from an MSP-only project without a worksheet or source
+  document; review the existing nonblocking riser warnings before generating.
 - **Generate RemoteLink Account** — builds an encrypted RemoteLink `.xml`
   account export from the settings reviewed across **SITE, ZONES, KEYPADS, and
   REMOTELINK**. The final dialog is deliberately read-only: it shows the
   account/receiver numbers and the same live receipt, then asks only for the
-  export **passphrase**. Generation writes both `<code>_remotelink.xml` and a
+  export **passphrase**. Readiness guidance appears before that dialog: a numeric
+  account/local code and installed RSP zones are required. Missing prerequisites
+  block only this export, not editing, riser generation, or worksheet creation.
+  Master-template rows without installed RSP ownership are excluded.
+  Generation writes both `<code>_remotelink.xml` and a
   matching `<code>_remotelink_summary.txt`; import the `.xml` into RemoteLink
   on Windows — no ODBC driver or direct database access needed.
 
@@ -147,8 +190,8 @@ for review.
 
 ![Generate RemoteLink Account](docs/screenshots/remotelink.png)
 
-If validation issues are open you get a summary with "Go to" jumps — generate
-anyway, or fix things first; your call.
+Worksheet and riser validation issues offer a summary with "Go to" jumps —
+generate anyway, or fix things first. RemoteLink's hard prerequisites must be met.
 
 ![Pre-generate check](docs/screenshots/generate-check.png)
 
@@ -160,8 +203,15 @@ a notification offers to open the finished file.
 ## Projects & saving
 
 Saving is explicit — the Save button or `Cmd/Ctrl+S` writes a `.dmps` project
-file (plain JSON) under `<output>/Sessions/`. A debounced background recovery
+file (plain JSON), normally under `<output>/Sessions/`. Create New Project writes
+the initial save only after setup is accepted. A debounced background recovery
 file guards against crashes; unsaved work is offered for recovery on reopen.
+**File → Save As…** keeps the old file and switches the current project and
+future recovery to the new `.dmps`. Cancel or a failed save does not switch paths.
+Only projects in the configured Sessions folder appear in **Open Recent**;
+files elsewhere can still be opened directly. Changing the output folder changes
+the active Sessions/recent folder. Editing the site name changes future output
+filename/revision series, not the current session filename; use Save As to rename it.
 In-app help lives under **Help → Field-Edit Workflow / Keyboard Shortcuts**,
 plus hover tooltips on the less obvious controls.
 
@@ -217,7 +267,8 @@ or hides group outlines in both the editor and exports; detailed drawings hide
 these outlines by default. Electrical connections remain unchanged.
 
 - **Add Device** opens the existing splitter, keypad, or RSP/power-supply creation
-  form. New equipment appears in **Unplaced**; existing drawing positions stay put.
+  form. Finishing the form automatically places new equipment in clear space;
+  existing drawing positions stay put. If no space fits, a device warning lets you retry after making room.
 - Select a device and choose **Edit Device**, or double-click its symbol. The same
   forms used by the domain tabs edit the shared project immediately. **Done** closes
   the form; it is not a separate draft. **Remove from Project** uses the existing
@@ -240,12 +291,14 @@ these outlines by default. Electrical connections remain unchanged.
 | `scripts/rl_injector/` | RemoteLink document model, safety verification, inspector, and encrypted `.xml` export |
 | `dmp_doorchart.spec` | PyInstaller build spec (OS-branched internally) |
 | `requirements.txt` | Pinned dependencies — build with **Python 3.13** |
+| `requirements-dev.txt` | Application dependencies plus the pinned test runner |
 | `VERSION` | App version, shown in the title bar |
 | `build_mac.command` / `build_windows.bat` | Per-machine build scripts |
-| `.github/workflows/release.yml` | CI: builds both OSes on a version tag |
+| `.github/workflows/ci.yml` | Regression tests on macOS and Windows for PRs and main |
+| `.github/workflows/release.yml` | Verifies the version, runs CI, then builds and publishes both OSes on a version tag |
 | `logos/`, `*.xlsx` | Branding assets and Excel templates |
 | `docs/screenshots/` | README images (demo data only) |
-| `docs/` | Design specs |
+| `docs/` | Roadmap, design specs, and release notes |
 
 Build output, virtualenvs, and working data are **not** committed — see
 `.gitignore`. One codebase runs on both operating systems — platform
@@ -257,9 +310,17 @@ differences are handled at runtime via `sys.platform` checks.
 
 ## Developer setup (new machine)
 
+For running from source, tests, pull requests, and the release checklist, see
+[CONTRIBUTING.md](CONTRIBUTING.md). Planned improvements and maintenance priorities
+live in the [project roadmap](docs/ROADMAP.md).
+
+For background-only verification, run `venv/bin/pytest --no-gui -q -ra`.
+This opt-in guard prevents Tcl/Tk creation and skips GUI tests; it does not replace
+native macOS/Windows packaged acceptance. Default GUI-capable CI behavior is unchanged.
+
 1. Install **Python 3.13** and **Git** (or GitHub Desktop).
 2. Install the OCR tools:
-   - macOS: `brew install tesseract ghostscript`
+   - macOS: `brew install python@3.13 python-tk@3.13 tesseract ghostscript`
    - Windows: Tesseract-OCR (UB Mannheim build) and Ghostscript, default paths.
 3. Clone this repo (anywhere **outside** OneDrive, e.g. `~/Projects/`).
 4. Build:
@@ -278,14 +339,15 @@ from GitHub Releases.
 Push a version tag to build both platforms via CI and publish a Release:
 
 ```
-# bump VERSION first (e.g. to 1.0.9), commit, then:
-git tag v1.0.9
-git push origin v1.0.9
+# choose an unused version, update VERSION and release notes, commit, then:
+git tag v1.7.1
+git push origin v1.7.1
 ```
 
-GitHub Actions builds the macOS `.app` and Windows `.exe` and attaches both to a
-GitHub Release for that tag. The Release is the version archive. CI fails fast if
-the pushed tag doesn't match the `VERSION` file, so the two can't drift.
+GitHub Actions verifies the tag matches `VERSION` and runs the regression suite
+on macOS and Windows before building the macOS `.app` and Windows `.exe`. Both
+builds must succeed before they are attached to a GitHub Release for that tag.
+The Release is the version archive; never move a published version tag.
 
 ## Auto-update
 

@@ -14,10 +14,16 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import riser_render  # noqa: E402
+from riser_drawing import wrap_text
 from riser_render import generate_riser_bundle, render_pdf, render_svg  # noqa: E402
 from riser_scene import TITLE_BLOCK_WIDTH, layout_riser  # noqa: E402
 from riser_model import RiserAnnotation  # noqa: E402
 from test_riser_scene import branched_design, legacy_named_splitter_design  # noqa: E402
+
+
+def test_explicit_location_line_break_is_preserved():
+    assert wrap_text('Data Room - Building #1\n(Service Keypad)', 1000, 16) == [
+        'Data Room - Building #1', '(Service Keypad)']
 
 
 def test_svg_is_standalone_searchable_and_contains_engineering_content(tmp_path):

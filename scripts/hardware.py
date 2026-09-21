@@ -131,6 +131,90 @@ def add_expander(design: DMPDesign, model: str, location: str | None = None) -> 
     return rsp
 
 
+def renumber_expander(design: DMPDesign, number: int, new_number: int) -> RSP:
+    """Rename an RSP/PS pair while preserving addresses and drawing geometry."""
+    rsp = next((r for r in design.rsps if r.number == number), None)
+    if rsp is None:
+        raise HardwareError(f"No expander #{number} in this design.")
+    if type(new_number) is not int or not 1 <= new_number <= MAX_EXPANDERS:
+        raise HardwareError(f"RSP/PS number must be between 1 and {MAX_EXPANDERS}.")
+    if number == new_number:
+        return rsp
+    if any(r.number == new_number for r in design.rsps) or any(
+            p.number == new_number for p in design.power_supplies):
+        raise HardwareError(f"RSP-{new_number} / PS-{new_number} already exists. Pick a free number.")
+
+    return _rename_expander(design, number, new_number)
+
+
+def renumber_expanders(design: DMPDesign, numbers: dict[int, int]) -> None:
+    """Validate final pair numbers together, allowing swaps and cycles."""
+    current = {r.number for r in design.rsps}
+    if not set(numbers) <= current:
+        raise HardwareError("An edited expander is no longer in the project.")
+    final = [numbers.get(r.number, r.number) for r in design.rsps]
+    if any(type(n) is not int or not 1 <= n <= MAX_EXPANDERS for n in final):
+        raise HardwareError(f"RSP/PS numbers must be between 1 and {MAX_EXPANDERS}.")
+    if len(set(final)) != len(final):
+        raise HardwareError("Each RSP/PS pair needs a unique number. Finish renumbering the pairs, then Save again.")
+    orphan_ps = {p.number for p in design.power_supplies} - current
+    if orphan_ps & set(final):
+        raise HardwareError("A power supply already uses one of these numbers.")
+    changes = [(old, new) for old, new in numbers.items() if old != new]
+    # Temporary identities are internal only; no callbacks or saves run between
+    # phases, and validation has completed before any mutation.
+    for index, (old, new) in enumerate(changes, 1):
+        _rename_expander(design, old, -index)
+    for index, (old, new) in enumerate(changes, 1):
+        _rename_expander(design, -index, new)
+
+
+def _rename_expander(design: DMPDesign, number: int, new_number: int) -> RSP:
+    rsp = next(r for r in design.rsps if r.number == number)
+    from session import ensure_editable_zones, sync_master_zones
+    from riser_model import DevicePortRef
+    ensure_editable_zones(design, merge_missing=True)
+    old_id, new_id = f"RSP-{number}", f"RSP-{new_number}"
+    rsp.number = new_number
+    for ps in design.power_supplies:
+        if ps.number == number:
+            ps.number = new_number
+            ps.relays = {key: re.sub(rf"(\bExpander\s*#\s*){number}(?!\d)",
+                                    lambda m: f"{m.group(1)}{new_number}", value, flags=re.I)
+                         for key, value in ps.relays.items()}
+    for zone in design.zones:
+        if zone.number in rsp.zones and zone.location:
+            zone.location = re.sub(rf"^PS-{number}(?=\s*:)",
+                                   f"PS-{new_number}", zone.location, flags=re.I)
+    for splitter in design.splitters:
+        splitter.outputs = [new_id if re.fullmatch(
+            rf"RSP[-\s]+{number}", (value or "").strip(), re.I) else value
+            for value in (splitter.outputs or [])]
+    for edge in design.connections:
+        if edge.source.device_id == old_id:
+            edge.source = DevicePortRef(new_id, edge.source.port_id)
+        if edge.target.device_id == old_id:
+            edge.target = DevicePortRef(new_id, edge.target.port_id)
+    for mapping in (design.device_location_ids, design.location_sync_values):
+        for prefix in ("RSP", "PS"):
+            old_ref, new_ref = f"{prefix}-{number}", f"{prefix}-{new_number}"
+            if old_ref in mapping:
+                mapping[new_ref] = mapping.pop(old_ref)
+    document = design.riser_document
+    if document is not None:
+        old_key, new_key = f"device:{old_id}", f"device:{new_id}"
+        element = document.elements.pop(old_key, None)
+        if element is not None:
+            element.id, element.ref = new_key, new_id
+            document.elements[new_key] = element
+        document.z_order = [new_key if key == old_key else key for key in document.z_order]
+        document.unplaced = [new_id if ref == old_id else ref for ref in document.unplaced]
+    design.rsps.sort(key=lambda r: r.number)
+    design.power_supplies.sort(key=lambda p: p.number)
+    sync_master_zones(design)
+    return rsp
+
+
 def remove_expander(design: DMPDesign, number: int) -> None:
     rsp = next((r for r in design.rsps if r.number == number), None)
     if rsp is None:
@@ -184,6 +268,135 @@ def _splitter_bus(splitter: Splitter) -> str | None:
     return "500"
 
 
+def _move_rsp_zone_addresses(design: DMPDesign, moves: dict[int, int],
+                             moving_rsps: list[RSP]) -> None:
+    """Validate every destination before changing any zone representation."""
+    if not moves:
+        return
+    occupied = ({zone for rsp in design.rsps for zone in rsp.zones}
+                | {zone.number for zone in design.zones}
+                | {zone.number for zone in design.master_zones}) - moves.keys()
+    conflicts = occupied.intersection(moves.values())
+    if conflicts or len(set(moves.values())) != len(moves):
+        raise HardwareError(
+            f"Destination zone addresses are occupied: "
+            f"{', '.join(map(str, sorted(conflicts))) or 'overlapping RSP ranges'}. "
+            "No changes were made.")
+    for rsp in moving_rsps:
+        rsp.zones = [moves[zone] for zone in rsp.zones]
+    for zone in design.zones:
+        zone.number = moves.get(zone.number, zone.number)
+    design.zones.sort(key=lambda zone: zone.number)
+    for zone in design.master_zones:
+        zone.number = moves.get(zone.number, zone.number)
+    design.master_zones.sort(key=lambda zone: zone.number)
+    moving_numbers = {rsp.number for rsp in moving_rsps}
+    for ps in design.power_supplies:
+        if ps.number in moving_numbers:
+            ps.relays = {relay: re.sub(
+                r"(?i)(\bZone\s+)(\d+)",
+                lambda match: match.group(1) + str(moves.get(int(match.group(2)), int(match.group(2)))),
+                label) for relay, label in ps.relays.items()}
+
+
+def sync_rsp_zone_buses(design: DMPDesign) -> int:
+    """Repair RSP ranges whose splitter feed already names a different LX bus."""
+    by_id = {splitter.id: splitter for splitter in design.splitters}
+    feeds = {edge.target.device_id: edge.source
+             for edge in getattr(design, "connections", [])
+             if edge.target.port_id == "IN" and edge.target.device_id in by_id}
+
+    def fed_bus(splitter: Splitter, seen: set[str] | None = None) -> int:
+        seen = set() if seen is None else seen
+        if splitter.id in seen:
+            return int(_splitter_bus(splitter))
+        seen.add(splitter.id)
+        source = feeds.get(splitter.id)
+        if source is not None:
+            match = (re.fullmatch(r"LX([5-9]00)", source.port_id, re.I)
+                     if source.device_id == "MSP" else None)
+            if match:
+                return int(match.group(1))
+            parent = by_id.get(source.device_id)
+            if parent is not None:
+                return fed_bus(parent, seen)
+        for value in (splitter.inputs or {}).values():
+            match = re.match(r"^\s*From\s+(.+?)\s*$", value or "", re.I)
+            parent = by_id.get(match.group(1)) if match else None
+            if parent is not None:
+                return fed_bus(parent, seen)
+        return int(_splitter_bus(splitter))
+
+    targets: dict[int, int] = {}
+    for splitter in design.splitters:
+        if splitter.splitter_type != "LX":
+            continue
+        bus = fed_bus(splitter)
+        for output in splitter.outputs or []:
+            match = re.fullmatch(r"RSP[\s_-]*(\d+)", (output or "").strip(), re.I)
+            if match:
+                number = int(match.group(1))
+                if number in targets and targets[number] != bus:
+                    raise HardwareError(f"RSP-{number} is connected to more than one LX bus.")
+                targets[number] = bus
+    attached_rsps: dict[int, list[RSP]] = {}
+    for rsp in design.rsps:
+        target = targets.get(rsp.number)
+        if target is not None and rsp.zones:
+            attached_rsps.setdefault(target, []).append(rsp)
+
+    groups: dict[int, list[RSP]] = {}
+    for target, rsps in attached_rsps.items():
+        ordered = sorted(rsps, key=lambda rsp: rsp.number)
+        in_bus = all(target <= zone < target + 100
+                     for rsp in ordered for zone in rsp.zones)
+        in_order = all(max(previous.zones) < min(current.zones)
+                       for previous, current in zip(ordered, ordered[1:]))
+        if not in_bus or not in_order:
+            groups[target] = ordered
+
+    moving_rsps = [rsp for group in groups.values() for rsp in group]
+    source_addresses = {zone for rsp in moving_rsps for zone in rsp.zones}
+    occupied = ({zone for rsp in design.rsps for zone in rsp.zones}
+                | {zone.number for zone in design.zones}
+                | {zone.number for zone in design.master_zones}) - source_addresses
+    moves: dict[int, int] = {}
+    for target, group in sorted(groups.items()):
+        offsets: dict[int, list[int]] = {}
+        for rsp in group:
+            first = min(rsp.zones)
+            current = first if first % 100 == 0 else (first // 100) * 100
+            offsets[rsp.number] = [zone + target - current for zone in rsp.zones]
+        proposed = [zone for rsp in group for zone in offsets[rsp.number]]
+        offsets_ordered = all(max(offsets[previous.number]) < min(offsets[current.number])
+                              for previous, current in zip(group, group[1:]))
+        if (offsets_ordered and len(set(proposed)) == len(proposed)
+                and all(target <= zone < target + 100 and zone not in occupied
+                        for zone in proposed)):
+            placements = offsets
+        else:
+            # An imported module can straddle a boundary or the old ranges can
+            # be out of RSP order. Pack whole modules by their RSP number.
+            placements = {}
+            reserved = set(occupied)
+            for rsp in group:
+                count = len(rsp.zones)
+                starts = [*range(target + 1, target + 101 - count), target]
+                block = next((list(range(start, start + count)) for start in starts
+                              if reserved.isdisjoint(range(start, start + count))), None)
+                if block is None:
+                    raise HardwareError(
+                        f"No room for all attached RSPs on LX{target}; "
+                        "zone ranges were not changed.")
+                placements[rsp.number] = block
+                reserved.update(block)
+        for rsp in group:
+            moves.update(zip(sorted(rsp.zones), placements[rsp.number]))
+            occupied.update(placements[rsp.number])
+    _move_rsp_zone_addresses(design, moves, moving_rsps)
+    return len(moving_rsps)
+
+
 def _used_numbers(design: DMPDesign, splitter_type: str,
                   exclude: Splitter | None = None, *, bus: str | None = None) -> set[int]:
     """Trailing numbers already taken by splitters of this type."""
@@ -202,20 +415,24 @@ def _used_numbers(design: DMPDesign, splitter_type: str,
 
 
 def add_splitter(design: DMPDesign, splitter_type: str,
-                 location: str | None = None) -> Splitter:
+                 location: str | None = None, *, lx_bus: str = "500") -> Splitter:
     if splitter_type not in ("LX", "KP"):
         raise HardwareError(f"Unknown splitter type: {splitter_type}")
+    if splitter_type == "LX" and lx_bus not in {"500", "600", "700", "800", "900"}:
+        raise HardwareError("LX bus must be one of 500, 600, 700, 800, or 900.")
     same_type = [s for s in design.splitters if s.splitter_type == splitter_type]
     if len(same_type) >= MAX_SPLITTERS_PER_TYPE:
         raise HardwareError(
             f"The splitter sheet fits at most {MAX_SPLITTERS_PER_TYPE} "
             f"{splitter_type} splitters."
         )
-    used = _used_numbers(design, splitter_type)
+    used = _used_numbers(design, splitter_type, bus=lx_bus)
     n = 1
     while n in used:
         n += 1
-    splitter = Splitter(id=_splitter_id(splitter_type, n),
+    splitter_id = (f"710-LX{lx_bus}-{n}" if splitter_type == "LX"
+                   else _splitter_id(splitter_type, n))
+    splitter = Splitter(id=splitter_id,
                         splitter_type=splitter_type, location=location,
                         outputs=["Spare", "Spare", "Spare"])
     design.splitters.append(splitter)
@@ -236,8 +453,11 @@ def remove_splitter(design: DMPDesign, splitter_id: str) -> None:
 
 
 def renumber_splitter(design: DMPDesign, splitter_id: str,
-                      new_number: int) -> Splitter:
-    """Change a splitter's trailing number (the 'N' in 710-LX500-N / 710-KP-N).
+                      new_number: int, *, lx_bus: str | None = None) -> Splitter:
+    """Change a splitter number and optionally its LX bus.
+
+    Direct MSP feeds and the zone addresses of attached RSPs follow the
+    selected bus. Existing destination addresses are never overwritten.
 
     The parser carries the diagram's numbering verbatim, so a missed splitter
     leaves a gap the tech can only patch with an out-of-order add. This lets
@@ -249,14 +469,18 @@ def renumber_splitter(design: DMPDesign, splitter_id: str,
     splitter = next((s for s in design.splitters if s.id == splitter_id), None)
     if splitter is None:
         raise HardwareError(f"No splitter {splitter_id} in this design.")
-    if _splitter_number(splitter) == new_number:
+    if lx_bus is not None and (
+            splitter.splitter_type != "LX" or lx_bus not in {"500", "600", "700", "800", "900"}):
+        raise HardwareError("LX bus must be one of 500, 600, 700, 800, or 900 for an LX splitter.")
+    bus = lx_bus or _splitter_bus(splitter)
+    if _splitter_number(splitter) == new_number and bus == _splitter_bus(splitter):
         return splitter  # no-op
     if not 1 <= new_number <= MAX_SPLITTERS_PER_TYPE:
         raise HardwareError(
             f"Splitter number must be between 1 and {MAX_SPLITTERS_PER_TYPE}."
         )
-    new_id = _splitter_id(
-        splitter.splitter_type, new_number, existing_id=splitter.id)
+    new_id = (f"710-LX{bus}-{new_number}" if lx_bus is not None else _splitter_id(
+        splitter.splitter_type, new_number, existing_id=splitter.id))
     # Legacy LX-710-N names do not encode their bus. A chained input may
     # therefore resolve to a different numbering pool even when the final ID
     # collides. IDs are graph/layout keys, so reject exact collisions first.
@@ -264,12 +488,36 @@ def renumber_splitter(design: DMPDesign, splitter_id: str,
         raise HardwareError(f"{new_id} already exists. Pick a free number.")
     if new_number in _used_numbers(
             design, splitter.splitter_type, exclude=splitter,
-            bus=_splitter_bus(splitter)):
+            bus=bus):
         raise HardwareError(f"{new_id} already exists. Pick a free number.")
 
+    zone_moves: dict[int, int] = {}
+    moving_rsps: list[RSP] = []
+    if lx_bus is not None and bus != _splitter_bus(splitter):
+        target_bus = int(bus)
+        attached = {int(match.group(1)) for output in splitter.outputs or []
+                    if (match := re.fullmatch(r"RSP[\s_-]*(\d+)", (output or "").strip(), re.I))}
+        for rsp in design.rsps:
+            if rsp.number not in attached or not rsp.zones:
+                continue
+            first = min(rsp.zones)
+            current_bus = first if first % 100 == 0 else (first // 100) * 100
+            if any(not current_bus <= zone < current_bus + 100 for zone in rsp.zones):
+                raise HardwareError(
+                    f"RSP-{rsp.number} crosses a bus boundary; "
+                    "review its physical addresses before changing the bus.")
+            if current_bus != target_bus:
+                moving_rsps.append(rsp)
+                zone_moves.update({zone: zone + target_bus - current_bus for zone in rsp.zones})
+
     old_id = splitter.id
+    _move_rsp_zone_addresses(design, zone_moves, moving_rsps)
     splitter.id = new_id
     _retoken_splitter_refs(design, old_id, new_id)
+    if lx_bus is not None:
+        splitter.inputs = {key: re.sub(
+            r"\b[5-9]00(?=\s+BUS\s+IN\s+FROM\s+XR/550)", bus, value, flags=re.I)
+            for key, value in (splitter.inputs or {}).items()}
 
     # Schema-2 connections are canonical. Renumber their endpoint references
     # in place so cable IDs, metadata, and manual routes remain stable.
@@ -278,6 +526,8 @@ def renumber_splitter(design: DMPDesign, splitter_id: str,
         if edge.source.device_id == old_id:
             edge.source = DevicePortRef(new_id, edge.source.port_id)
         if edge.target.device_id == old_id:
+            if lx_bus is not None and edge.source.device_id == "MSP" and re.fullmatch(r"LX[5-9]00", edge.source.port_id):
+                edge.source = DevicePortRef("MSP", f"LX{bus}")
             edge.target = DevicePortRef(new_id, edge.target.port_id)
 
     document = getattr(design, "riser_document", None)

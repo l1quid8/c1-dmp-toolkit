@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest an improvement to a field or office workflow.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues first. Describe one improvement using fictional
+        examples. This report is public: do not include real school/customer
+        files, panel user codes, credentials, or network settings.
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Current workflow
+      description: What are you trying to accomplish, and which app steps or outputs are involved?
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or friction
+      description: What makes the workflow difficult? Include frequency, impact, and any workaround.
+    validations:
+      required: true
+  - type: textarea
+    id: success
+    attributes:
+      label: What would success look like?
+      description: Describe an observable result. Include your proposed solution or alternatives if you have them.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context (optional)
+      description: Include relevant OS constraints or a fictional example. Sanitize any attachments, screenshots, paths, and metadata before uploading.

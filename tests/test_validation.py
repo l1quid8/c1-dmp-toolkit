@@ -9,6 +9,8 @@ Run: pytest tests/test_validation.py
 from pathlib import Path
 import sys
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -153,6 +155,24 @@ def test_unresolved_conflict_errors():
 
 
 # -------- topology.unconfirmed --------
+
+@pytest.mark.parametrize("source,severity,phrase", [
+    ("riser", "warning", "source riser"),
+    ("auto-derived", "error", "checked against the riser"),
+    ("manual", "warning", "when complete"),
+    ("", "warning", "marked as reviewed"),
+])
+def test_topology_review_guidance_matches_provenance(source, severity, phrase):
+    design = _valid_design()
+    design.topology_source = source
+    issue = next(i for i in validate_design(design, topology_confirmed=False)
+                 if i.code == "topology.unconfirmed")
+    assert issue.severity == severity
+    assert phrase in issue.message
+    if source == "manual":
+        assert "riser" not in issue.message.lower()
+        assert "extraction" not in issue.message.lower()
+
 
 def test_auto_derived_unconfirmed_is_error():
     design = _valid_design()

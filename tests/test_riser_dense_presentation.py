@@ -35,8 +35,11 @@ def test_dense_preview_fits_devices_captions_and_wires_without_changing_wiring()
     assert not [issue for issue in validate_riser(design,doc)
                 if issue.code in {'scene.off_page','scene.overlap','scene.cable_through_device','scene.caption_overlap','scene.uncovered_intersection'}]
     assert design==before
-    for prefix in ('710-KP-', '710-LX500-'):
-        assert len({e.x for e in doc.elements.values() if e.kind=='device' and e.ref.startswith(prefix)})==1
+    kp = [e for e in doc.elements.values() if e.kind=='device'
+          and e.ref.startswith(('710-KP-', 'KEYPAD-'))]
+    lx = [e for e in doc.elements.values() if e.kind=='device'
+          and e.ref.startswith(('710-LX500-', 'RSP-'))]
+    assert max(e.x+e.width for e in kp) < min(e.x for e in lx)
     assert len([e for e in doc.elements.values() if e.kind=='device'])==27
 
 

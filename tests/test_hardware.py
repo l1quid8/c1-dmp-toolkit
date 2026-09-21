@@ -140,6 +140,43 @@ def test_remove_missing_expander_raises():
 
 # -------- splitters --------
 
+@pytest.mark.parametrize("bus,want", [
+    ("500", "710-LX500-1"), ("600", "710-LX600-1"),
+    ("900", "710-LX900-1"),
+])
+def test_add_splitter_uses_selected_lx_bus(bus, want):
+    assert add_splitter(DMPDesign(), "LX", lx_bus=bus).id == want
+
+
+def test_add_splitter_numbers_independently_within_each_bus():
+    d = DMPDesign()
+    assert add_splitter(d, "LX", lx_bus="600").id == "710-LX600-1"
+    assert add_splitter(d, "LX").id == "710-LX500-1"
+    assert add_splitter(d, "LX", lx_bus="600").id == "710-LX600-2"
+    remove_splitter(d, "710-LX600-1")
+    assert add_splitter(d, "LX", lx_bus="600").id == "710-LX600-1"
+    assert add_splitter(d, "KP", lx_bus="900").id == "710-KP-1"
+    assert add_splitter(d, "KP").id == "710-KP-2"
+
+
+@pytest.mark.parametrize("bus", ["400", "1000", "LX600", "", "600.0"])
+def test_add_splitter_rejects_invalid_lx_bus_without_mutation(bus):
+    d = DMPDesign()
+    with pytest.raises(HardwareError, match="LX bus"):
+        add_splitter(d, "LX", lx_bus=bus)
+    assert d.splitters == []
+
+
+def test_lx_capacity_is_per_family_not_per_selected_bus():
+    d = DMPDesign()
+    for n in range(MAX_SPLITTERS_PER_TYPE):
+        add_splitter(d, "LX", lx_bus="500" if n % 2 else "600")
+    with pytest.raises(HardwareError, match="12 LX splitters"):
+        add_splitter(d, "LX", lx_bus="900")
+    assert len(d.splitters) == MAX_SPLITTERS_PER_TYPE
+    assert add_splitter(d, "KP").id == "710-KP-1"
+
+
 def test_add_splitter_ids_and_capacity():
     d = DMPDesign()
     s1 = add_splitter(d, "LX", location="FACP")
@@ -411,3 +448,29 @@ def test_persistent_gap_keeps_later_modules_sheets(tmp_path):
     wb = openpyxl.load_workbook(out)
     info_sheets = sorted(s for s in wb.sheetnames if "Point Info" in s)
     assert len(info_sheets) == 3, info_sheets  # sheets 1-3 kept, 4-15 trimmed
+
+
+def test_edit_splitter_bus_preserves_refs_and_updates_panel_feed():
+    from riser_model import DevicePortRef, TopologyConnection
+    d = DMPDesign(splitters=[
+        Splitter('710-LX500-2', 'LX', inputs={'LX-Bus In': '500 BUS IN FROM XR/550'}, outputs=['Spare'] * 3),
+        Splitter('710-LX500-3', 'LX', inputs={'LX-Bus In': 'From 710-LX500-2'}),
+    ], keypads=[Keypad(number=2, source='710-LX500-2')])
+    d.connections = [TopologyConnection(id='feed', source=DevicePortRef('MSP', 'LX500'), target=DevicePortRef('710-LX500-2', 'IN'))]
+    renumber_splitter(d, '710-LX500-2', 2, lx_bus='600')
+    assert d.splitters[0].id == '710-LX600-2'
+    assert d.splitters[0].inputs == {'LX-Bus In': '600 BUS IN FROM XR/550'}
+    assert d.splitters[1].inputs['LX-Bus In'] == 'From 710-LX600-2'
+    assert d.keypads[0].source == '710-LX600-2'
+    assert d.connections[0].source == DevicePortRef('MSP', 'LX600')
+    assert d.connections[0].target == DevicePortRef('710-LX600-2', 'IN')
+
+
+@pytest.mark.parametrize('bus', ['400', '600'])
+def test_edit_splitter_bus_rejects_invalid_or_duplicate_without_mutation(bus):
+    import copy
+    d = DMPDesign(splitters=[Splitter('710-LX500-2', 'LX'), Splitter('710-LX600-2', 'LX')])
+    before = copy.deepcopy(d)
+    with pytest.raises(HardwareError):
+        renumber_splitter(d, '710-LX500-2', 2, lx_bus=bus)
+    assert d == before

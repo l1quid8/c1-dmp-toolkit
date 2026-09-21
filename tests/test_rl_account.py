@@ -129,6 +129,16 @@ def test_build_staging_account_filters_uninstalled_zones():
     assert 999 not in {z.number for z in acct.zones}
 
 
+@pytest.mark.parametrize("empty_range", [False, True])
+def test_staging_no_installed_rsp_range_never_exports_master_template_rows(empty_range):
+    design = _rl_design()
+    design.rsps = [RSP(1, zones=[])] if empty_range else []
+
+    assert build_staging_account(design, "2250", "1").zones == []
+    with pytest.raises(InjectorError, match="No zones to stage"):
+        build_configured_account_doc(design, RemoteLinkConfig(), _mini_template())
+
+
 # --- .xml encoder ----------------------------------------------------------
 
 def _zone_xml(num, typ, name):

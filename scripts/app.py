@@ -28,12 +28,16 @@ from generate_dmp_ws import (
     DEFAULT_TEMPLATE,
 )
 from parse_dmp_worksheet import parse_dmp_worksheet, worksheet_looks_like_dmp
+from parse_bom import parse_bom, NotBOMError
+from bom_review_dialog import ask_bom_review
 from inject_door_chart import inject, _slugify
 from session import (
     SESSION_EXT,
     Session,
     SessionLoadError,
     clear_recovery,
+    create_blank_session,
+    default_session_path,
     ensure_editable_zones,
     list_recent_sessions,
     load_recovery,
@@ -41,11 +45,15 @@ from session import (
     normalize_rsp_tokens,
     normalize_zone_descriptions,
     pending_recovery,
+    save_session,
+    sessions_dir,
     sync_master_zones,
     unique_session_path,
 )
-from editor_frame import EditorFrame
+from editor_frame import EditorFrame, _site_defaults
+from new_project_dialog import ask_new_project
 from topology_service import ensure_explicit_topology, project_legacy_topology
+from validation import remotelink_readiness_issues, worksheet_readiness_issues
 from riser_render import generate_riser_bundle
 from riser_scene import layout_riser, sync_riser_document, validate_riser
 from editor_tabs import auto_hide_scrollbar
@@ -81,19 +89,31 @@ _WORKFLOW_HELP = """The editor is the working document. The Excel files are arti
 generated from it — they are never re-imported, so always re-open the .dmps project to \
 make changes.
 
-1. IMPORT
-   Drop a design PDF, an existing DMP worksheet (.xlsx), or a saved project (.dmps) onto \
-the home screen. The app parses it and detects the school name.
+1. CREATE NEW PROJECT OR IMPORT/OPEN
+   Create New Project on home or File (Cmd/Ctrl+N) needs only a site / school name. \
+Local code, two-line address, MSP location, sheet number, prepared by, and issue date \
+are optional. Create saves a collision-safe .dmps in Sessions and opens RISER with \
+the existing MSP/title block and no invented equipment or wiring. Cancel saves nothing.
+   Or drop/browse a PDF, DMP worksheet or BOM (.xlsx), or saved project (.dmps), or use File \
+→ Open (Cmd/Ctrl+O). PDF/XLSX imports and reopened projects start on ZONES, using the \
+same editor. Recent projects reopen without requesting the original source file.
 
 2. EDIT  (seven tabs)
    • SITE — school, address, contact, tech, install date, IP / gateway, XR-550 location, \
-and RemoteLink panel connection settings.
+and RemoteLink panel connection settings. Setup seeds the riser title; later SITE \
+edits and drawing-title edits stay independent, including after save/reopen. RISER \
+→ Copy from SITE explicitly copies school, local code, address, and school name as \
+the project title (confirming a different nonempty title). Other drawing fields stay \
+unchanged; drawing edits never overwrite SITE.
    • ZONES — searchable grid of every zone. Filter chips: All / Needs attention (blank or \
 "NEW" description) / Spares / Errors. Double-click a cell to edit, including its \
 RemoteLink zone type.
    • SPLITTERS — splitter wiring and CAD conflicts. Tick "Wiring reviewed" once you've \
-checked it against the riser diagram (required before FINAL).
-   • KEYPADS — location, source, RemoteLink device type, name, and displayed areas.
+checked the wiring (required before FINAL). For a manual design, review your authored \
+connections; its topology is not a failed PDF extraction.
+   • KEYPADS — location, source, RemoteLink device type, name, and displayed areas. \
+Keypad 1 sourced directly from MSP is the normal service-keypad convention, not a \
+separate equipment type.
    • RSP/POWER — RSP / power-supply locations; add or remove expanders here.
    • REMOTELINK — account, users, arming model, optional advanced settings, and a live \
 read-back receipt of the account that will be generated.
@@ -110,22 +130,38 @@ must be hyphenated (RSP-3, not RSP 3).
    Saving is explicit — click Save (or Ctrl/Cmd+S). The orange dot and "Unsaved changes" \
 mean you have edits that aren't on disk yet. A background recovery file guards against \
 crashes between saves.
+   File → Save As… switches to a new .dmps file and keeps the old file; only projects \
+saved in the configured Sessions folder appear in Open Recent. Recovery follows the \
+new path; cancel or save failure keeps the old path. Changing the output folder changes \
+the active Sessions/recent folder. A SITE name edit changes future output filenames \
+and revision series, not the current project filename; use Save As to rename it.
 
 4. GENERATE  (repeat as needed)
    The footer generates the worksheet, door chart, riser, or encrypted RemoteLink account. \
-The chart is built from the newest worksheet. Each worksheet/chart/riser run writes the next revision \
+Risers need no source file or worksheet, even for an MSP-only design. Worksheets use \
+the shared design and warn about missing site fields, RSPs/zones, and wiring review. \
+The chart is built from a worksheet: manual projects must generate their own worksheet \
+in this runtime first, including after reopen; unrelated same-name files are not used. \
+Imported XLSX files can be charted immediately; existing imported-project fallback stays unchanged.
+   Each worksheet/chart/riser run writes the next revision \
 — school_dmp_rev1.xlsx, rev2, … — keeping earlier revisions, so the normal loop is: \
 generate, print, review with the superintendent, edit, regenerate. If checks are failing \
-you'll see a summary first, but generation is never blocked. You stay in the editor the \
+you'll see a summary first; worksheet/riser warnings do not block generation. You stay in the editor the \
 whole time; a notification offers to open the finished file.
 
    RemoteLink generation uses the settings reviewed across SITE, ZONES, KEYPADS, and \
-REMOTELINK. Its final dialog is read-only and asks only for the encryption passphrase. \
+REMOTELINK. Readiness guidance precedes the passphrase dialog: a numeric account/local \
+code and installed RSP zones are required. Missing prerequisites block only RemoteLink \
+export, never project creation/editing. Master-template rows without installed RSP \
+ownership are excluded. Its final dialog is read-only and asks only for the encryption passphrase. \
 Review the receipt before importing; after import, a qualified technician must verify the \
 account before sending programming to a panel. Help → Inspect RemoteLink Account opens \
 an existing encrypted export without changing it.
 
-Hardware changes (post-CAD): you can add or remove expanders, splitters, and keypads. \
+Hardware changes (manual or imported): add or remove expanders, splitters, and keypads. \
+LX splitters support LX500–LX900 with independent per-bus numbering and matching-bus \
+connections. RSP module numbers and zone addresses are independent; existing devices \
+are not renumbered after removal. \
 Removing hardware re-points anything that fed it to "Spare" and unsources affected \
 keypads — the app pops a summary and routes you to review the new wiring. Template \
 capacities: 15 expanders, 12 LX + 12 KP splitters, 28 keypads."""
@@ -237,6 +273,7 @@ class App:
         # Which artifact is generating right now: "worksheet" | "chart" | None.
         # Generation runs in the background while the editor stays up.
         self._generating: str | None = None
+        self._creating_project = False
         # editor.edit_epoch at the moment the last worksheet was generated —
         # lets the door-chart action warn when the worksheet has gone stale.
         self._ws_epoch: int | None = None
@@ -275,7 +312,7 @@ class App:
 
         # Menu-bar shortcuts (mirror File + Worksheet). Handlers self-guard.
         mod = "Command" if sys.platform == "darwin" else "Control"
-        self.root.bind_all(f"<{mod}-n>", lambda _e=None: self._process_another())
+        self.root.bind_all(f"<{mod}-n>", lambda _e=None: self._create_new_project())
         self.root.bind_all(f"<{mod}-o>", lambda _e=None: self._choose_pdf())
         self.root.bind_all(f"<{mod}-w>", lambda _e=None: self._process_another())
         self.root.bind_all(f"<{mod}-e>", lambda _e=None: self._generate_worksheet())
@@ -395,8 +432,8 @@ class App:
         self._file_menu = file_menu
         self._recent_menu = tk.Menu(file_menu, tearoff=0)
 
-        file_menu.add_command(label="New Project", accelerator=accel("N"),
-                              command=self._process_another)
+        file_menu.add_command(label="Create New Project", accelerator=accel("N"),
+                              command=self._create_new_project)
         file_menu.add_command(label="Open…", accelerator=accel("O"),
                               command=self._choose_pdf)
         file_menu.add_cascade(label="Open Recent", menu=self._recent_menu)
@@ -405,6 +442,7 @@ class App:
                               command=self._process_another)
         file_menu.add_command(label="Save", accelerator=accel("S"),
                               command=self._save_shortcut)
+        file_menu.add_command(label="Save As…", command=self._save_as)
         file_menu.add_command(label="Revert to Saved…",
                               command=self._revert_clicked)
         file_menu.add_separator()
@@ -485,6 +523,7 @@ class App:
         editing = self.state == "editing" and self.editor is not None
         state = "normal" if editing else "disabled"
         self._file_menu.entryconfigure("Save", state=state)
+        self._file_menu.entryconfigure("Save As…", state=state)
         self._file_menu.entryconfigure("Close Project", state=state)
         can_revert = editing and self.session is not None and self.session.path
         self._file_menu.entryconfigure(
@@ -731,23 +770,37 @@ class App:
             corner_radius=12,
             fg_color=theme.SURFACE,
         )
-        dz.grid(row=1, column=0, sticky="ew")
+        dz.grid(row=0, column=0, sticky="ew")
         dz.columnconfigure(0, weight=1)
         # Let the zone shrink-wrap its contents and impose the target size as a
         # row floor instead. Pinning the frame's own height clipped the
         # file-type chips off the bottom edge the moment the stack grew.
-        self.input_section.rowconfigure(1, minsize=168)
+        self.input_section.rowconfigure(0, minsize=168)
         self._drop_zone = dz
 
-        IconTile(dz, "⬆", size=44).grid(row=0, column=0, pady=(22, 10))
+        create_button = primary_button(dz, "Create New Project", self._create_new_project,
+                                       width=200)
+        create_button.grid(row=0, column=0, padx=24, pady=(28, 0))
+
+        divider = ctk.CTkFrame(dz, fg_color="transparent")
+        divider.grid(row=1, column=0, sticky="ew", padx=34, pady=(24, 0))
+        divider.columnconfigure(0, weight=1)
+        divider.columnconfigure(2, weight=1)
+        for column in (0, 2):
+            ctk.CTkFrame(divider, height=1, corner_radius=0,
+                         fg_color=theme.BORDER_STRONG).grid(row=0, column=column, sticky="ew")
+        ctk.CTkLabel(divider, text="or", font=theme.ui_font(theme.SIZE["chip"]),
+                     text_color=theme.TEXT_SECOND).grid(row=0, column=1, padx=15)
+
+        IconTile(dz, "⬆", size=44).grid(row=2, column=0, pady=(18, 10))
         ctk.CTkLabel(
             dz, text="Drop a design file to start",
             font=theme.ui_font(theme.SIZE["drop_title"], "bold"),
             text_color=theme.TEXT,
-        ).grid(row=1, column=0)
+        ).grid(row=3, column=0)
 
         sub = ctk.CTkFrame(dz, fg_color="transparent")
-        sub.grid(row=2, column=0, pady=(3, 0))
+        sub.grid(row=4, column=0, pady=(3, 0))
         ctk.CTkLabel(sub, text="or ", font=theme.ui_font(theme.SIZE["chip"]),
                      text_color=theme.TEXT_SECOND).pack(side="left")
         ctk.CTkLabel(sub, text="browse…",
@@ -755,11 +808,15 @@ class App:
                      text_color=theme.ACCENT).pack(side="left")
 
         types = ctk.CTkFrame(dz, fg_color="transparent")
-        types.grid(row=3, column=0, pady=(12, 20))
-        for kind in ("PDF", "XLSX", "DMPS"):
+        types.grid(row=5, column=0, pady=(12, 26))
+        for kind in ("PDF", "XLSX", "BOM", "DMPS"):
             Chip(types, kind, size=theme.SIZE["label"]).pack(side="left", padx=3)
 
         def walk(widget):
+            # Keep the creation button's native command/canvas bindings intact.
+            # Only the import surface should open the file picker on click.
+            if widget is create_button:
+                return
             yield widget
             for child in widget.winfo_children():
                 yield from walk(child)
@@ -1203,11 +1260,11 @@ class App:
 
     def _choose_pdf(self):
         path = filedialog.askopenfilename(
-            title="Choose design PDF, DMP worksheet, or saved project",
+            title="Choose design PDF, DMP worksheet, BOM, or saved project",
             filetypes=[
-                ("PDF, worksheet, or project", "*.pdf *.xlsx *.dmps"),
+                ("PDF, Excel, or project", "*.pdf *.xlsx *.dmps"),
                 ("PDF files", "*.pdf"),
-                ("DMP worksheet", "*.xlsx"),
+                ("DMP worksheet or BOM", "*.xlsx"),
                 ("Saved project", "*.dmps"),
                 ("All files", "*.*"),
             ],
@@ -1285,30 +1342,47 @@ class App:
         self._run_async(work, on_done, on_error)
 
     def _start_load_worksheet(self, xlsx_path: Path):
-        """Load an already-generated DMP worksheet (.xlsx) into the editor,
-        skipping PDF parsing.
+        """Load a DMP worksheet or a supported equipment BOM into the editor.
 
-        self.dmp_path points at the imported file, so 'Generate Door Chart' is
-        available immediately and builds from it as-is; generating a worksheet
-        revision re-points dmp_path at the new file.
+        Only a DMP worksheet becomes an immediate Door Chart source. A BOM
+        starts a draft and requires worksheet generation first.
         """
         self.dmp_path = xlsx_path
         self.pdf_path = None
         self.parsed_design = None
         self.state = "loading_xlsx"
         self._stop_spinners()
-        self._show_file_card(xlsx_path.name, parsing=True, busy_text=" Reading worksheet…")
+        self._show_file_card(xlsx_path.name, parsing=True, busy_text=" Reading Excel file…")
 
         def work():
             with contextlib.redirect_stdout(self._redirector), \
                  contextlib.redirect_stderr(self._redirector):
-                return parse_dmp_worksheet(xlsx_path)
+                design = parse_dmp_worksheet(xlsx_path)
+                if worksheet_looks_like_dmp(design):
+                    return design, None, True
+                try:
+                    return design, parse_bom(xlsx_path), False
+                except NotBOMError:
+                    return design, None, False
 
-        def on_done(design):
+        def on_done(result):
             if self.state != "loading_xlsx":
                 return
             self._stop_spinners()
-            if not worksheet_looks_like_dmp(design):
+            design, bom, is_dmp = result
+            if bom is not None:
+                self.dmp_path = None  # A BOM is never a generated worksheet.
+                if not ask_bom_review(self.root, bom.review_text):
+                    self.state = "idle"
+                    return
+                design = bom.design
+                self._show_file_card(xlsx_path.name, parsing=False,
+                                     school_name=design.site_info.school_name or "Unknown")
+                self._enter_editor(Session(design=design, source_kind="bom",
+                                           source_name=xlsx_path.name,
+                                           path=unique_session_path(design)))
+                return
+            if not is_dmp:
                 self.state = "idle"
                 self.dmp_path = None
                 self._show_parse_error(
@@ -1356,7 +1430,7 @@ class App:
     # Project editor                                                         #
     # ------------------------------------------------------------------ #
 
-    def _enter_editor(self, session: Session):
+    def _enter_editor(self, session: Session, *, initial_tab: str = "ZONES"):
         """Open the unified editor over a session (new or loaded)."""
         # Make zones editable even when only Master rows were parsed (xlsx with
         # unevaluated Point Info formulas), and canonicalize legacy 'RSP N'
@@ -1380,6 +1454,7 @@ class App:
             on_toggle_fullscreen=self._toggle_fullscreen,
             on_status_change=self._on_editor_status,
             on_validation_change=self._on_editor_validation,
+            initial_tab=initial_tab,
         )
         self.editor.grid(row=0, column=0, sticky="nsew")
         self._sync_fullscreen_controls()
@@ -1445,6 +1520,20 @@ class App:
         if self.state == "editing" and self.editor:
             self.editor.save()
 
+    def _save_as(self) -> bool:
+        """Choose a new project file and use the editor's normal save lifecycle."""
+        if self.state != "editing" or self.editor is None or self.session is None:
+            return False
+        target = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Save As — only projects in Sessions appear in Open Recent",
+            initialdir=str(sessions_dir()),
+            initialfile=default_session_path(self.session.design).name,
+            defaultextension=SESSION_EXT,
+            filetypes=[("Saved project", "*.dmps"), ("All files", "*.*")],
+        )
+        return self.editor.save(Path(target)) if target else False
+
     def _on_ui_exception(self, exc_type, exc, tb):
         import traceback as _tb
         detail = "".join(_tb.format_exception(exc_type, exc, tb))
@@ -1475,10 +1564,15 @@ class App:
     def _latest_worksheet_path(self) -> Path | None:
         """The worksheet a door chart would be built from: the last one this
         session touched (a generated rev, or the imported source xlsx), else
-        the highest rev on disk from a previous session."""
+        the highest rev on disk from an imported project's previous session.
+        Manual projects generate their own worksheet in each runtime first."""
         if self.dmp_path is not None and Path(self.dmp_path).exists():
             return Path(self.dmp_path)
         if self.session is not None:
+            # A new/reopened manual project must generate its own worksheet;
+            # a matching school slug on disk can belong to a different project.
+            if self.session.source_kind in {"manual", "bom"}:
+                return None
             return latest_rev_path(self.output_dir, f"{self._school_slug()}_dmp")
         return None
 
@@ -1503,7 +1597,8 @@ class App:
             self.editor.save()
 
         def proceed():
-            design = self.session.design
+            worksheet_epoch = self.editor.edit_epoch
+            design = copy.deepcopy(self.session.design)
             project_legacy_topology(design)
             sync_master_zones(design)
             # Persist the per-machine site defaults (tech, IP, ...). Phone and
@@ -1538,7 +1633,7 @@ class App:
                 self._set_generating(None)
                 self.dmp_path = out_path
                 if self.editor is not None:
-                    self._ws_epoch = self.editor.edit_epoch
+                    self._ws_epoch = worksheet_epoch
                 rev = out_path.stem.rsplit("_rev", 1)[-1]
                 self._show_toast(
                     f"Worksheet rev {rev} ready",
@@ -1552,7 +1647,9 @@ class App:
 
             self._run_async(work, on_done, on_error)
 
-        self.editor.show_issues_dialog(proceed, proceed_label="Generate anyway")
+        readiness = worksheet_readiness_issues(self.session.design, self.session)
+        note = "\n".join(issue.message for issue in readiness) if readiness else None
+        self.editor.show_issues_dialog(proceed, proceed_label="Generate anyway", note=note)
 
     def _choose_riser_outputs(self):
         """Choose files while retaining the application's saved output folder."""
@@ -1622,10 +1719,10 @@ class App:
                 "Save project?", "Save the project before generating the riser?"):
             self.editor.save()
 
-        design = self.session.design
+        design = copy.deepcopy(self.session.design)
         if design.riser_document is None or not design.riser_document.elements:
             from riser_presentation import layout_presentation
-            design.riser_document = layout_presentation(design)
+            design.riser_document = layout_presentation(design, title_source=design.riser_document)
         sync_riser_document(design, design.riser_document)
         issues = validate_riser(design, design.riser_document)
         if issues:
@@ -1640,14 +1737,13 @@ class App:
                 return
 
         out_dir = self.output_dir
-        render_design = copy.deepcopy(design)
-        document = render_design.riser_document
+        document = design.riser_document
         self._set_generating("riser")
 
         def work():
             with contextlib.redirect_stdout(self._redirector), \
                  contextlib.redirect_stderr(self._redirector):
-                return generate_riser_bundle(render_design, document, out_dir, formats=formats)
+                return generate_riser_bundle(design, document, out_dir, formats=formats)
 
         def on_done(paths):
             self._set_generating(None)
@@ -1737,6 +1833,14 @@ class App:
             return
         if not getattr(self.editor, 'generation_allowed', lambda: True)():
             return
+        readiness = remotelink_readiness_issues(self.session.design, self.session.remotelink)
+        hard_issues = [issue for issue in readiness if issue.severity == "error"]
+        if hard_issues:
+            messagebox.showinfo("RemoteLink not ready", "\n".join(i.message for i in hard_issues))
+            return
+        if readiness:
+            messagebox.showinfo("RemoteLink configuration warnings",
+                                "\n".join(i.message for i in readiness))
         if self.editor.dirty and messagebox.askyesno(
             "Save project?", "Save the project before generating?",
         ):
@@ -1745,9 +1849,10 @@ class App:
 
     def _show_remotelink_dialog(self):
         """Review the saved configuration and prompt only for encryption."""
-        design = self.session.design
+        design = copy.deepcopy(self.session.design)
+        config = copy.deepcopy(self.session.remotelink)
         sync_master_zones(design)
-        resolved = resolve_config(self.session.remotelink, design)
+        resolved = resolve_config(config, design)
 
         dlg = ctk.CTkToplevel(self.root)
         dlg.title("Generate RemoteLink Account")
@@ -1803,7 +1908,7 @@ class App:
 
         try:
             receipt_text = preview_account_summary(
-                design, self.session.remotelink,
+                design, config,
                 resource_path("remotelink_account_template.xml"),
             )
         except Exception as exc:
@@ -1836,7 +1941,8 @@ class App:
         primary_button(btns, "Generate", submit, width=120).pack(side="right")
 
     def _run_generate_remotelink(self, passphrase):
-        design = self.session.design
+        design = copy.deepcopy(self.session.design)
+        config = copy.deepcopy(self.session.remotelink)
         sync_master_zones(design)
         out_dir = self.output_dir
         template_path = resource_path("remotelink_account_template.xml")
@@ -1847,14 +1953,14 @@ class App:
             with contextlib.redirect_stdout(self._redirector), \
                  contextlib.redirect_stderr(self._redirector):
                 return generate_configured_account_xml(
-                    design, self.session.remotelink,
+                    design, config,
                     template_path=template_path, passphrase=passphrase,
                     out_dir=out_dir)
 
         def on_done(path):
             self._set_generating(None)
             account_num = resolve_config(
-                self.session.remotelink, design).account_num
+                config, design).account_num
             self._show_toast(
                 f"RemoteLink account {account_num} ready",
                 action=("Open", lambda: open_file(path)),
@@ -1870,6 +1976,69 @@ class App:
     # ------------------------------------------------------------------ #
     # Reset                                                                 #
     # ------------------------------------------------------------------ #
+
+    def _create_new_project(self):
+        """Keep the current project alive until a blank project is safely saved."""
+        if self._creating_project:
+            return
+        if self._generating is not None or self.state in {"parsing", "loading_xlsx"}:
+            messagebox.showinfo("Work in progress",
+                                "Wait for the current import or generation to finish "
+                                "before creating a project.")
+            return
+        self._creating_project = True
+        close_guard_passed = False
+        replacement_saved = False
+        guarded_editor = guarded_editor_session = None
+        try:
+            prefs = load_prefs()
+            result = ask_new_project(self.root, prepared_by=prefs.get("install_tech", ""))
+            if result is None:
+                return
+            # Modal waits still service Tk callbacks and menu shortcuts.
+            if self._generating is not None or self.state in {"parsing", "loading_xlsx"}:
+                messagebox.showinfo("Work in progress",
+                                    "Wait for the current import or generation to finish "
+                                    "before creating a project.")
+                return
+            guarded_editor, guarded_session = self.editor, self.session
+            guarded_editor_session = guarded_editor.session if guarded_editor else None
+            if guarded_editor and not guarded_editor.maybe_close():
+                return
+            close_guard_passed = True
+            # The dirty-close dialog also services callbacks. Do not replace a
+            # different project, or race work that started during that wait.
+            if (self.editor is not guarded_editor or self.session is not guarded_session
+                    or (guarded_editor and guarded_editor.session is not guarded_editor_session)):
+                return
+            if self._generating is not None or self.state in {"parsing", "loading_xlsx"}:
+                messagebox.showinfo("Work in progress",
+                                    "Wait for the current import or generation to finish "
+                                    "before creating a project.")
+                return
+            site, title_updates = result
+            for field, value in _site_defaults(prefs).items():
+                if value and not (getattr(site, field, None) or "").strip():
+                    setattr(site, field, value)
+            session = create_blank_session(site, title_block_updates=title_updates)
+            session.path = unique_session_path(session.design)
+            save_session(session)
+            replacement_saved = True
+        except Exception as exc:
+            messagebox.showerror("Create New Project", f"Couldn't create the project: {exc}")
+            return
+        finally:
+            self._creating_project = False
+            if (close_guard_passed and not replacement_saved and guarded_editor
+                    and self.editor is guarded_editor
+                    and guarded_editor.session is guarded_editor_session and guarded_editor.dirty):
+                # Discard clears recovery. Restore only the retained dirty close
+                # target, without adding an edit or touching a replacement.
+                guarded_editor._schedule_recovery(write_now=True)
+        self.pdf_path = None
+        self.dmp_path = None
+        self.door_chart_path = None
+        self._enter_editor(session, initial_tab="RISER")
 
     def _process_another(self):
         if self._generating is not None:
@@ -2168,8 +2337,8 @@ class App:
     def _show_shortcuts_help(self):
         mod = "Cmd" if sys.platform == "darwin" else "Ctrl"
         rows = [
-            (f"{mod}+N", "New / close project"),
-            (f"{mod}+O", "Open a PDF or worksheet"),
+            (f"{mod}+N", "Create New Project"),
+            (f"{mod}+O", "Open a PDF, worksheet, or saved project"),
             (f"{mod}+S", "Save the project (.dmps)"),
             (f"{mod}+E", "Generate the DMP worksheet (next revision)"),
             (f"{mod}+D", "Generate the door chart (next revision)"),

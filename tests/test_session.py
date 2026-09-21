@@ -337,6 +337,57 @@ def test_default_session_path_slug(tmp_sessions_dir):
     assert path.name == "MAPLEWOOD_ELEMENTARY_SCHOOL.dmps"
 
 
+@pytest.mark.parametrize("name", ["CON", "prn", "AuX", "NUL"] +
+                         [f"COM{n}" for n in range(1, 10)] +
+                         [f"LPT{n}" for n in range(1, 10)])
+def test_default_session_path_protects_windows_reserved_stems(tmp_sessions_dir, name):
+    design = DMPDesign(site_info=SiteInfo(school_name=name))
+    assert default_session_path(design).name == f"_{name}.dmps"
+
+
+def test_unique_session_path_reserves_recovery_only_slots(tmp_sessions_dir):
+    design = DMPDesign(site_info=SiteInfo(school_name="NEW SCHOOL"))
+    base = tmp_sessions_dir / "NEW_SCHOOL.dmps"
+    first_recovery = session_mod.recovery_path(base)
+    first_recovery.write_text("older unsaved project", encoding="utf-8")
+    second_recovery = tmp_sessions_dir / "NEW_SCHOOL (2).dmps.recovery"
+    second_recovery.write_text("another unsaved project", encoding="utf-8")
+
+    assert unique_session_path(design) == tmp_sessions_dir / "NEW_SCHOOL (3).dmps"
+    assert first_recovery.read_text() == "older unsaved project"
+    assert second_recovery.read_text() == "another unsaved project"
+
+
+@pytest.mark.parametrize("failure", ["mkdir", "write"])
+def test_failed_save_as_retains_committed_path_timestamp_and_file(tmp_sessions_dir, failure):
+    session = Session(design=_populated_design())
+    old = save_session(session)
+    old_text = old.read_text()
+    session.saved_at = "2020-01-02T03:04:05"
+    old_timestamp = session.saved_at
+    recovery = write_recovery(session)
+    recovery_text = recovery.read_text()
+    session.design.site_info.school_code = "EDITED"
+    if failure == "mkdir":
+        blocked = tmp_sessions_dir / "not-a-folder"
+        blocked.write_text("keep", encoding="utf-8")
+        target = blocked / "new.dmps"
+    else:
+        target = tmp_sessions_dir / "new.dmps"
+        target.write_text("existing target", encoding="utf-8")
+        (tmp_sessions_dir / "new.dmps.tmp").mkdir()
+
+    with pytest.raises(OSError):
+        save_session(session, target)
+
+    assert session.path == old
+    assert session.saved_at == old_timestamp
+    assert old.read_text() == old_text
+    assert recovery.read_text() == recovery_text
+    if failure == "write":
+        assert target.read_text() == "existing target"
+
+
 # -------- crash recovery lifecycle --------
 
 def test_recovery_written_then_cleared_on_save(tmp_sessions_dir):
