@@ -965,6 +965,8 @@ class RiserTab(ctk.CTkFrame):
         self._connect_source: DevicePortRef | None = None
         self._preview_item = None
         self._initial_fit_done = False
+        self._framed_size: tuple[int, int] | None = None
+        self._user_view_adjusted = False
         self._fit_mode = False
         self._resize_after_id = None
         self._tool_buttons: dict[str, ctk.CTkButton] = {}
@@ -1103,6 +1105,9 @@ class RiserTab(ctk.CTkFrame):
 
     def toggle_panel(self):
         """Give the canvas the inspector's space without rebuilding its fields."""
+        # The panel changes the canvas size by design; that is not a layout
+        # settle and must not trigger the initial framing re-computation.
+        self._user_view_adjusted = True
         self._panel_visible = not self._panel_visible
         if self._panel_visible:
             self.inspector.grid()
@@ -2329,12 +2334,14 @@ class RiserTab(ctk.CTkFrame):
         self._changed()
 
     def _pan_start(self, event):
+        self._user_view_adjusted = True
         self.canvas.scan_mark(event.x, event.y)
 
     def _pan_move(self, event):
         self.canvas.scan_dragto(event.x, event.y, gain=1)
 
     def _on_wheel(self, event):
+        self._user_view_adjusted = True
         if event.state & 0x4 or event.state & 0x8:
             self.set_zoom(self.zoom * (1.1 if event.delta > 0 else 1 / 1.1))
         else:
@@ -2541,6 +2548,7 @@ class RiserTab(ctk.CTkFrame):
 
     def set_zoom(self, value):
         self._fit_mode = False
+        self._user_view_adjusted = True
         self._set_zoom(value)
 
     def _set_zoom(self, value, *, inspector=True):
@@ -2606,11 +2614,27 @@ class RiserTab(ctk.CTkFrame):
             self.after_cancel(self._resize_after_id)
         if not self._initial_fit_done:
             self._initial_fit_done = True
+            self._framed_size = (event.width, event.height)
+            callback = self._frame_initial_view
+        elif (not self._fit_mode and not self._user_view_adjusted
+              and self._framed_size is not None
+              and self._resized_beyond_framing(event.width, event.height)):
+            # The first layout event can arrive while the canvas is still
+            # settling toward its real size (embedded panes and mapped
+            # windows both do this), which locks in a wrong zoom. Until the
+            # user adjusts the view, a large size change means the framing
+            # should be recomputed at the settled dimensions.
+            self._framed_size = (event.width, event.height)
             callback = self._frame_initial_view
         else:
             callback = (lambda: self.fit_to_view(inspector=False)) if self._fit_mode else (
                 lambda: self.redraw(inspector=False))
         self._resize_after_id = self.after_idle(self._finish_canvas_resize, callback)
+
+    def _resized_beyond_framing(self, width: int, height: int) -> bool:
+        framed_width, framed_height = self._framed_size
+        return (abs(width - framed_width) > framed_width * 0.2
+                or abs(height - framed_height) > framed_height * 0.2)
 
     def _finish_canvas_resize(self, callback):
         self._resize_after_id = None

@@ -1534,11 +1534,15 @@ class PowerTab(ctk.CTkFrame):
 
     def __init__(self, master, session: Session, on_change,
                  on_structure_change=None, on_hardware_change=None, *,
+                 on_renumber=None,
                  on_navigate: Callable[[str], None] | None = None):
         super().__init__(master, fg_color="transparent")
         self.session = session
         self.on_change = on_change
         self.on_structure_change = on_structure_change or on_change
+        # Renaming a pair keeps its zone addresses and wiring, so it must not
+        # trigger the structure path that repacks LX bus ranges.
+        self.on_renumber = on_renumber or self.on_structure_change
         # Removals route through here so the editor can report cascade fallout;
         # falls back to a plain mutate + structure-refresh when unset.
         self.on_hardware_change = on_hardware_change or (
@@ -1608,7 +1612,7 @@ class PowerTab(ctk.CTkFrame):
             return False
         if changed:
             self._number_vars.clear()
-            self.on_structure_change()
+            self.on_renumber()
         return True
 
     def sync_locations(self):
@@ -1683,7 +1687,7 @@ class PowerTab(ctk.CTkFrame):
                     messagebox.showwarning("Can't renumber RSP/PS", str(exc),
                                            parent=num_entry.winfo_toplevel())
                     return False
-                self.on_structure_change()
+                self.on_renumber()
                 return True
             finally:
                 committing = False

@@ -494,10 +494,14 @@ class EditorFrame(ctk.CTkFrame):
             programming_options = (
                 {"on_programming_change": self._on_keypad_programming_edit}
                 if cls is KeypadsTab else {})
+            extra_options = (
+                {"on_renumber": self._on_expander_renumber}
+                if cls is PowerTab else {})
             widget = cls(self.tabs.tab(title), self.session, self._on_design_edit,
                          on_structure_change=self._on_structure_change,
                          on_hardware_change=self.apply_hardware_change,
-                         on_navigate=self.tabs.set, **programming_options)
+                         on_navigate=self.tabs.set, **programming_options,
+                         **extra_options)
             widget.grid(row=0, column=0, sticky="nsew")
             setattr(self, attr, widget)
 
@@ -822,6 +826,15 @@ class EditorFrame(ctk.CTkFrame):
             self.session.topology_confirmed = False
         self._topology_signature = signature
         return changed
+
+    def _on_expander_renumber(self):
+        """A pair rename keeps zone addresses, wiring, and riser geometry,
+        so only the identity-dependent views need to refresh."""
+        self.session.topology_confirmed = False
+        sync_master_zones(self.session.design)
+        self.mark_dirty()
+        self.refresh_validation()
+        self.refresh_all_tabs()
 
     def _on_structure_change(self):
         """Hardware was added or removed: every tab's choices and rows shift."""
