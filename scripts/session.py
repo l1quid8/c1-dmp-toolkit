@@ -76,6 +76,19 @@ class Session:
     path: Optional[Path] = None      # where this session lives on disk
 
 
+def renumber_session_keypad(session: Session, number: int, new_number: int) -> Keypad:
+    """Move a keypad address and its saved RemoteLink settings together."""
+    from hardware import renumber_keypad
+
+    keypad = renumber_keypad(session.design, number, new_number)
+    if number != new_number:
+        configured = session.remotelink.keypads.pop(number, None)
+        session.remotelink.keypads.pop(new_number, None)
+        if configured is not None:
+            session.remotelink.keypads[new_number] = configured
+    return keypad
+
+
 @dataclass
 class SessionSummary:
     """Cheap listing entry for the recent-projects screen."""
@@ -177,6 +190,7 @@ def _splitter_from_dict(d: dict) -> Splitter:
         location=d.get("location"),
         inputs=dict(d.get("inputs") or {}),
         outputs=list(d.get("outputs") or []),
+        output_locations=list(d.get("output_locations") or []),
     )
 
 

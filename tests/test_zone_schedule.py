@@ -66,6 +66,16 @@ def test_leading_z_misread_still_parses():
     assert zones[501].rsp == 1
 
 
+def test_east_direction_marker_misread_as_euro_in_zone_room():
+    text = "\n".join([
+        "Z503/RSP1", "MAIN BLDG", "1ST FLR", "HALLWAY €", "NEW", "(N)WP240",
+        "Z504/RSP1", "MAIN BLDG", "1ST FLR", "SCIENCE LAB", "NEW", "(N)WP240",
+    ])
+    zones = _by_num(extract_zones(text))
+    assert zones[503].room == "HALLWAY (E)"
+    assert zones[504].room == "SCIENCE LAB"
+
+
 def test_no_false_zone_from_noise_lines():
     """Cable types and combus labels must not be mistaken for zone-ids."""
     text = "\n".join([

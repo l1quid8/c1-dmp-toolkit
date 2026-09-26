@@ -33,6 +33,7 @@ import customtkinter as ctk
 import theme
 from hardware import (
     HardwareError,
+    MAX_KEYPADS,
     add_expander,
     add_keypad,
     add_splitter,
@@ -44,7 +45,7 @@ from hardware import (
     renumber_expanders,
     renumber_splitter,
 )
-from session import Session
+from session import Session, renumber_session_keypad
 from rl_injector.rl_config import (
     KEYPAD_DEFAULT_DISPLAY_AREAS,
     KEYPAD_DEVICE_TYPES,
@@ -561,15 +562,10 @@ def prompt_add_keypad(root, session: Session, on_done) -> ctk.CTkToplevel:
         font=theme.ui_font(theme.SIZE["chip"]),
     ).pack(anchor="w", padx=20, pady=(8, 0))
 
-    glob_var = tk.BooleanVar(value=False)
-    _styled_checkbox(win, "Global keypad", glob_var, None,
-                     ).pack(anchor="w", padx=20, pady=(10, 0))
-
     def confirm():
         keypad = None
         try:
-            keypad = add_keypad(session.design, loc.get().strip() or None,
-                                None, glob_var.get())
+            keypad = add_keypad(session.design, loc.get().strip() or None)
             set_keypad_source(session.design, keypad.number, source_menu.get())
         except (HardwareError, TopologyError) as exc:
             if keypad is not None and keypad in session.design.keypads:
@@ -1298,18 +1294,21 @@ class KeypadsTab(ctk.CTkFrame):
     def __init__(self, master, session: Session, on_change,
                  on_structure_change=None, on_hardware_change=None, *,
                  on_navigate: Callable[[str], None] | None = None,
-                 on_programming_change: Callable[[], None] | None = None):
+                 on_programming_change: Callable[[], None] | None = None,
+                 on_renumber: Callable[[], None] | None = None):
         super().__init__(master, fg_color="transparent")
         self.session = session
         self.on_change = on_change
         self.on_programming_change = on_programming_change or on_change
         self.on_structure_change = on_structure_change or on_change
+        self.on_renumber = on_renumber or self.on_structure_change
         # Removals route through here so the editor can report cascade fallout;
         # falls back to a plain mutate + structure-refresh when unset.
         self.on_hardware_change = on_hardware_change or (
             lambda mutate: (mutate(), self.on_structure_change()))
         # Accepted for a uniform tab contract; this tab has nothing to link to.
         self.on_navigate = on_navigate
+        self._number_vars: dict[int, tk.StringVar] = {}
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
@@ -1320,6 +1319,9 @@ class KeypadsTab(ctk.CTkFrame):
         self.refresh()
 
     def refresh(self):
+        pending_numbers = {number: variable.get() for number, variable in self._number_vars.items()}
+        self._number_vars.clear()
+        self._pending_numbers = pending_numbers
         reconcile_keypads(self.session.remotelink, self.session.design)
         for w in self.body.winfo_children():
             w.destroy()
@@ -1354,13 +1356,84 @@ class KeypadsTab(ctk.CTkFrame):
         self.on_hardware_change(
             lambda: remove_keypad(self.session.design, kp.number))
 
+    def commit_numbers(self):
+        numbers = {}
+        try:
+            for number, variable in self._number_vars.items():
+                value = variable.get().strip()
+                if not value.isascii() or not value.isdigit():
+                    raise HardwareError(f"Enter whole keypad numbers between 1 and {MAX_KEYPADS}.")
+                numbers[number] = int(value)
+            final = [numbers.get(kp.number, kp.number) for kp in self.session.design.keypads]
+            if any(not 1 <= value <= MAX_KEYPADS for value in final):
+                raise HardwareError(f"Keypad number must be between 1 and {MAX_KEYPADS}.")
+            if len(set(final)) != len(final):
+                raise HardwareError("Each keypad needs a unique number. Pick a free number.")
+            changed = [(old, new) for old, new in numbers.items() if old != new]
+            if any(new in {kp.number for kp in self.session.design.keypads} for _, new in changed):
+                raise HardwareError("Pick a free keypad number, then make the next change.")
+            for old, new in changed:
+                renumber_session_keypad(self.session, old, new)
+        except HardwareError as exc:
+            messagebox.showwarning("Can't save keypad numbers", str(exc),
+                                   parent=self.winfo_toplevel())
+            return False
+        if changed:
+            self._number_vars.clear()
+            self.on_renumber()
+        return True
+
     def _build_keypad_card(self, kp, parent=None) -> ctk.CTkFrame:
         card = Card(self.body if parent is None else parent)
         card.columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(card, text=f"KEYPAD #{kp.number}", text_color=theme.TEXT,
-                     font=theme.mono_font(13, "bold"),
-                     ).grid(row=0, column=0, sticky="w", padx=12, pady=(11, 0))
+        id_row = ctk.CTkFrame(card, fg_color="transparent")
+        id_row.grid(row=0, column=0, sticky="w", padx=12, pady=(11, 0))
+        ctk.CTkLabel(id_row, text="KEYPAD #", text_color=theme.TEXT,
+                     font=theme.mono_font(13, "bold")).pack(side="left")
+        num_entry = _styled_entry(id_row, width=44, justify="center",
+                                  font=theme.mono_font(13, "bold"))
+        if parent is None:
+            number_var = tk.StringVar(value=self._pending_numbers.get(kp.number, str(kp.number)))
+            self._number_vars[kp.number] = number_var
+            num_entry.configure(textvariable=number_var)
+            number_var.trace_add("write", lambda *_: self.on_change())
+        else:
+            num_entry.insert(0, str(kp.number))
+        num_entry.pack(side="left")
+        attach_tooltip(num_entry, f"Keypad device number (1–{MAX_KEYPADS}). Wiring and programming follow it.")
+
+        committing = False
+
+        def commit_number(_event=None):
+            nonlocal committing
+            if committing or not num_entry.winfo_exists():
+                return
+            committing = True
+            try:
+                if parent is None:
+                    return self.commit_numbers()
+                value = num_entry.get().strip()
+                if value == str(kp.number):
+                    return True
+                try:
+                    if not value.isascii() or not value.isdigit():
+                        raise HardwareError(f"Enter a whole keypad number between 1 and {MAX_KEYPADS}.")
+                    renumber_session_keypad(self.session, kp.number, int(value))
+                except HardwareError as exc:
+                    num_entry.delete(0, "end")
+                    num_entry.insert(0, str(kp.number))
+                    messagebox.showwarning("Can't renumber keypad", str(exc),
+                                           parent=num_entry.winfo_toplevel())
+                    return False
+                self.on_renumber()
+                return True
+            finally:
+                committing = False
+
+        num_entry.bind("<Return>", commit_number)
+        num_entry.bind("<FocusOut>", commit_number)
+        card.commit_pending = commit_number
 
         location = ctk.CTkTextbox(
             card, height=60, wrap="word", border_width=1,
@@ -1407,17 +1480,6 @@ class KeypadsTab(ctk.CTkFrame):
         menu.configure(command=commit_source)
         menu.set(current or "— select source —")
         holder.pack(side="left", padx=(theme.PAD["sm"], 0))
-
-        glob_var = tk.BooleanVar(value=kp.global_keypad)
-
-        def glob_toggled(k=kp, var=glob_var):
-            k.global_keypad = var.get()
-            self.on_change()
-
-        _styled_checkbox(card, "Global keypad", glob_var, glob_toggled,
-                         text_color=theme.TEXT_SECOND).grid(
-            row=1, column=1, columnspan=2, sticky="e", padx=(0, 12),
-            pady=(0, 11))
 
         rl = effective_keypad(self.session.remotelink, kp)
         rl_row = ctk.CTkFrame(card, fg_color=theme.SURFACE_SUBTLE,

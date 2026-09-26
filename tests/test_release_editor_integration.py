@@ -100,6 +100,23 @@ def test_both_tabs_and_four_independent_generation_actions(editor):
     assert calls == ["chart", "remotelink", "riser", "worksheet"]
 
 
+def test_keypad_number_field_updates_saved_project_and_exports(editor, tmp_path):
+    frame, _calls = editor
+    number = frame.keypads_tab._number_vars[2]
+    number.set("7")
+
+    assert frame.save()
+    assert frame.session.design.keypads[-1].number == 7
+    assert frame.session.remotelink.keypads[7].name == "OFFICE"
+    assert 2 not in frame.session.remotelink.keypads
+    assert load_session(frame.session.path).design.keypads[-1].number == 7
+
+    output = tmp_path / "renumbered.xlsx"
+    write_dmp_xlsx(frame.session.design,
+                   ROOT / "DMP Installation Worksheet_template_blank.xlsx", output)
+    assert 7 in {keypad.number for keypad in parse_dmp_worksheet(output).keypads}
+
+
 @pytest.mark.parametrize("which", ["worksheet", "chart", "remotelink", "riser"])
 def test_generation_interlock_keeps_all_four_actions_distinct(editor, which):
     frame, calls = editor

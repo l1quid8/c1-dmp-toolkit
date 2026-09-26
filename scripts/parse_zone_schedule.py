@@ -95,6 +95,13 @@ def normalize_zone_number(digits: str) -> str:
     return f"Z{n}"
 
 
+def _normalize_room_ocr(room: str) -> str:
+    # Some CAD fonts render the east-direction marker (E) as a euro glyph in
+    # the PDF text layer. Correct only a standalone marker at the end of a
+    # zone room; currency elsewhere is not a direction.
+    return re.sub(r"\s+€$", " (E)", room.strip())
+
+
 def extract_school_info(text: str) -> dict:
     """Pulls school name, address, location code from the OCR'd text."""
     info: dict[str, str] = {}
@@ -420,7 +427,7 @@ def extract_zones(text: str) -> list[ZoneRecord]:
         if len(body) >= 2 and FLOOR_RE.search(body[1]):
             rec.floor = body[1]
         if len(body) >= 3:
-            rec.room = body[2].rstrip(",")
+            rec.room = _normalize_room_ocr(body[2].rstrip(","))
         if len(body) >= 4:
             sm = SENSOR_RE.match(body[3])
             if sm:

@@ -164,7 +164,7 @@ connections. RSP module numbers and zone addresses are independent; existing dev
 are not renumbered after removal. \
 Removing hardware re-points anything that fed it to "Spare" and unsources affected \
 keypads — the app pops a summary and routes you to review the new wiring. Template \
-capacities: 15 expanders, 12 LX + 12 KP splitters, 28 keypads."""
+capacities: 15 expanders, 20 LX + 12 KP splitters, 28 keypads."""
 
 ctk.set_default_color_theme("blue")
 
@@ -1906,12 +1906,14 @@ class App:
                      corner_radius=theme.RADIUS["button"]).grid(
             row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
 
+        receipt_error = None
         try:
             receipt_text = preview_account_summary(
                 design, config,
                 resource_path("remotelink_account_template.xml"),
             )
         except Exception as exc:
+            receipt_error = exc
             receipt_text = f"Receipt unavailable\n===================\n{exc}"
         receipt = ctk.CTkTextbox(
             dlg, wrap="word", fg_color=theme.SURFACE,
@@ -1938,7 +1940,10 @@ class App:
             dlg.destroy()
             self._run_generate_remotelink(passphrase)
 
-        primary_button(btns, "Generate", submit, width=120).pack(side="right")
+        generate_button = primary_button(btns, "Generate", submit, width=120)
+        if receipt_error is not None:
+            generate_button.configure(state="disabled")
+        generate_button.pack(side="right")
 
     def _run_generate_remotelink(self, passphrase):
         design = copy.deepcopy(self.session.design)

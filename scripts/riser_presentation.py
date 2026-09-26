@@ -383,7 +383,7 @@ def layout_presentation(design, *, title_source=None):
             doc.elements['device:' + ref] = RiserElement(
                 'device:' + ref, 'device', ref, x, y, width, height,
                 symbol_style='detailed')
-    regions = {'KP': (48., 840.), 'LX': (875., 2220.)}
+    regions = {'KP': (100., 840.), 'LX': (875., 2220.)}
     for side in (() if reference_slots else ('KP', 'LX')):
         tier_y = 38. + root_h + 44.
         for level in sorted(set(depth.values()) - {0}):
@@ -405,7 +405,11 @@ def layout_presentation(design, *, title_source=None):
             for row_index, refs in enumerate(rows):
                 row_height = max(sizes[ref][1] for ref in refs)
                 refs = rows[row_index]
-                total = sum(sizes[ref][0] for ref in refs) + 28. * (len(refs) - 1)
+                device_width = sum(sizes[ref][0] for ref in refs)
+                free_width = right - left - device_width
+                gap = (max(28., min(110., (free_width - 48.) / (len(refs) - 1)))
+                       if len(refs) > 1 else 0.)
+                total = device_width + gap * (len(refs) - 1)
                 cursor = left + max(0., (right - left - total) / 2)
                 placed = []
                 for ref in refs:
@@ -415,7 +419,7 @@ def layout_presentation(design, *, title_source=None):
                         width, height, symbol_style='detailed')
                     doc.elements[item.id] = item
                     placed.append(item)
-                    cursor += width + 28.
+                    cursor += width + gap
                 # Keypad room captions sit below their physical symbol. Give
                 # that visible text space before starting the next tier.
                 caption_bottom = max((box[3] for item in placed
@@ -423,6 +427,21 @@ def layout_presentation(design, *, title_source=None):
                                      default=tier_y + row_height)
                 base_gap = 18. if row_index + 1 < len(rows) else (50. if side == 'KP' else 24.)
                 tier_y = max(tier_y + row_height + base_gap, caption_bottom + 12.)
+
+    if not reference_slots:
+        # Smaller trees otherwise occupy only the top half of the sheet. Use
+        # the remaining vertical room for the wire bands between depth tiers.
+        devices = [item for item in doc.elements.values() if item.kind == 'device']
+        bottom = max((max([item.y + item.height] +
+                          [box[3] for box in caption_boxes(isolated, item)])
+                      for item in devices), default=0.)
+        anchor = doc.elements['device:MSP'].y + root_h
+        if anchor < bottom < doc.page_height - 260.:
+            stretch = min(1.45, max(1., (doc.page_height - 200. - anchor) /
+                                    (bottom - anchor)))
+            for item in devices:
+                if item.ref != 'MSP' and item.y >= anchor:
+                    item.y = anchor + (item.y - anchor) * stretch
 
     # Keep canonical ownership available for editing, but leave the boxes
     # hidden: the original drawing conveys location through device captions.

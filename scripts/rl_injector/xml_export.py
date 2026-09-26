@@ -151,6 +151,14 @@ def _apply_account_edits(doc: AccountDoc, acct, sentinel: int) -> None:
     for zone in sorted(acct.zones, key=lambda item: item.number):
         row = prototypes.get(zone.zone_type, default_prototype).clone()
         row.set("NUMBER", str(zone.number))
+        try:
+            zone.name.encode("latin-1")
+        except UnicodeEncodeError as exc:
+            raise InjectorError(
+                f"Zone {zone.number} description {zone.name!r} contains a "
+                "character RemoteLink cannot encode. Edit its DESCRIPTION "
+                "on the ZONES tab, then preview the account again."
+            ) from exc
         row.set("NAME", f"Z{zone.number} {zone.name}")
         staged_zones.append(row)
     zones.rows = staged_zones

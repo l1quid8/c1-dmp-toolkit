@@ -23,7 +23,8 @@ from parse_dmp_worksheet import DMPDesign, Keypad, PowerSupply, RSP, Splitter, Z
 
 # Template capacities (DMP Installation Worksheet_template_blank.xlsx)
 MAX_EXPANDERS = 15        # Point Info sheets shipped in the template
-MAX_SPLITTERS_PER_TYPE = 12   # 4 rows per splitter in rows 2-50
+MAX_SPLITTERS_PER_TYPE = 12   # KP editor limit
+MAX_LX_SPLITTERS = 20        # LX template has 20 four-row device blocks
 MAX_KEYPADS = 28          # Keypad sheet rows 3-30
 
 EXPANDER_MODELS = {"714-16": 16, "714-8": 8}
@@ -421,9 +422,10 @@ def add_splitter(design: DMPDesign, splitter_type: str,
     if splitter_type == "LX" and lx_bus not in {"500", "600", "700", "800", "900"}:
         raise HardwareError("LX bus must be one of 500, 600, 700, 800, or 900.")
     same_type = [s for s in design.splitters if s.splitter_type == splitter_type]
-    if len(same_type) >= MAX_SPLITTERS_PER_TYPE:
+    limit = MAX_LX_SPLITTERS if splitter_type == "LX" else MAX_SPLITTERS_PER_TYPE
+    if len(same_type) >= limit:
         raise HardwareError(
-            f"The splitter sheet fits at most {MAX_SPLITTERS_PER_TYPE} "
+            f"The splitter sheet fits at most {limit} "
             f"{splitter_type} splitters."
         )
     used = _used_numbers(design, splitter_type, bus=lx_bus)
@@ -475,9 +477,10 @@ def renumber_splitter(design: DMPDesign, splitter_id: str,
     bus = lx_bus or _splitter_bus(splitter)
     if _splitter_number(splitter) == new_number and bus == _splitter_bus(splitter):
         return splitter  # no-op
-    if not 1 <= new_number <= MAX_SPLITTERS_PER_TYPE:
+    limit = MAX_LX_SPLITTERS if splitter.splitter_type == "LX" else MAX_SPLITTERS_PER_TYPE
+    if not 1 <= new_number <= limit:
         raise HardwareError(
-            f"Splitter number must be between 1 and {MAX_SPLITTERS_PER_TYPE}."
+            f"Splitter number must be between 1 and {limit}."
         )
     new_id = (f"710-LX{bus}-{new_number}" if lx_bus is not None else _splitter_id(
         splitter.splitter_type, new_number, existing_id=splitter.id))
@@ -559,6 +562,48 @@ def add_keypad(design: DMPDesign, location: str | None = None,
     keypad = Keypad(number=n, source=source, location=location,
                     global_keypad=global_keypad)
     design.keypads.append(keypad)
+    design.keypads.sort(key=lambda k: k.number)
+    return keypad
+
+
+def renumber_keypad(design: DMPDesign, number: int, new_number: int) -> Keypad:
+    """Change a keypad address while keeping its connections and riser placement."""
+    keypad = next((k for k in design.keypads if k.number == number), None)
+    if keypad is None:
+        raise HardwareError(f"No keypad #{number} in this design.")
+    if type(new_number) is not int or not 1 <= new_number <= MAX_KEYPADS:
+        raise HardwareError(f"Keypad number must be between 1 and {MAX_KEYPADS}.")
+    if number == new_number:
+        return keypad
+    if any(k.number == new_number for k in design.keypads):
+        raise HardwareError(f"KEYPAD #{new_number} already exists. Pick a free number.")
+
+    old_id, new_id = f"KEYPAD-{number}", f"KEYPAD-{new_number}"
+    keypad.number = new_number
+    for splitter in design.splitters:
+        splitter.outputs = [
+            f"KEYPAD #{new_number}" if re.fullmatch(
+                rf"KEYPAD[\s#-]*{number}", (value or "").strip(), re.I)
+            else value for value in (splitter.outputs or [])
+        ]
+    from riser_model import DevicePortRef
+    for edge in design.connections:
+        if edge.source.device_id == old_id:
+            edge.source = DevicePortRef(new_id, edge.source.port_id)
+        if edge.target.device_id == old_id:
+            edge.target = DevicePortRef(new_id, edge.target.port_id)
+    for mapping in (design.device_location_ids, design.location_sync_values):
+        if old_id in mapping:
+            mapping[new_id] = mapping.pop(old_id)
+    document = design.riser_document
+    if document is not None:
+        old_key, new_key = f"device:{old_id}", f"device:{new_id}"
+        element = document.elements.pop(old_key, None)
+        if element is not None:
+            element.id, element.ref = new_key, new_id
+            document.elements[new_key] = element
+        document.z_order = [new_key if key == old_key else key for key in document.z_order]
+        document.unplaced = [new_id if ref == old_id else ref for ref in document.unplaced]
     design.keypads.sort(key=lambda k: k.number)
     return keypad
 
