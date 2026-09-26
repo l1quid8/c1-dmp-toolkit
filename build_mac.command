@@ -10,6 +10,14 @@ cd "$PROJECT_DIR"
 BUILD_HOME="$HOME/.dmp-doorchart"
 VENV="$BUILD_HOME/venv"
 APP_NAME="C1 DMP Toolkit"
+DEST="$HOME/Applications"
+
+# PyInstaller imports some modules lazily from the app executable. Replacing
+# that bundle while it is running can corrupt those later reads.
+if pgrep -f "$DEST/$APP_NAME.app/Contents/MacOS/$APP_NAME" >/dev/null; then
+    echo "ERROR: Quit $APP_NAME before rebuilding the installed app." >&2
+    exit 1
+fi
 
 echo "==> Project:    $PROJECT_DIR"
 echo "==> Build home: $BUILD_HOME  (local, never synced)"
@@ -51,7 +59,6 @@ echo "==> Building (this takes a few minutes)..."
     dmp_doorchart.spec
 
 # 6. Install to ~/Applications ----------------------------------------------
-DEST="$HOME/Applications"
 mkdir -p "$DEST"
 rm -rf "$DEST/$APP_NAME.app"
 cp -R "$BUILD_HOME/dist/$APP_NAME.app" "$DEST/"
