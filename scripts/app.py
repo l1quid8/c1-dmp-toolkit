@@ -1906,12 +1906,14 @@ class App:
                      corner_radius=theme.RADIUS["button"]).grid(
             row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
 
+        receipt_error = None
         try:
             receipt_text = preview_account_summary(
                 design, config,
                 resource_path("remotelink_account_template.xml"),
             )
         except Exception as exc:
+            receipt_error = exc
             receipt_text = f"Receipt unavailable\n===================\n{exc}"
         receipt = ctk.CTkTextbox(
             dlg, wrap="word", fg_color=theme.SURFACE,
@@ -1938,7 +1940,10 @@ class App:
             dlg.destroy()
             self._run_generate_remotelink(passphrase)
 
-        primary_button(btns, "Generate", submit, width=120).pack(side="right")
+        generate_button = primary_button(btns, "Generate", submit, width=120)
+        if receipt_error is not None:
+            generate_button.configure(state="disabled")
+        generate_button.pack(side="right")
 
     def _run_generate_remotelink(self, passphrase):
         design = copy.deepcopy(self.session.design)

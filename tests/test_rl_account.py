@@ -96,6 +96,18 @@ def test_build_staging_account_zone_types():
     assert types[516] == ZONE_TYPE_SUPERVISORY
 
 
+def test_unsupported_zone_character_names_the_editable_zone():
+    design = _rl_design()
+    design.master_zones[0].description = "HALLWAY €"
+    with pytest.raises(InjectorError, match=r"Zone 501 description 'HALLWAY €'.*ZONES tab"):
+        preview_account_summary(design, RemoteLinkConfig(), BUNDLED_TEMPLATE)
+
+    design.master_zones[0].description = "HALLWAY E"
+    doc = build_configured_account_doc(
+        design, RemoteLinkConfig(), BUNDLED_TEMPLATE.read_text(encoding="latin-1"))
+    assert doc.table("ZoneInfoList").rows[0].text("NAME") == "Z501 HALLWAY E"
+
+
 def test_explicit_zone_type_override_wins_over_automatic_derivation():
     """A field-tech Exit selection must replace the default Night type."""
     design = _rl_design()
