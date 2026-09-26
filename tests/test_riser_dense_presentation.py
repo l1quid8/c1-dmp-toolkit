@@ -43,6 +43,14 @@ def test_dense_preview_fits_devices_captions_and_wires_without_changing_wiring()
     assert len([e for e in doc.elements.values() if e.kind=='device'])==27
 
 
+def test_preview_spreads_siblings_into_available_sheet_space():
+    doc = layout_presentation(dense_school())
+    first = doc.elements['device:KEYPAD-2']
+    second = doc.elements['device:KEYPAD-3']
+    assert second.x - (first.x + first.width) >= 55
+    assert first.x >= 100
+
+
 def test_preview_opens_at_readable_scale_and_leaves_project_untouched(editor, monkeypatch):
     frame,_=editor
     tab=frame.riser_tab

@@ -51,6 +51,7 @@ class Splitter:
     location: Optional[str] = None
     inputs: dict[str, str] = field(default_factory=dict)  # "LX-Bus In" / "KP-Bus In" -> description
     outputs: list[str] = field(default_factory=list)      # ["RSP 1", "RSP 2", ...]
+    output_locations: list[str] = field(default_factory=list)  # location printed beside each output
 
 
 @dataclass
@@ -270,7 +271,7 @@ def _parse_kp_splitters(ws) -> list[Splitter]:
     splitters: list[Splitter] = []
     current_splitter: Optional[Splitter] = None
 
-    for row in ws.iter_rows(min_row=1, max_row=50, values_only=True):
+    for row in ws.iter_rows(min_row=1, values_only=True):
         if not row:
             continue
 
@@ -290,16 +291,17 @@ def _parse_kp_splitters(ws) -> list[Splitter]:
                 location=loc_text if loc_text else None,
             )
             # First line may also have input info
-            if func_text and "In" in func_text:
+            if func_text and "in" in func_text.casefold():
                 current_splitter.inputs[func_text] = desc_text
         # I/O line (e.g., "KP-Bus In", "KP-Bus 1", etc.) — col A is empty, col B has function
         elif current_splitter and func_text:
             # Store as input or output based on "In" vs numbered
-            if "In" in func_text:
+            if "in" in func_text.casefold():
                 current_splitter.inputs[func_text] = desc_text
             else:
                 # Output line: store the description (keypad or device it feeds)
                 current_splitter.outputs.append(desc_text)
+                current_splitter.output_locations.append(loc_text)
 
     if current_splitter:
         splitters.append(current_splitter)
@@ -312,7 +314,7 @@ def _parse_lx_splitters(ws) -> list[Splitter]:
     splitters: list[Splitter] = []
     current_splitter: Optional[Splitter] = None
 
-    for row in ws.iter_rows(min_row=1, max_row=50, values_only=True):
+    for row in ws.iter_rows(min_row=1, values_only=True):
         if not row:
             continue
 
@@ -332,15 +334,16 @@ def _parse_lx_splitters(ws) -> list[Splitter]:
                 location=loc_text if loc_text else None,
             )
             # First line may also have input info
-            if func_text and "In" in func_text:
+            if func_text and "in" in func_text.casefold():
                 current_splitter.inputs[func_text] = desc_text
         # I/O line (e.g., "LX-Bus In", "LX-Bus 1", etc.) — col A is empty, col B has function
         elif current_splitter and func_text:
-            if "In" in func_text:
+            if "in" in func_text.casefold():
                 current_splitter.inputs[func_text] = desc_text
             else:
                 # Output line: store the description
                 current_splitter.outputs.append(desc_text)
+                current_splitter.output_locations.append(loc_text)
 
     if current_splitter:
         splitters.append(current_splitter)

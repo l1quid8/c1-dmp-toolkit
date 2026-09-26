@@ -164,7 +164,7 @@ connections. RSP module numbers and zone addresses are independent; existing dev
 are not renumbered after removal. \
 Removing hardware re-points anything that fed it to "Spare" and unsources affected \
 keypads — the app pops a summary and routes you to review the new wiring. Template \
-capacities: 15 expanders, 12 LX + 12 KP splitters, 28 keypads."""
+capacities: 15 expanders, 20 LX + 12 KP splitters, 28 keypads."""
 
 ctk.set_default_color_theme("blue")
 

@@ -155,17 +155,26 @@ def derive_legacy_connections(
 
     by_id = {s.id: s for s in getattr(design, "splitters", [])}
     by_normal_id = {s.id.upper(): s.id for s in getattr(design, "splitters", [])}
+    for splitter_id in by_id:
+        match = re.fullmatch(r"KP-710-(\d+)", splitter_id, re.I)
+        if match:
+            by_normal_id[f"710-KP-{match.group(1)}"] = splitter_id
+        match = re.fullmatch(r"710-KP-(\d+)", splitter_id, re.I)
+        if match:
+            by_normal_id[f"KP-710-{match.group(1)}"] = splitter_id
 
     def named_parent(input_text: str) -> str | None:
-        if not input_text.lower().startswith("from "):
-            return None
-        return by_normal_id.get(input_text[5:].strip().upper())
+        """Find a named upstream 710 in field worksheet input descriptions."""
+        for token in re.findall(r"(?:KP-710|710-KP|710-LX\d{3}|LX-710)-\d+",
+                                input_text.upper()):
+            parent = by_normal_id.get(token)
+            if parent:
+                return parent
+        return None
 
+    # Explicit output rows take precedence over prose in the child IN field.
+    # Field worksheets commonly write a bare splitter ID (without "To ").
     for splitter in getattr(design, "splitters", []):
-        input_text = next(iter((splitter.inputs or {}).values()), "").strip()
-        if input_text and named_parent(input_text) is None:
-            add(DevicePortRef("MSP", _panel_port(splitter)),
-                DevicePortRef(splitter.id, "IN"))
         for index, raw in enumerate(splitter.outputs or [], 1):
             value = (raw or "").strip()
             if not value or value.lower() == "spare":
@@ -173,7 +182,10 @@ def derive_legacy_connections(
             target_id = ""
             if value.lower().startswith("to "):
                 target_id = value[3:].strip()
-            else:
+            target_id = by_normal_id.get(target_id.upper() or value.upper(), target_id)
+            if not target_id:
+                target_id = by_normal_id.get(value.upper(), "")
+            if not target_id:
                 match = _RSP_RE.match(value)
                 if match:
                     target_id = f"RSP-{int(match.group(1))}"
@@ -211,6 +223,11 @@ def derive_legacy_connections(
                 used.add(port)
                 incoming.add(target_id)
                 break
+    # A service keypad may share the panel bus while all splitter outputs are
+    # occupied by downstream devices.  Do not steal one of those outputs.
+    if assume_service_keypad and any(k.number == 1 for k in getattr(design, "keypads", [])):
+        if not any(edge.target.device_id == "KEYPAD-1" for edge in result):
+            add(DevicePortRef("MSP", "KP BUS"), DevicePortRef("KEYPAD-1", "IN"))
 
     # Some legacy data names a parent only in the child's IN field. Attach it
     # to the first unused output so the edge is not silently lost.
@@ -228,7 +245,19 @@ def derive_legacy_connections(
                 add(DevicePortRef(*port), DevicePortRef(splitter.id, "IN"))
                 used.add(port)
                 break
-    return result
+    # Only true bus roots are direct panel children.  Previously every
+    # populated input without a leading "From " became a direct MSP edge,
+    # even when a different splitter explicitly listed it on an output.
+    incoming = {c.target.device_id for c in result}
+    for splitter in getattr(design, "splitters", []):
+        input_text = next(iter((splitter.inputs or {}).values()), "").strip()
+        if input_text and splitter.id not in incoming and not named_parent(input_text):
+            add(DevicePortRef("MSP", _panel_port(splitter)),
+                DevicePortRef(splitter.id, "IN"))
+    panel_roots = [edge for edge in result
+                   if edge.source.device_id == "MSP"
+                   and edge.target.device_id in by_id]
+    return panel_roots + [edge for edge in result if edge not in panel_roots]
 
 
 def default_riser_document(design) -> RiserDocument:

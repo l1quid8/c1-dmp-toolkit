@@ -28,6 +28,7 @@ from hardware import (  # noqa: E402
     HardwareError,
     MAX_EXPANDERS,
     MAX_KEYPADS,
+    MAX_LX_SPLITTERS,
     MAX_SPLITTERS_PER_TYPE,
     add_expander,
     add_keypad,
@@ -169,11 +170,11 @@ def test_add_splitter_rejects_invalid_lx_bus_without_mutation(bus):
 
 def test_lx_capacity_is_per_family_not_per_selected_bus():
     d = DMPDesign()
-    for n in range(MAX_SPLITTERS_PER_TYPE):
+    for n in range(MAX_LX_SPLITTERS):
         add_splitter(d, "LX", lx_bus="500" if n % 2 else "600")
-    with pytest.raises(HardwareError, match="12 LX splitters"):
+    with pytest.raises(HardwareError, match=f"{MAX_LX_SPLITTERS} LX splitters"):
         add_splitter(d, "LX", lx_bus="900")
-    assert len(d.splitters) == MAX_SPLITTERS_PER_TYPE
+    assert len(d.splitters) == MAX_LX_SPLITTERS
     assert add_splitter(d, "KP").id == "710-KP-1"
 
 
@@ -185,7 +186,7 @@ def test_add_splitter_ids_and_capacity():
     assert s1.id == "710-LX500-1" and s2.id == "710-LX500-2"
     assert k1.id == "710-KP-1"
     assert s1.outputs == ["Spare", "Spare", "Spare"]
-    for _ in range(MAX_SPLITTERS_PER_TYPE - 2):
+    for _ in range(MAX_LX_SPLITTERS - 2):
         add_splitter(d, "LX")
     with pytest.raises(HardwareError):
         add_splitter(d, "LX")
@@ -243,7 +244,7 @@ def test_renumber_splitter_rejects_out_of_range():
     with pytest.raises(HardwareError):
         renumber_splitter(d, "710-LX500-1", 0)
     with pytest.raises(HardwareError):
-        renumber_splitter(d, "710-LX500-1", MAX_SPLITTERS_PER_TYPE + 1)
+        renumber_splitter(d, "710-LX500-1", MAX_LX_SPLITTERS + 1)
 
 
 def test_renumber_splitter_types_are_independent():

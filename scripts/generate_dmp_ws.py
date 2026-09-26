@@ -1243,7 +1243,9 @@ def write_dmp_xlsx(design: DMPDesign, template_path: Path, output_path: Path,
                 _write_cell_safe(ws, f"B{row}", f"KP-Bus {i}")
                 if output:
                     _write_cell_safe(ws, f"C{row}", output)
-                    dest_loc = _resolve_output_location(output)
+                    dest_loc = (splitter.output_locations[i - 1]
+                                if i - 1 < len(splitter.output_locations) else "")
+                    dest_loc = dest_loc or _resolve_output_location(output)
                     if dest_loc:
                         _write_cell_safe(ws, f"D{row}", dest_loc)
                 row += 1
@@ -1288,7 +1290,9 @@ def write_dmp_xlsx(design: DMPDesign, template_path: Path, output_path: Path,
                 _write_cell_safe(ws, f"B{row}", f"LX-Bus {i}")
                 if output:
                     _write_cell_safe(ws, f"C{row}", output)
-                    dest_loc = _resolve_output_location(output)
+                    dest_loc = (splitter.output_locations[i - 1]
+                                if i - 1 < len(splitter.output_locations) else "")
+                    dest_loc = dest_loc or _resolve_output_location(output)
                     if dest_loc:
                         _write_cell_safe(ws, f"D{row}", dest_loc)
                 row += 1

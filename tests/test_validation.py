@@ -198,14 +198,14 @@ def test_confirmed_topology_silent():
 # -------- capacity.exceeded --------
 
 def test_over_capacity_errors():
-    from hardware import MAX_EXPANDERS, MAX_KEYPADS, MAX_SPLITTERS_PER_TYPE
+    from hardware import MAX_EXPANDERS, MAX_KEYPADS, MAX_LX_SPLITTERS
     from parse_dmp_worksheet import Keypad
     design = _valid_design()
     design.rsps = [RSP(number=n, location="X", zones=[501 + 16 * (n - 1)])
                    for n in range(1, MAX_EXPANDERS + 2)]
     design.splitters = [Splitter(id=f"710-LX500-{n}", splitter_type="LX",
                                  outputs=["Spare"] * 3)
-                        for n in range(1, MAX_SPLITTERS_PER_TYPE + 2)]
+                        for n in range(1, MAX_LX_SPLITTERS + 2)]
     design.keypads = [Keypad(number=n, source="MSP")
                       for n in range(1, MAX_KEYPADS + 2)]
     issues = validate_design(design, topology_confirmed=True)

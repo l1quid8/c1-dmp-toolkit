@@ -177,6 +177,7 @@ def _splitter_from_dict(d: dict) -> Splitter:
         location=d.get("location"),
         inputs=dict(d.get("inputs") or {}),
         outputs=list(d.get("outputs") or []),
+        output_locations=list(d.get("output_locations") or []),
     )
 
 

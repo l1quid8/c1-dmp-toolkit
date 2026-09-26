@@ -116,7 +116,8 @@ def _rule_rsp_hyphen(design: DMPDesign, ctx: dict) -> Iterator[Issue]:
 def _rule_capacity(design: DMPDesign, ctx: dict) -> Iterator[Issue]:
     # Belt-and-braces: adds are guarded at the source (hardware.py), but a
     # session file could arrive over-cap.
-    from hardware import MAX_EXPANDERS, MAX_KEYPADS, MAX_SPLITTERS_PER_TYPE
+    from hardware import (MAX_EXPANDERS, MAX_KEYPADS, MAX_LX_SPLITTERS,
+                          MAX_SPLITTERS_PER_TYPE)
     if len(design.rsps) > MAX_EXPANDERS:
         yield Issue(
             code="capacity.exceeded", severity="error", tab=TAB_POWER, ref=None,
@@ -125,12 +126,13 @@ def _rule_capacity(design: DMPDesign, ctx: dict) -> Iterator[Issue]:
         )
     for stype in ("LX", "KP"):
         n = sum(1 for s in design.splitters if s.splitter_type == stype)
-        if n > MAX_SPLITTERS_PER_TYPE:
+        limit = MAX_LX_SPLITTERS if stype == "LX" else MAX_SPLITTERS_PER_TYPE
+        if n > limit:
             yield Issue(
                 code="capacity.exceeded", severity="error", tab=TAB_SPLITTERS,
                 ref=None,
                 message=f"{n} {stype} splitters — the splitter sheet fits at "
-                        f"most {MAX_SPLITTERS_PER_TYPE}",
+                        f"most {limit}",
             )
     if len(design.keypads) > MAX_KEYPADS:
         yield Issue(

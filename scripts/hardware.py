@@ -23,7 +23,8 @@ from parse_dmp_worksheet import DMPDesign, Keypad, PowerSupply, RSP, Splitter, Z
 
 # Template capacities (DMP Installation Worksheet_template_blank.xlsx)
 MAX_EXPANDERS = 15        # Point Info sheets shipped in the template
-MAX_SPLITTERS_PER_TYPE = 12   # 4 rows per splitter in rows 2-50
+MAX_SPLITTERS_PER_TYPE = 12   # KP editor limit
+MAX_LX_SPLITTERS = 20        # LX template has 20 four-row device blocks
 MAX_KEYPADS = 28          # Keypad sheet rows 3-30
 
 EXPANDER_MODELS = {"714-16": 16, "714-8": 8}
@@ -421,9 +422,10 @@ def add_splitter(design: DMPDesign, splitter_type: str,
     if splitter_type == "LX" and lx_bus not in {"500", "600", "700", "800", "900"}:
         raise HardwareError("LX bus must be one of 500, 600, 700, 800, or 900.")
     same_type = [s for s in design.splitters if s.splitter_type == splitter_type]
-    if len(same_type) >= MAX_SPLITTERS_PER_TYPE:
+    limit = MAX_LX_SPLITTERS if splitter_type == "LX" else MAX_SPLITTERS_PER_TYPE
+    if len(same_type) >= limit:
         raise HardwareError(
-            f"The splitter sheet fits at most {MAX_SPLITTERS_PER_TYPE} "
+            f"The splitter sheet fits at most {limit} "
             f"{splitter_type} splitters."
         )
     used = _used_numbers(design, splitter_type, bus=lx_bus)
@@ -475,9 +477,10 @@ def renumber_splitter(design: DMPDesign, splitter_id: str,
     bus = lx_bus or _splitter_bus(splitter)
     if _splitter_number(splitter) == new_number and bus == _splitter_bus(splitter):
         return splitter  # no-op
-    if not 1 <= new_number <= MAX_SPLITTERS_PER_TYPE:
+    limit = MAX_LX_SPLITTERS if splitter.splitter_type == "LX" else MAX_SPLITTERS_PER_TYPE
+    if not 1 <= new_number <= limit:
         raise HardwareError(
-            f"Splitter number must be between 1 and {MAX_SPLITTERS_PER_TYPE}."
+            f"Splitter number must be between 1 and {limit}."
         )
     new_id = (f"710-LX{bus}-{new_number}" if lx_bus is not None else _splitter_id(
         splitter.splitter_type, new_number, existing_id=splitter.id))
