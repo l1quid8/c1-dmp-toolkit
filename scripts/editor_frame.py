@@ -401,6 +401,8 @@ class EditorFrame(ctk.CTkFrame):
 
     def save(self, path: Path | None = None) -> bool:
         """Save the current project, optionally switching to a new file."""
+        if hasattr(self, "keypads_tab") and self.keypads_tab.commit_numbers() is False:
+            return False
         if hasattr(self, "power_tab") and self.power_tab.commit_numbers() is False:
             return False
         self.flush_design_refresh()
@@ -496,7 +498,7 @@ class EditorFrame(ctk.CTkFrame):
                 if cls is KeypadsTab else {})
             extra_options = (
                 {"on_renumber": self._on_expander_renumber}
-                if cls is PowerTab else {})
+                if cls in (KeypadsTab, PowerTab) else {})
             widget = cls(self.tabs.tab(title), self.session, self._on_design_edit,
                          on_structure_change=self._on_structure_change,
                          on_hardware_change=self.apply_hardware_change,
@@ -580,7 +582,8 @@ class EditorFrame(ctk.CTkFrame):
             card = self.splitters_tab._build_splitter_card(splitter, parent=body)
             card.pack(fill='x')
         elif keypad:
-            self.keypads_tab._build_keypad_card(keypad, parent=body).pack(fill='x')
+            card = self.keypads_tab._build_keypad_card(keypad, parent=body)
+            card.pack(fill='x')
         elif rsp:
             card = self.power_tab._build_rsp_card(rsp,
                 {ps.number: ps for ps in design.power_supplies}, parent=body)
@@ -593,7 +596,7 @@ class EditorFrame(ctk.CTkFrame):
 
         def done():
             # FocusOut is asynchronous; explicitly commit before destroying widgets.
-            if (splitter or rsp) and card.winfo_exists():
+            if (splitter or keypad or rsp) and card.winfo_exists():
                 if card.commit_pending() is False:
                     return
             self._close_hardware_dialog()
@@ -973,6 +976,8 @@ class EditorFrame(ctk.CTkFrame):
     def _guard_generation(self, callback):
         def guarded():
             if self.generation_allowed() and callback:
+                if hasattr(self, "keypads_tab") and self.keypads_tab.commit_numbers() is False:
+                    return
                 if hasattr(self, "power_tab") and self.power_tab.commit_numbers() is False:
                     return
                 return callback()

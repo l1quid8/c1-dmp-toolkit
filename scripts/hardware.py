@@ -566,6 +566,48 @@ def add_keypad(design: DMPDesign, location: str | None = None,
     return keypad
 
 
+def renumber_keypad(design: DMPDesign, number: int, new_number: int) -> Keypad:
+    """Change a keypad address while keeping its connections and riser placement."""
+    keypad = next((k for k in design.keypads if k.number == number), None)
+    if keypad is None:
+        raise HardwareError(f"No keypad #{number} in this design.")
+    if type(new_number) is not int or not 1 <= new_number <= MAX_KEYPADS:
+        raise HardwareError(f"Keypad number must be between 1 and {MAX_KEYPADS}.")
+    if number == new_number:
+        return keypad
+    if any(k.number == new_number for k in design.keypads):
+        raise HardwareError(f"KEYPAD #{new_number} already exists. Pick a free number.")
+
+    old_id, new_id = f"KEYPAD-{number}", f"KEYPAD-{new_number}"
+    keypad.number = new_number
+    for splitter in design.splitters:
+        splitter.outputs = [
+            f"KEYPAD #{new_number}" if re.fullmatch(
+                rf"KEYPAD[\s#-]*{number}", (value or "").strip(), re.I)
+            else value for value in (splitter.outputs or [])
+        ]
+    from riser_model import DevicePortRef
+    for edge in design.connections:
+        if edge.source.device_id == old_id:
+            edge.source = DevicePortRef(new_id, edge.source.port_id)
+        if edge.target.device_id == old_id:
+            edge.target = DevicePortRef(new_id, edge.target.port_id)
+    for mapping in (design.device_location_ids, design.location_sync_values):
+        if old_id in mapping:
+            mapping[new_id] = mapping.pop(old_id)
+    document = design.riser_document
+    if document is not None:
+        old_key, new_key = f"device:{old_id}", f"device:{new_id}"
+        element = document.elements.pop(old_key, None)
+        if element is not None:
+            element.id, element.ref = new_key, new_id
+            document.elements[new_key] = element
+        document.z_order = [new_key if key == old_key else key for key in document.z_order]
+        document.unplaced = [new_id if ref == old_id else ref for ref in document.unplaced]
+    design.keypads.sort(key=lambda k: k.number)
+    return keypad
+
+
 def remove_keypad(design: DMPDesign, number: int) -> None:
     keypad = next((k for k in design.keypads if k.number == number), None)
     if keypad is None:
