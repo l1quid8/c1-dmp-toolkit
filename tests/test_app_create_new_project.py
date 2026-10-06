@@ -32,7 +32,8 @@ def background_editor(tmp_path):
     save_session(project, tmp_path / "original.dmps")
     statuses, cancelled_jobs = [], []
     editor = SimpleNamespace(
-        session=project, dirty=True, _recovery_job="pending-snapshot", _save_btn=None,
+        session=project, dirty=True, _recovery_job="pending-snapshot", _recovery_failed=False,
+        _save_btn=None,
         root=SimpleNamespace(after_cancel=cancelled_jobs.append),
         flush_design_refresh=lambda: None,
     )
