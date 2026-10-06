@@ -578,8 +578,26 @@ def pending_recovery(session_path: Path) -> Optional[datetime]:
 
 
 def load_recovery(session_path: Path) -> Session:
-    session = _session_from_dict(
-        json.loads(recovery_path(session_path).read_text(encoding="utf-8")),
-        session_path,
-    )
-    return session
+    rec = recovery_path(session_path)
+    try:
+        d = json.loads(rec.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SessionLoadError(f"Couldn't read {rec.name}: {exc}") from exc
+    try:
+        return _session_from_dict(d, session_path)
+    except SessionLoadError:
+        raise
+    except Exception as exc:
+        raise SessionLoadError(f"{rec.name} is damaged: {exc}") from exc
+
+
+def set_aside_recovery(session_path: Path) -> Path | None:
+    """Rename an unreadable recovery file so it stops being offered on open,
+    without destroying it. Returns the new path, or None if nothing moved."""
+    rec = recovery_path(session_path)
+    target = rec.with_name(rec.name + ".unreadable")
+    try:
+        os.replace(rec, target)
+    except OSError:
+        return None
+    return target

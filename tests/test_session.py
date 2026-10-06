@@ -537,3 +537,17 @@ def test_sync_then_serialize_round_trip():
     restored = design_from_dict(json.loads(json.dumps(design_to_dict(design))))
     assert restored.master_zones == design.master_zones
     assert {z.number: z.description for z in restored.master_zones}[501] == "RENAMED ROOM"
+
+
+def test_unreadable_recovery_raises_load_error_and_can_be_set_aside(tmp_path):
+    from session import SessionLoadError, load_recovery, recovery_path, set_aside_recovery
+    target = tmp_path / "School.dmps"
+    recovery_path(target).write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(SessionLoadError):
+        load_recovery(target)
+
+    moved = set_aside_recovery(target)
+    assert moved == tmp_path / "School.dmps.recovery.unreadable"
+    assert moved.read_text(encoding="utf-8") == "{not json"
+    assert not recovery_path(target).exists()

@@ -24,6 +24,7 @@ import theme
 from topology_service import project_legacy_topology, prune_unknown_connections
 from hardware import HardwareError, snapshot_refs, diff_refs, sync_rsp_zone_buses
 from session import Session, save_session, sync_master_zones, write_recovery, clear_recovery
+from timefmt import clock_time
 from validation import validate_design, badge_counts, badge_counts_by_severity
 from editor_zones import ZonesTab
 from editor_remotelink import RemoteLinkTab
@@ -452,7 +453,7 @@ class EditorFrame(ctk.CTkFrame):
         when = ""
         if self.session.saved_at:
             with contextlib.suppress(Exception):
-                when = datetime.fromisoformat(self.session.saved_at).strftime("%-I:%M %p")
+                when = clock_time(datetime.fromisoformat(self.session.saved_at))
         self.on_status_change(f"Saved {when} ✓" if when else "Saved ✓", False)
 
     def _update_save_button(self):

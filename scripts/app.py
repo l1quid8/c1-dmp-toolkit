@@ -47,9 +47,11 @@ from session import (
     pending_recovery,
     save_session,
     sessions_dir,
+    set_aside_recovery,
     sync_master_zones,
     unique_session_path,
 )
+from timefmt import short_datetime
 from editor_frame import EditorFrame, _site_defaults
 from new_project_dialog import ask_new_project
 from topology_service import ensure_explicit_topology, project_legacy_topology
@@ -960,13 +962,10 @@ class App:
     @staticmethod
     def _recent_meta(summary) -> str:
         """"Saved Jul 1, 1:38 PM · from northview.pdf" — the ISO timestamp read
-        as machine output, so it's rendered the way a person would say it.
-        %-d / %-I aren't portable, hence the manual assembly."""
+        as machine output, so it's rendered the way a person would say it."""
         saved = summary.saved_at or ""
         with contextlib.suppress(ValueError, TypeError):
-            when = datetime.fromisoformat(summary.saved_at)
-            saved = (f"{when:%b} {when.day}, {when.hour % 12 or 12}"
-                     f":{when:%M} {when:%p}")
+            saved = short_datetime(datetime.fromisoformat(summary.saved_at))
         parts = [f"Saved {saved}"] if saved else []
         if summary.source_name:
             parts.append(f"from {summary.source_name}")
@@ -1495,15 +1494,25 @@ class App:
         if self.editor and not self.editor.maybe_close():
             return
         try:
+            session = None
             rec_time = pending_recovery(path)
             if rec_time and messagebox.askyesno(
                 "Recover unsaved changes?",
-                f"Unsaved changes from {rec_time.strftime('%b %-d, %-I:%M %p')} "
+                f"Unsaved changes from {short_datetime(rec_time)} "
                 "were found for this project (the app may have closed "
                 "unexpectedly).\n\nRecover them?",
             ):
-                session = load_recovery(path)
-            else:
+                try:
+                    session = load_recovery(path)
+                except SessionLoadError as exc:
+                    # A damaged backup must never lock the project: keep it
+                    # aside for inspection and open the last saved version.
+                    set_aside_recovery(path)
+                    messagebox.showwarning(
+                        "Couldn't recover unsaved changes",
+                        f"{exc}\n\nOpening the last saved version instead.",
+                    )
+            if session is None:
                 clear_recovery(path)
                 session = load_session(path)
         except SessionLoadError as exc:

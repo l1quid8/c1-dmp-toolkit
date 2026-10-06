@@ -2,6 +2,7 @@
 
 import io
 import sys
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -173,16 +174,19 @@ def test_dmps_route_uses_normal_or_recovery_loader(controller, boundaries, monke
     if recovery_choice is not None:
         project.design.site_info.school_code = "RECOVERED"
         write_recovery(project)
-        # Avoid platform-dependent %-d formatting while exercising the recovery branch.
-        monkeypatch.setattr(app_module, "pending_recovery", lambda target:
-                            SimpleNamespace(strftime=lambda pattern: "Sep 12, 12:00 PM"))
+        monkeypatch.setattr(app_module, "pending_recovery",
+                            lambda target: datetime(2026, 9, 12, 12, 0))
     else:
         monkeypatch.setattr(app_module.messagebox, "askyesno",
                             lambda *args: pytest.fail("prompted without recovery"))
+    prompts = []
     if recovery_choice is not None:
-        monkeypatch.setattr(app_module.messagebox, "askyesno", lambda *args: recovery_choice)
+        monkeypatch.setattr(app_module.messagebox, "askyesno",
+                            lambda title, message: prompts.append(message) or recovery_choice)
 
     controller._start_input(path)
+    if recovery_choice is not None:
+        assert "Sep 12, 12:00 PM" in prompts[0]
 
     chosen = "load_recovery" if recovery_choice else "load_session"
     boundaries[chosen].assert_called_once_with(path)
@@ -196,6 +200,27 @@ def test_dmps_route_uses_normal_or_recovery_loader(controller, boundaries, monke
     for name in set(boundaries) - {chosen}:
         boundaries[name].assert_not_called()
     assert session_module.recovery_path(path).exists() is bool(recovery_choice)
+
+
+def test_damaged_recovery_opens_last_saved_version(controller, boundaries, monkeypatch, tmp_path):
+    # A truncated backup must not lock the project: open the saved file, keep the backup aside.
+    project = create_blank_session(SiteInfo(school_name="SAVED SCHOOL"))
+    path = save_session(project, tmp_path / "existing.dmps")
+    session_module.recovery_path(path).write_text("{truncated", encoding="utf-8")
+    monkeypatch.setattr(app_module, "pending_recovery",
+                        lambda target: datetime(2026, 9, 12, 12, 0))
+    monkeypatch.setattr(app_module.messagebox, "askyesno", lambda *args: True)
+    warnings = []
+    monkeypatch.setattr(app_module.messagebox, "showwarning",
+                        lambda title, message: warnings.append(title))
+
+    controller._start_input(path)
+
+    loaded, _tab = controller.entered[0]
+    assert loaded.path == path and not controller.errors
+    assert warnings == ["Couldn't recover unsaved changes"]
+    assert not session_module.recovery_path(path).exists()
+    assert (tmp_path / "existing.dmps.recovery.unreadable").exists()
 
 
 def test_dmps_load_error_does_not_enter_editor(controller, boundaries, tmp_path):
