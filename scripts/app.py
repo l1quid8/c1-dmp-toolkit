@@ -45,11 +45,13 @@ from session import (
     normalize_rsp_tokens,
     normalize_zone_descriptions,
     pending_recovery,
+    record_worksheet,
     save_session,
     sessions_dir,
     set_aside_recovery,
     sync_master_zones,
     unique_session_path,
+    worksheet_fingerprint,
 )
 from timefmt import short_datetime
 from editor_frame import EditorFrame, _site_defaults
@@ -276,9 +278,6 @@ class App:
         # Generation runs in the background while the editor stays up.
         self._generating: str | None = None
         self._creating_project = False
-        # editor.edit_epoch at the moment the last worksheet was generated —
-        # lets the door-chart action warn when the worksheet has gone stale.
-        self._ws_epoch: int | None = None
 
         self._spinner_jobs: list[str] = []
         self._recent_scan = None
@@ -1404,7 +1403,8 @@ class App:
             self._show_file_card(xlsx_path.name, parsing=False, school_name=school)
             self._enter_editor(Session(design=design, source_kind="xlsx",
                                        source_name=xlsx_path.name,
-                                       path=unique_session_path(design)))
+                                       path=unique_session_path(design),
+                                       worksheet_path=str(xlsx_path)))
 
         def on_error(exc):
             if self.state != "loading_xlsx":
@@ -1444,7 +1444,6 @@ class App:
         self.session = session
         self.parsed_design = session.design  # generation flows read this
         self.state = "editing"
-        self._ws_epoch = None  # no worksheet generated for this project yet
 
         self._teardown_editor()
         self.editor = EditorFrame(
@@ -1460,14 +1459,15 @@ class App:
         )
         self.editor.grid(row=0, column=0, sticky="nsew")
         self._sync_fullscreen_controls()
-        if session.source_kind == "xlsx" and self.dmp_path is not None:
-            # The imported worksheet IS the design as of right now — treat it
-            # as in-sync so the door-chart staleness warning only fires for
-            # edits made after import.
-            self._ws_epoch = self.editor.edit_epoch
         if session.saved_at is None:
             # Fresh parse: seed the per-machine defaults the old form offered.
             self.editor.prefill_site_defaults(load_prefs())
+        if (session.source_kind == "xlsx" and session.saved_at is None
+                and session.worksheet_path and not session.worksheet_fingerprint):
+            # The imported worksheet IS the design as of right now (machine
+            # defaults included), so the door chart treats it as current.
+            record_worksheet(session, Path(session.worksheet_path),
+                             worksheet_fingerprint(session.design), update_file=False)
         self._show_editor_surface()
         self._set_toolbar_enabled(True)
         if session.source_name:
@@ -1573,20 +1573,41 @@ class App:
     def _school_slug(self) -> str:
         return _slugify(self.session.design.site_info.school_name or "output")
 
+    def _door_chart_source(self) -> tuple[Path | None, str]:
+        """The worksheet a door chart would be built from, and whether it
+        matches the project: 'current', 'stale', or 'unknown' (found by school
+        name; this project never recorded making it)."""
+        session = self.session
+        if session is None:
+            return None, "unknown"
+        if session.worksheet_path and Path(session.worksheet_path).exists():
+            fresh = worksheet_fingerprint(session.design) == session.worksheet_fingerprint
+            return Path(session.worksheet_path), "current" if fresh else "stale"
+        # A manual/BOM project must generate its own worksheet; a matching
+        # school slug on disk can belong to a different project.
+        if session.source_kind in {"manual", "bom"}:
+            return None, "unknown"
+        # Projects saved before worksheet tracking, or whose worksheet moved.
+        return latest_rev_path(self.output_dir, f"{self._school_slug()}_dmp"), "unknown"
+
     def _latest_worksheet_path(self) -> Path | None:
-        """The worksheet a door chart would be built from: the last one this
-        session touched (a generated rev, or the imported source xlsx), else
-        the highest rev on disk from an imported project's previous session.
-        Manual projects generate their own worksheet in each runtime first."""
-        if self.dmp_path is not None and Path(self.dmp_path).exists():
-            return Path(self.dmp_path)
-        if self.session is not None:
-            # A new/reopened manual project must generate its own worksheet;
-            # a matching school slug on disk can belong to a different project.
-            if self.session.source_kind in {"manual", "bom"}:
-                return None
-            return latest_rev_path(self.output_dir, f"{self._school_slug()}_dmp")
-        return None
+        return self._door_chart_source()[0]
+
+    def _confirm_chart_source(self, src: Path, status: str) -> str:
+        """Ask before building from a worksheet that may not match. 'use' | 'cancel'."""
+        if status == "stale":
+            title = "Worksheet may be stale"
+            body = (f"The design has changed since {src.name} was generated.\n\n"
+                    "The door chart is built from that file, so it won't include "
+                    "the newer edits. Generate the door chart anyway?\n\n"
+                    "(Tip: regenerate the worksheet first to pick up your edits.)")
+        else:
+            title = "Confirm worksheet"
+            body = (f"This project has no record of generating a worksheet. The "
+                    f"newest one saved for this school is {src.name}, but it may "
+                    "belong to a different project or be out of date.\n\n"
+                    "Build the door chart from it anyway?")
+        return "use" if messagebox.askyesno(title, body) else "cancel"
 
     def _set_generating(self, which: str | None):
         self._generating = which
@@ -1619,8 +1640,8 @@ class App:
             return
 
         def proceed():
-            worksheet_epoch = self.editor.edit_epoch
-            design = copy.deepcopy(self.session.design)
+            session = self.session
+            design = copy.deepcopy(session.design)
             project_legacy_topology(design)
             sync_master_zones(design)
             # Persist the per-machine site defaults (tech, IP, ...). Phone and
@@ -1649,13 +1670,15 @@ class App:
                 with contextlib.redirect_stdout(self._redirector), \
                      contextlib.redirect_stderr(self._redirector):
                     write_dmp_xlsx(design, DEFAULT_TEMPLATE, out_path)
-                return out_path
+                return out_path, worksheet_fingerprint(design)
 
-            def on_done(out_path):
+            def on_done(result):
+                out_path, fingerprint = result
                 self._set_generating(None)
-                self.dmp_path = out_path
-                if self.editor is not None:
-                    self._ws_epoch = worksheet_epoch
+                if self.session is session:
+                    self.dmp_path = out_path
+                    record_worksheet(session, out_path, fingerprint,
+                                     update_file=not self.editor.dirty)
                 rev = out_path.stem.rsplit("_rev", 1)[-1]
                 self._show_toast(
                     f"Worksheet rev {rev} ready",
@@ -1791,7 +1814,7 @@ class App:
             return
         if not getattr(self.editor, 'generation_allowed', lambda: True)():
             return
-        src = self._latest_worksheet_path()
+        src, status = self._door_chart_source()
         if src is None:
             messagebox.showinfo(
                 "No worksheet yet",
@@ -1799,15 +1822,7 @@ class App:
             return
         # The chart reads the worksheet FILE, so editor changes newer than
         # that file won't be in it. Warn (never block) when that's the case.
-        stale = (self._ws_epoch != self.editor.edit_epoch
-                 if self._ws_epoch is not None else self.editor.edit_epoch > 0)
-        if stale and not messagebox.askyesno(
-            "Worksheet may be stale",
-            f"The design has changed since {src.name} was generated.\n\n"
-            "The door chart is built from that file, so it won't include the "
-            "newer edits. Generate the door chart anyway?\n\n"
-            "(Tip: regenerate the worksheet first to pick up your edits.)",
-        ):
+        if status != "current" and self._confirm_chart_source(src, status) != "use":
             return
 
         out_dir = self.output_dir
@@ -2079,7 +2094,6 @@ class App:
         self.parsed_design = None
         self.session = None
         self.state = "idle"
-        self._ws_epoch = None
         self._stop_spinners()
         self._teardown_editor()
         self.action_section.grid_remove()
