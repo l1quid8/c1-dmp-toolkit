@@ -14,7 +14,10 @@ asking.
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import dataclasses
+import hashlib
 import json
 import os
 import re
@@ -74,6 +77,11 @@ class Session:
     topology_confirmed: bool = False
     saved_at: Optional[str] = None   # ISO timestamp of last clean save
     path: Optional[Path] = None      # where this session lives on disk
+    # Which worksheet a door chart should be built from, and a fingerprint of
+    # the design it was written from. Bookkeeping, not project content, so
+    # it's excluded from equality (exports must not "change" a project).
+    worksheet_path: Optional[str] = field(default=None, compare=False)
+    worksheet_fingerprint: Optional[str] = field(default=None, compare=False)
 
 
 def renumber_session_keypad(session: Session, number: int, new_number: int) -> Keypad:
@@ -165,6 +173,40 @@ def unique_session_path(design: DMPDesign) -> Path:
 
 def recovery_path(session_path: Path) -> Path:
     return session_path.parent / (session_path.name + RECOVERY_SUFFIX)
+
+
+def worksheet_fingerprint(design: DMPDesign) -> str:
+    """A hash of everything the worksheet is written from.
+
+    The riser drawing is left out: moving riser symbols doesn't change the
+    worksheet, so it shouldn't make a door chart look out of date."""
+    snapshot = copy.deepcopy(design)
+    project_legacy_topology(snapshot)
+    sync_master_zones(snapshot)
+    data = design_to_dict(snapshot)
+    data.pop("riser_document", None)
+    text = json.dumps(data, sort_keys=True)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def record_worksheet(session: Session, worksheet: Path, fingerprint: str,
+                     *, update_file: bool) -> None:
+    """Remember the worksheet a door chart should use.
+
+    update_file also writes the record into the saved project, so it survives
+    closing the app without another save. Only pass it when the editor has no
+    unsaved changes: touching the file then would make a pending crash-recovery
+    snapshot look older than the project and stop it from being offered."""
+    session.worksheet_path = str(worksheet)
+    session.worksheet_fingerprint = fingerprint
+    if not update_file or session.path is None or not Path(session.path).exists():
+        return
+    # Bookkeeping only: a failed write leaves the record in memory for the next save.
+    with contextlib.suppress(OSError, ValueError):
+        target = Path(session.path)
+        data = json.loads(target.read_text(encoding="utf-8"))
+        data["worksheet"] = {"path": session.worksheet_path, "fingerprint": fingerprint}
+        _atomic_write(target, json.dumps(data, indent=1))
 
 
 # -------- DMPDesign <-> dict --------
@@ -446,6 +488,8 @@ def _session_to_dict(session: Session) -> dict:
         "source": {"kind": session.source_kind, "name": session.source_name},
         "topology_confirmed": session.topology_confirmed,
         "remotelink": config_to_dict(session.remotelink),
+        "worksheet": {"path": session.worksheet_path,
+                      "fingerprint": session.worksheet_fingerprint},
         "design": design_to_dict(session.design),
     }
 
@@ -459,6 +503,7 @@ def _session_from_dict(d: dict, path: Path) -> Session:
             "Update the app to open it."
         )
     source = d.get("source") or {}
+    worksheet = d.get("worksheet") or {}
     design_data = d.get("design") or {}
     design = design_from_dict(design_data)
     if version < 2 or "connections" not in design_data:
@@ -473,6 +518,8 @@ def _session_from_dict(d: dict, path: Path) -> Session:
         topology_confirmed=bool(d.get("topology_confirmed", False)),
         saved_at=d.get("saved_at"),
         path=path,
+        worksheet_path=worksheet.get("path"),
+        worksheet_fingerprint=worksheet.get("fingerprint"),
     )
 
 
@@ -578,8 +625,26 @@ def pending_recovery(session_path: Path) -> Optional[datetime]:
 
 
 def load_recovery(session_path: Path) -> Session:
-    session = _session_from_dict(
-        json.loads(recovery_path(session_path).read_text(encoding="utf-8")),
-        session_path,
-    )
-    return session
+    rec = recovery_path(session_path)
+    try:
+        d = json.loads(rec.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SessionLoadError(f"Couldn't read {rec.name}: {exc}") from exc
+    try:
+        return _session_from_dict(d, session_path)
+    except SessionLoadError:
+        raise
+    except Exception as exc:
+        raise SessionLoadError(f"{rec.name} is damaged: {exc}") from exc
+
+
+def set_aside_recovery(session_path: Path) -> Path | None:
+    """Rename an unreadable recovery file so it stops being offered on open,
+    without destroying it. Returns the new path, or None if nothing moved."""
+    rec = recovery_path(session_path)
+    target = rec.with_name(rec.name + ".unreadable")
+    try:
+        os.replace(rec, target)
+    except OSError:
+        return None
+    return target

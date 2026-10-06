@@ -1,6 +1,6 @@
 # Project priorities
 
-Reviewed September 12, 2026. This is a proposed backlog, not a promise that a
+Reviewed October 6, 2026. This is a proposed backlog, not a promise that a
 feature is available. Effort estimates are relative: **S** is a focused change,
 **M** spans several components, **L** needs a separate design and migration plan.
 
@@ -47,9 +47,9 @@ below as they are selected for work.
 
 | Priority | Improvement | Why it matters | Effort | Done when |
 |---|---|---|---|---|
-| P0 | Snapshot exports and track the revision actually generated | Editing while a worksheet is generated can make an older export appear current | S–M | Exports use a captured design/configuration and starting edit epoch; completion cannot update another project's state; an edit during generation leaves the worksheet stale |
-| P1 | Show recovery-save health | A failed recovery write is currently suppressed, so crash protection can fail without notice | S–M | Failed writes produce a persistent, actionable status; slow storage does not block editing; successful retry clears the warning |
-| P1 | Verify updater payloads and preserve rollback | Updating should recover cleanly from corrupt downloads, wrong bundles, failed replacements, or launch failures | M | Bundle/version and integrity checks precede replacement; failure paths are tested on both platforms; the previous build survives until a successful startup |
+| Done (1.7.3) | Snapshot exports and track the revision actually generated | Editing while a worksheet is generated can make an older export appear current | S–M | Exports already used a captured design and could not update another project's state. 1.7.3 saves which worksheet the project made with a fingerprint of the design, so an edit during generation (or after) still shows as stale after the project is reopened |
+| Done (1.7.3) | Show recovery-save health | A failed recovery write was suppressed, so crash protection could fail without notice | S–M | A failed write shows "Unsaved — auto-backup failed, save now" until a retry or save succeeds |
+| P1 | Verify updater payloads and preserve rollback | Updating should recover cleanly from wrong bundles, failed replacements, or launch failures | M | 1.7.3 shipped checksum verification and made Cancel discard a staged update. Remaining: a bundle/version check of the extracted app before replacement, failure paths tested on both platforms, and keeping the previous build until the new one starts successfully |
 | P2 | Extend undo to hardware changes | Hardware additions/removals change shared zones and wiring and do not share canvas undo behavior | L | Undo restores device, zones, wiring and layout together across tabs; redo and save/reopen preserve the result |
 
 ### Evidence and scope

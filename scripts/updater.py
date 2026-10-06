@@ -20,14 +20,17 @@ strips quarantine defensively.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import urllib.request
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from paths import resource_path
@@ -76,14 +79,17 @@ def is_newer(latest: tuple[int, ...], current: tuple[int, ...]) -> bool:
 # Release lookup                                                               #
 # --------------------------------------------------------------------------- #
 
-def _select_asset(assets: list[dict]) -> str | None:
+class UpdateError(Exception):
+    """A download that must not be installed; the message is shown to the user."""
+
+
+def _select_asset(assets: list[dict]) -> dict | None:
     suffix = _ASSET_SUFFIX.get(sys.platform)
     if not suffix:
         return None
     for a in assets:
-        name = a.get("name") or ""
-        if name.endswith(suffix):
-            return a.get("browser_download_url")
+        if (a.get("name") or "").endswith(suffix):
+            return a
     return None
 
 
@@ -91,7 +97,8 @@ def fetch_latest(timeout: float = 5.0) -> dict | None:
     """Return info about the latest release, or None on any failure/offline.
 
     Result keys: tag, version (tuple), notes (release body), asset_url (platform
-    zip download), html_url (release page).
+    zip download), asset_digest (GitHub's "sha256:<hex>" for that zip, or None),
+    html_url (release page).
     """
     req = urllib.request.Request(
         _API_LATEST,
@@ -104,11 +111,13 @@ def fetch_latest(timeout: float = 5.0) -> dict | None:
         return None
 
     tag = data.get("tag_name") or ""
+    asset = _select_asset(data.get("assets") or []) or {}
     return {
         "tag": tag,
         "version": parse_version(tag),
         "notes": (data.get("body") or "").strip(),
-        "asset_url": _select_asset(data.get("assets") or []),
+        "asset_url": asset.get("browser_download_url"),
+        "asset_digest": asset.get("digest"),
         "html_url": data.get("html_url") or _RELEASES_PAGE,
     }
 
@@ -163,7 +172,7 @@ def download(url: str, dest: Path, progress_cb=None, timeout: float = 30.0) -> N
 
 
 # --------------------------------------------------------------------------- #
-# Install (extract + detached swap-and-relaunch)                              #
+# Install (extract, stage, detached swap-and-relaunch)                        #
 # --------------------------------------------------------------------------- #
 
 def _work_dir(install_path: Path) -> Path:
@@ -268,28 +277,58 @@ del "%~f0"
     return script
 
 
-def apply_update(zip_path: Path) -> bool:
-    """Swap the running app for the downloaded build and relaunch.
+def verify_download(zip_path: Path, digest: str | None) -> None:
+    """Refuse a download that doesn't match the SHA-256 GitHub published for it."""
+    algo, _, expected = (digest or "").partition(":")
+    if algo != "sha256" or not expected:
+        raise UpdateError("This release has no checksum, so the download "
+                          "can't be verified.")
+    h = hashlib.sha256()
+    with open(zip_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    if h.hexdigest() != expected.lower():
+        raise UpdateError("The download was damaged or incomplete.")
 
-    Returns True after launching the detached helper (the caller should then quit
-    the app so the helper can replace its files). Returns False if self-update
-    isn't possible (dev run / unknown platform / malformed archive).
-    """
+
+@dataclass
+class StagedUpdate:
+    """An extracted build plus the swap script that will install it. Nothing
+    runs until launch_staged(), so the user can still back out."""
+    command: list[str]
+    work: Path
+    creationflags: int = 0
+
+
+def stage_update(zip_path: Path) -> StagedUpdate | None:
+    """Extract the new build and write the swap script, without starting it.
+
+    Returns None if self-update isn't possible (dev run / unknown platform /
+    malformed archive)."""
     app = install_dir()
     if app is None or sys.platform not in _ASSET_SUFFIX:
-        return False
-
+        return None
     work = _work_dir(app)
     payload = prepare_payload(zip_path, work)
     if payload is None:
-        return False
-
+        shutil.rmtree(work, ignore_errors=True)
+        return None
     if sys.platform == "darwin":
         script = _write_mac_script(payload, app, work)
-        subprocess.Popen(["/bin/bash", str(script)], start_new_session=True)
-    else:  # win32
-        script = _write_windows_script(payload, app, work)
-        flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-        subprocess.Popen(["cmd", "/c", str(script)], creationflags=flags,
-                          close_fds=True)
-    return True
+        return StagedUpdate(["/bin/bash", str(script)], work)
+    script = _write_windows_script(payload, app, work)
+    flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    return StagedUpdate(["cmd", "/c", str(script)], work, creationflags=flags)
+
+
+def launch_staged(staged: StagedUpdate) -> None:
+    """Start the detached helper; it swaps files once this process exits."""
+    if staged.creationflags:
+        subprocess.Popen(staged.command, creationflags=staged.creationflags,
+                         close_fds=True)
+    else:
+        subprocess.Popen(staged.command, start_new_session=True)
+
+
+def discard_staged(staged: StagedUpdate) -> None:
+    shutil.rmtree(staged.work, ignore_errors=True)

@@ -370,7 +370,7 @@ def export_controller(tmp_path, monkeypatch):
     controller.state, controller._generating = "editing", None
     controller.pdf_path = controller.dmp_path = controller.door_chart_path = None
     controller.output_dir, controller.root = tmp_path, None
-    controller._ws_epoch, controller._redirector = None, io.StringIO()
+    controller._redirector = io.StringIO()
     notes, messages, completed = [], [], []
 
     def show_issues(proceed, *, proceed_label, note=None):
@@ -581,9 +581,13 @@ def test_worksheet_snapshot_keeps_mid_generation_edits_stale_for_chart(export_co
     finally:
         workbook.close()
     assert controller.session == before_work
-    assert controller._ws_epoch == 4
+    from session import worksheet_fingerprint
+    assert controller.session.worksheet_path == str(controller.dmp_path)
+    assert controller.session.worksheet_fingerprint != worksheet_fingerprint(controller.session.design)
+    seen = []
+    controller._confirm_chart_source = lambda src, status: (seen.append(status), "cancel")[1]
     controller._generate_door_chart()
-    assert messages and messages[-1][0] == "Worksheet may be stale"
+    assert seen == ["stale"]
 
 
 def test_source_free_manual_session_saves_reopens_and_exports_all_deliverables(export_controller):

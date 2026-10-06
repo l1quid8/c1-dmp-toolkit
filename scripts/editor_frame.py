@@ -24,6 +24,7 @@ import theme
 from topology_service import project_legacy_topology, prune_unknown_connections
 from hardware import HardwareError, snapshot_refs, diff_refs, sync_rsp_zone_buses
 from session import Session, save_session, sync_master_zones, write_recovery, clear_recovery
+from timefmt import clock_time
 from validation import validate_design, badge_counts, badge_counts_by_severity
 from editor_zones import ZonesTab
 from editor_remotelink import RemoteLinkTab
@@ -331,9 +332,10 @@ class EditorFrame(ctk.CTkFrame):
         self._topology_signature = _graph_signature(session.design)
         self._location_signature = location_values(session.design)
         self.dirty = False
-        # Bumped on every edit; the app snapshots it after a worksheet generate
-        # to warn when a door chart would be built from a stale worksheet.
+        # Bumped on every edit. Door-chart staleness no longer reads it (the
+        # session's worksheet fingerprint does, and survives reopen).
         self.edit_epoch = 0
+        self._recovery_failed = False
         self._recovery_job: str | None = None
         self._design_refresh_job: str | None = None
         self._on_generate_worksheet = self._guard_generation(on_generate_worksheet)
@@ -390,14 +392,25 @@ class EditorFrame(ctk.CTkFrame):
         delay = 0 if write_now else RECOVERY_DEBOUNCE_MS
         self._recovery_job = self.root.after(delay, self._write_recovery)
 
+    @property
+    def backup_failed(self) -> bool:
+        """True while the crash-protection snapshot can't be written."""
+        return self._recovery_failed
+
     def _write_recovery(self):
         self._recovery_job = None
         if not self.dirty:
             return
         if hasattr(self, "riser_tab"):
             self.riser_tab.cancel(redraw=False)
-        with contextlib.suppress(Exception):
+        try:
             write_recovery(self.session)
+            failed = False
+        except Exception:
+            failed = True
+        if failed != self._recovery_failed:
+            self._recovery_failed = failed
+            self._notify_status()
 
     def save(self, path: Path | None = None) -> bool:
         """Save the current project, optionally switching to a new file."""
@@ -417,6 +430,7 @@ class EditorFrame(ctk.CTkFrame):
         if old_path is not None and old_path != self.session.path:
             clear_recovery(old_path)
         self.dirty = False
+        self._recovery_failed = False
         if self._recovery_job is not None:
             with contextlib.suppress(Exception):
                 self.root.after_cancel(self._recovery_job)
@@ -447,12 +461,15 @@ class EditorFrame(ctk.CTkFrame):
     def _notify_status(self):
         self._update_save_button()
         if self.dirty:
-            self.on_status_change("●  Unsaved changes", True)
+            if self._recovery_failed:
+                self.on_status_change("⚠  Unsaved — auto-backup failed, save now", True)
+            else:
+                self.on_status_change("●  Unsaved changes", True)
             return
         when = ""
         if self.session.saved_at:
             with contextlib.suppress(Exception):
-                when = datetime.fromisoformat(self.session.saved_at).strftime("%-I:%M %p")
+                when = clock_time(datetime.fromisoformat(self.session.saved_at))
         self.on_status_change(f"Saved {when} ✓" if when else "Saved ✓", False)
 
     def _update_save_button(self):

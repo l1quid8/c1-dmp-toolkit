@@ -6,6 +6,7 @@ import queue
 import threading
 import subprocess
 import contextlib
+import shutil
 import tempfile
 import webbrowser
 from datetime import date, datetime
@@ -45,11 +46,15 @@ from session import (
     normalize_rsp_tokens,
     normalize_zone_descriptions,
     pending_recovery,
+    record_worksheet,
     save_session,
     sessions_dir,
+    set_aside_recovery,
     sync_master_zones,
     unique_session_path,
+    worksheet_fingerprint,
 )
+from timefmt import short_datetime
 from editor_frame import EditorFrame, _site_defaults
 from new_project_dialog import ask_new_project
 from topology_service import ensure_explicit_topology, project_legacy_topology
@@ -274,9 +279,6 @@ class App:
         # Generation runs in the background while the editor stays up.
         self._generating: str | None = None
         self._creating_project = False
-        # editor.edit_epoch at the moment the last worksheet was generated —
-        # lets the door-chart action warn when the worksheet has gone stale.
-        self._ws_epoch: int | None = None
 
         self._spinner_jobs: list[str] = []
         self._recent_scan = None
@@ -683,16 +685,23 @@ class App:
         save_prefs({**load_prefs(), "appearance_mode": mode})
 
     def _set_project_title(self, text: str | None, dirty: bool = False,
-                           status: str = ""):
+                           status: str = "", backup_failed: bool = False):
         """Paint the header's project block. `status` is the editor's save
-        string ("Saved 2:41 PM ✓"), which the saved pill shows verbatim."""
+        string ("Saved 2:41 PM ✓"), which the saved pill shows verbatim. A
+        failed crash-protection backup shows the editor's warning instead of
+        the ordinary unsaved label."""
         if text:
             self._title_lbl.configure(text=text.upper(), text_color=theme.TEXT)
             if self._source_lbl.winfo_manager() != "pack":
                 self._source_lbl.pack(anchor="w")
-            self._save_pill.set_variant("warning" if dirty else "success")
-            self._save_pill.set_text(
-                "● Unsaved changes" if dirty else (status or "Saved ✓"))
+            if dirty and backup_failed:
+                variant, label = "error", status
+            elif dirty:
+                variant, label = "warning", "● Unsaved changes"
+            else:
+                variant, label = "success", status or "Saved ✓"
+            self._save_pill.set_variant(variant)
+            self._save_pill.set_text(label)
             self._save_pill.grid(row=0, column=2, padx=(theme.PAD["md"], 0))
         else:
             self._title_lbl.configure(text="No project open",
@@ -709,7 +718,8 @@ class App:
         school = ""
         if self.session:
             school = self.session.design.site_info.school_name or "Untitled project"
-        self._set_project_title(school, dirty, status=text)
+        backup_failed = bool(getattr(self.editor, "backup_failed", False))
+        self._set_project_title(school, dirty, status=text, backup_failed=backup_failed)
         # The first save creates session.path, which enables Revert.
         self._set_toolbar_enabled(self.state == "editing")
 
@@ -960,13 +970,10 @@ class App:
     @staticmethod
     def _recent_meta(summary) -> str:
         """"Saved Jul 1, 1:38 PM · from northview.pdf" — the ISO timestamp read
-        as machine output, so it's rendered the way a person would say it.
-        %-d / %-I aren't portable, hence the manual assembly."""
+        as machine output, so it's rendered the way a person would say it."""
         saved = summary.saved_at or ""
         with contextlib.suppress(ValueError, TypeError):
-            when = datetime.fromisoformat(summary.saved_at)
-            saved = (f"{when:%b} {when.day}, {when.hour % 12 or 12}"
-                     f":{when:%M} {when:%p}")
+            saved = short_datetime(datetime.fromisoformat(summary.saved_at))
         parts = [f"Saved {saved}"] if saved else []
         if summary.source_name:
             parts.append(f"from {summary.source_name}")
@@ -1329,8 +1336,11 @@ class App:
             self._stop_spinners()
             self._show_file_card(pdf_path.name, parsing=False,
                                  school_name=design.site_info.school_name or "Unknown")
+            # A PDF import starts a NEW project: never reuse the school-name
+            # slot, which may hold a field-corrected project for the same site.
             self._enter_editor(Session(design=design, source_kind="pdf",
-                                       source_name=pdf_path.name))
+                                       source_name=pdf_path.name,
+                                       path=unique_session_path(design)))
 
         def on_error(exc):
             if self.state != "parsing":
@@ -1402,7 +1412,8 @@ class App:
             self._show_file_card(xlsx_path.name, parsing=False, school_name=school)
             self._enter_editor(Session(design=design, source_kind="xlsx",
                                        source_name=xlsx_path.name,
-                                       path=unique_session_path(design)))
+                                       path=unique_session_path(design),
+                                       worksheet_path=str(xlsx_path)))
 
         def on_error(exc):
             if self.state != "loading_xlsx":
@@ -1442,7 +1453,6 @@ class App:
         self.session = session
         self.parsed_design = session.design  # generation flows read this
         self.state = "editing"
-        self._ws_epoch = None  # no worksheet generated for this project yet
 
         self._teardown_editor()
         self.editor = EditorFrame(
@@ -1458,14 +1468,15 @@ class App:
         )
         self.editor.grid(row=0, column=0, sticky="nsew")
         self._sync_fullscreen_controls()
-        if session.source_kind == "xlsx" and self.dmp_path is not None:
-            # The imported worksheet IS the design as of right now — treat it
-            # as in-sync so the door-chart staleness warning only fires for
-            # edits made after import.
-            self._ws_epoch = self.editor.edit_epoch
         if session.saved_at is None:
             # Fresh parse: seed the per-machine defaults the old form offered.
             self.editor.prefill_site_defaults(load_prefs())
+        if (session.source_kind == "xlsx" and session.saved_at is None
+                and session.worksheet_path and not session.worksheet_fingerprint):
+            # The imported worksheet IS the design as of right now (machine
+            # defaults included), so the door chart treats it as current.
+            record_worksheet(session, Path(session.worksheet_path),
+                             worksheet_fingerprint(session.design), update_file=False)
         self._show_editor_surface()
         self._set_toolbar_enabled(True)
         if session.source_name:
@@ -1495,15 +1506,25 @@ class App:
         if self.editor and not self.editor.maybe_close():
             return
         try:
+            session = None
             rec_time = pending_recovery(path)
             if rec_time and messagebox.askyesno(
                 "Recover unsaved changes?",
-                f"Unsaved changes from {rec_time.strftime('%b %-d, %-I:%M %p')} "
+                f"Unsaved changes from {short_datetime(rec_time)} "
                 "were found for this project (the app may have closed "
                 "unexpectedly).\n\nRecover them?",
             ):
-                session = load_recovery(path)
-            else:
+                try:
+                    session = load_recovery(path)
+                except SessionLoadError as exc:
+                    # A damaged backup must never lock the project: keep it
+                    # aside for inspection and open the last saved version.
+                    set_aside_recovery(path)
+                    messagebox.showwarning(
+                        "Couldn't recover unsaved changes",
+                        f"{exc}\n\nOpening the last saved version instead.",
+                    )
+            if session is None:
                 clear_recovery(path)
                 session = load_session(path)
         except SessionLoadError as exc:
@@ -1561,27 +1582,87 @@ class App:
     def _school_slug(self) -> str:
         return _slugify(self.session.design.site_info.school_name or "output")
 
+    def _door_chart_source(self) -> tuple[Path | None, str]:
+        """The worksheet a door chart would be built from, and whether it
+        matches the project: 'current', 'stale', or 'unknown' (found by school
+        name; this project never recorded making it)."""
+        session = self.session
+        if session is None:
+            return None, "unknown"
+        if session.worksheet_path and Path(session.worksheet_path).exists():
+            fresh = worksheet_fingerprint(session.design) == session.worksheet_fingerprint
+            return Path(session.worksheet_path), "current" if fresh else "stale"
+        # A manual/BOM project must generate its own worksheet; a matching
+        # school slug on disk can belong to a different project.
+        if session.source_kind in {"manual", "bom"}:
+            return None, "unknown"
+        # Projects saved before worksheet tracking, or whose worksheet moved.
+        return latest_rev_path(self.output_dir, f"{self._school_slug()}_dmp"), "unknown"
+
     def _latest_worksheet_path(self) -> Path | None:
-        """The worksheet a door chart would be built from: the last one this
-        session touched (a generated rev, or the imported source xlsx), else
-        the highest rev on disk from an imported project's previous session.
-        Manual projects generate their own worksheet in each runtime first."""
-        if self.dmp_path is not None and Path(self.dmp_path).exists():
-            return Path(self.dmp_path)
-        if self.session is not None:
-            # A new/reopened manual project must generate its own worksheet;
-            # a matching school slug on disk can belong to a different project.
-            if self.session.source_kind in {"manual", "bom"}:
-                return None
-            return latest_rev_path(self.output_dir, f"{self._school_slug()}_dmp")
-        return None
+        return self._door_chart_source()[0]
+
+    def _confirm_chart_source(self, src: Path, status: str) -> str:
+        """Ask before building a door chart from a worksheet that may not match
+        the project. Returns 'regenerate', 'use', or 'cancel'."""
+        if status == "stale":
+            title = "Worksheet is out of date"
+            body = (f"You've changed this project since {src.name} was made. "
+                    "The door chart is built from that file, so it won't "
+                    "include those changes.")
+        else:
+            title = "Check the worksheet"
+            body = (f"This project has no record of making a worksheet. The newest "
+                    f"one saved for this school is {src.name}, but it may belong "
+                    "to a different project or be out of date.")
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title(title)
+        dlg.geometry("560x230")
+        dlg.configure(fg_color=theme.APP_BG)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        choice = "cancel"
+        ctk.CTkLabel(dlg, text=title, font=theme.ui_font(16, "bold"),
+                     text_color=theme.TEXT).pack(anchor="w", padx=20, pady=(20, 8))
+        ctk.CTkLabel(dlg, text=body, wraplength=520, justify="left", anchor="w",
+                     text_color=theme.TEXT_SECOND).pack(fill="x", padx=20)
+
+        def pick(value):
+            nonlocal choice
+            choice = value
+            dlg.destroy()
+
+        buttons = ctk.CTkFrame(dlg, fg_color="transparent")
+        buttons.pack(fill="x", side="bottom", padx=20, pady=16)
+        ctk.CTkButton(buttons, text="Regenerate worksheet first", width=210,
+                      command=lambda: pick("regenerate")).pack(side="right")
+        ctk.CTkButton(buttons, text="Use this file anyway", width=160,
+                      fg_color=theme.SURFACE_CHIP, text_color=theme.TEXT,
+                      command=lambda: pick("use")).pack(side="right", padx=8)
+        ctk.CTkButton(buttons, text="Cancel", width=80,
+                      command=dlg.destroy).pack(side="left")
+        dlg.bind("<Escape>", lambda _event: dlg.destroy())
+        self.root.wait_window(dlg)
+        return choice
 
     def _set_generating(self, which: str | None):
         self._generating = which
         if self.editor is not None:
             self.editor.set_generating(which)
 
-    def _generate_worksheet(self):
+    def _save_before_generating(self, prompt: str) -> bool:
+        """Offer to save unsaved edits before an export.
+
+        Returns False when the export must stop: the user chose Save and it
+        failed (the editor has already said why). Choosing not to save still
+        generates from what's on screen."""
+        if not self.editor.dirty:
+            return True
+        if not messagebox.askyesno("Save project?", prompt):
+            return True
+        return self.editor.save()
+
+    def _generate_worksheet(self, *, then=None):
         """Generate the next worksheet revision without leaving the editor.
 
         Validation warns but never blocks — the printed sheet is itself a
@@ -1591,14 +1672,12 @@ class App:
             return
         if not getattr(self.editor, 'generation_allowed', lambda: True)():
             return
-        if self.editor.dirty and messagebox.askyesno(
-            "Save project?", "Save the project before generating?",
-        ):
-            self.editor.save()
+        if not self._save_before_generating("Save the project before generating?"):
+            return
 
         def proceed():
-            worksheet_epoch = self.editor.edit_epoch
-            design = copy.deepcopy(self.session.design)
+            session = self.session
+            design = copy.deepcopy(session.design)
             project_legacy_topology(design)
             sync_master_zones(design)
             # Persist the per-machine site defaults (tech, IP, ...). Phone and
@@ -1624,22 +1703,31 @@ class App:
                     ensure_searchable_pdf(pdf_path)
                 out_dir.mkdir(parents=True, exist_ok=True)
                 out_path = next_rev_path(out_dir, f"{slug}_dmp")
+                # Fingerprint before writing: the writer fills in details on
+                # its copy, and the record must match the project, not that.
+                fingerprint = worksheet_fingerprint(design)
                 with contextlib.redirect_stdout(self._redirector), \
                      contextlib.redirect_stderr(self._redirector):
                     write_dmp_xlsx(design, DEFAULT_TEMPLATE, out_path)
-                return out_path
+                return out_path, fingerprint
 
-            def on_done(out_path):
+            def on_done(result):
+                out_path, fingerprint = result
                 self._set_generating(None)
-                self.dmp_path = out_path
-                if self.editor is not None:
-                    self._ws_epoch = worksheet_epoch
+                if self.session is session:
+                    self.dmp_path = out_path
+                    record_worksheet(session, out_path, fingerprint,
+                                     update_file=not self.editor.dirty)
                 rev = out_path.stem.rsplit("_rev", 1)[-1]
                 self._show_toast(
                     f"Worksheet rev {rev} ready",
                     action=("Open", lambda: open_file(out_path)),
                     meta=f"{out_path.name} · {len(design.zones)} zones",
                     folder=out_path)
+                if then is not None and self.session is session:
+                    # Only after a successful write for this same project, so a
+                    # failed or cancelled worksheet can't loop back into the chart.
+                    self.root.after(0, then)
 
             def on_error(exc):
                 self._set_generating(None)
@@ -1715,9 +1803,9 @@ class App:
         if not formats:
             return
         self.editor.flush_design_refresh()
-        if self.editor.dirty and messagebox.askyesno(
-                "Save project?", "Save the project before generating the riser?"):
-            self.editor.save()
+        if not self._save_before_generating(
+                "Save the project before generating the riser?"):
+            return
 
         design = copy.deepcopy(self.session.design)
         if design.riser_document is None or not design.riser_document.elements:
@@ -1769,7 +1857,7 @@ class App:
             return
         if not getattr(self.editor, 'generation_allowed', lambda: True)():
             return
-        src = self._latest_worksheet_path()
+        src, status = self._door_chart_source()
         if src is None:
             messagebox.showinfo(
                 "No worksheet yet",
@@ -1777,16 +1865,13 @@ class App:
             return
         # The chart reads the worksheet FILE, so editor changes newer than
         # that file won't be in it. Warn (never block) when that's the case.
-        stale = (self._ws_epoch != self.editor.edit_epoch
-                 if self._ws_epoch is not None else self.editor.edit_epoch > 0)
-        if stale and not messagebox.askyesno(
-            "Worksheet may be stale",
-            f"The design has changed since {src.name} was generated.\n\n"
-            "The door chart is built from that file, so it won't include the "
-            "newer edits. Generate the door chart anyway?\n\n"
-            "(Tip: regenerate the worksheet first to pick up your edits.)",
-        ):
-            return
+        if status != "current":
+            choice = self._confirm_chart_source(src, status)
+            if choice == "regenerate":
+                self._generate_worksheet(then=self._generate_door_chart)
+                return
+            if choice != "use":
+                return
 
         out_dir = self.output_dir
         self._set_generating("chart")
@@ -1811,7 +1896,7 @@ class App:
             self._show_toast(
                 f"Door chart rev {rev} ready",
                 action=("Open", lambda: open_file(chart_path)),
-                meta=f"{chart_path.name} · {zones} zones",
+                meta=f"{chart_path.name} · from {src.name}",
                 folder=chart_path)
 
         def on_error(exc):
@@ -1841,10 +1926,8 @@ class App:
         if readiness:
             messagebox.showinfo("RemoteLink configuration warnings",
                                 "\n".join(i.message for i in readiness))
-        if self.editor.dirty and messagebox.askyesno(
-            "Save project?", "Save the project before generating?",
-        ):
-            self.editor.save()
+        if not self._save_before_generating("Save the project before generating?"):
+            return
         self._show_remotelink_dialog()
 
     def _show_remotelink_dialog(self):
@@ -2059,7 +2142,6 @@ class App:
         self.parsed_design = None
         self.session = None
         self.state = "idle"
-        self._ws_epoch = None
         self._stop_spinners()
         self._teardown_editor()
         self.action_section.grid_remove()
@@ -2382,18 +2464,22 @@ class App:
             self.root.after(0, lambda: bar.set(frac) if bar.winfo_exists() else None)
 
         def work():
+            zip_path = Path(tempfile.mkdtemp(prefix="dmp_dl_")) / "update.zip"
             try:
-                zip_path = Path(tempfile.mkdtemp(prefix="dmp_dl_")) / "update.zip"
                 updater.download(info["asset_url"], zip_path, progress)
-                ok = updater.apply_update(zip_path)
+                updater.verify_download(zip_path, info.get("asset_digest"))
+                staged = updater.stage_update(zip_path)
             except Exception as exc:
-                self.root.after(0, lambda: self._update_failed(str(exc)))
+                msg = str(exc) or type(exc).__name__  # `exc` is unbound once this block ends
+                self.root.after(0, lambda: self._update_failed(msg))
                 return
-            if ok:
-                self.root.after(0, self._quit_for_update)
-            else:
+            finally:
+                shutil.rmtree(zip_path.parent, ignore_errors=True)
+            if staged is None:
                 self.root.after(0, lambda: self._update_failed(
                     "Self-update isn't available for this build."))
+                return
+            self.root.after(0, lambda: self._finish_update(staged))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -2419,10 +2505,18 @@ class App:
             pass
         os._exit(0)
 
-    def _quit_for_update(self):
-        """Quit so the detached helper can replace files and relaunch."""
+    def _finish_update(self, staged):
+        """Settle unsaved work first; only a confirmed quit arms the swap."""
+        if self._generating is not None and not messagebox.askyesno(
+                "Update now?", "Generation in progress — quit and update anyway?"):
+            updater.discard_staged(staged)
+            self._close_update_dialog()
+            return
         if self.state == "editing" and self.editor and not self.editor.maybe_close():
-            return  # user cancelled the save prompt — leave the app open
+            updater.discard_staged(staged)
+            self._close_update_dialog()
+            return  # user cancelled the save prompt — app stays open, nothing queued
+        updater.launch_staged(staged)
         self._shutdown()
 
     def _on_close(self):
