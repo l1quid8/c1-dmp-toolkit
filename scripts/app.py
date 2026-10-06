@@ -1593,6 +1593,18 @@ class App:
         if self.editor is not None:
             self.editor.set_generating(which)
 
+    def _save_before_generating(self, prompt: str) -> bool:
+        """Offer to save unsaved edits before an export.
+
+        Returns False when the export must stop: the user chose Save and it
+        failed (the editor has already said why). Choosing not to save still
+        generates from what's on screen."""
+        if not self.editor.dirty:
+            return True
+        if not messagebox.askyesno("Save project?", prompt):
+            return True
+        return self.editor.save()
+
     def _generate_worksheet(self):
         """Generate the next worksheet revision without leaving the editor.
 
@@ -1603,10 +1615,8 @@ class App:
             return
         if not getattr(self.editor, 'generation_allowed', lambda: True)():
             return
-        if self.editor.dirty and messagebox.askyesno(
-            "Save project?", "Save the project before generating?",
-        ):
-            self.editor.save()
+        if not self._save_before_generating("Save the project before generating?"):
+            return
 
         def proceed():
             worksheet_epoch = self.editor.edit_epoch
@@ -1727,9 +1737,9 @@ class App:
         if not formats:
             return
         self.editor.flush_design_refresh()
-        if self.editor.dirty and messagebox.askyesno(
-                "Save project?", "Save the project before generating the riser?"):
-            self.editor.save()
+        if not self._save_before_generating(
+                "Save the project before generating the riser?"):
+            return
 
         design = copy.deepcopy(self.session.design)
         if design.riser_document is None or not design.riser_document.elements:
@@ -1853,10 +1863,8 @@ class App:
         if readiness:
             messagebox.showinfo("RemoteLink configuration warnings",
                                 "\n".join(i.message for i in readiness))
-        if self.editor.dirty and messagebox.askyesno(
-            "Save project?", "Save the project before generating?",
-        ):
-            self.editor.save()
+        if not self._save_before_generating("Save the project before generating?"):
+            return
         self._show_remotelink_dialog()
 
     def _show_remotelink_dialog(self):
