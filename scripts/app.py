@@ -1328,8 +1328,11 @@ class App:
             self._stop_spinners()
             self._show_file_card(pdf_path.name, parsing=False,
                                  school_name=design.site_info.school_name or "Unknown")
+            # A PDF import starts a NEW project: never reuse the school-name
+            # slot, which may hold a field-corrected project for the same site.
             self._enter_editor(Session(design=design, source_kind="pdf",
-                                       source_name=pdf_path.name))
+                                       source_name=pdf_path.name,
+                                       path=unique_session_path(design)))
 
         def on_error(exc):
             if self.state != "parsing":

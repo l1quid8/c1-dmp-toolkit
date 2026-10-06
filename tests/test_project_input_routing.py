@@ -266,3 +266,24 @@ def test_input_close_guard_prevents_all_import_boundaries(controller, boundaries
     assert controller.session is old and not controller.entered and not controller.errors
     for spy in boundaries.values():
         spy.assert_not_called()
+
+
+def test_pdf_import_never_overwrites_saved_project_for_same_school(controller, boundaries, tmp_path):
+    # A revised design PDF must not replace the field-corrected project, or its
+    # pending crash-recovery slot, when saved.
+    existing = create_blank_session(SiteInfo(school_name="PDF SCHOOL"))
+    old = save_session(existing)
+    old_text = old.read_text()
+    reserved = tmp_path / "Sessions" / "PDF_SCHOOL (2).dmps"
+    session_module.recovery_path(reserved).write_text("{}", encoding="utf-8")
+    boundaries["build_dmp_design_from_pdf"].side_effect = None
+    boundaries["build_dmp_design_from_pdf"].return_value = create_blank_session(
+        SiteInfo(school_name="PDF SCHOOL")).design
+
+    controller._start_input(tmp_path / "revised.pdf")
+
+    project, _tab = controller.entered[0]
+    assert project.path == tmp_path / "Sessions" / "PDF_SCHOOL (3).dmps"
+    save_session(project)
+    assert old.read_text() == old_text
+    assert session_module.recovery_path(reserved).read_text(encoding="utf-8") == "{}"
