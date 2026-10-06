@@ -6,6 +6,7 @@ import queue
 import threading
 import subprocess
 import contextlib
+import shutil
 import tempfile
 import webbrowser
 from datetime import date, datetime
@@ -2455,18 +2456,22 @@ class App:
             self.root.after(0, lambda: bar.set(frac) if bar.winfo_exists() else None)
 
         def work():
+            zip_path = Path(tempfile.mkdtemp(prefix="dmp_dl_")) / "update.zip"
             try:
-                zip_path = Path(tempfile.mkdtemp(prefix="dmp_dl_")) / "update.zip"
                 updater.download(info["asset_url"], zip_path, progress)
-                ok = updater.apply_update(zip_path)
+                updater.verify_download(zip_path, info.get("asset_digest"))
+                staged = updater.stage_update(zip_path)
             except Exception as exc:
-                self.root.after(0, lambda: self._update_failed(str(exc)))
+                msg = str(exc) or type(exc).__name__  # `exc` is unbound once this block ends
+                self.root.after(0, lambda: self._update_failed(msg))
                 return
-            if ok:
-                self.root.after(0, self._quit_for_update)
-            else:
+            finally:
+                shutil.rmtree(zip_path.parent, ignore_errors=True)
+            if staged is None:
                 self.root.after(0, lambda: self._update_failed(
                     "Self-update isn't available for this build."))
+                return
+            self.root.after(0, lambda: self._finish_update(staged))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -2492,10 +2497,18 @@ class App:
             pass
         os._exit(0)
 
-    def _quit_for_update(self):
-        """Quit so the detached helper can replace files and relaunch."""
+    def _finish_update(self, staged):
+        """Settle unsaved work first; only a confirmed quit arms the swap."""
+        if self._generating is not None and not messagebox.askyesno(
+                "Update now?", "Generation in progress — quit and update anyway?"):
+            updater.discard_staged(staged)
+            self._close_update_dialog()
+            return
         if self.state == "editing" and self.editor and not self.editor.maybe_close():
-            return  # user cancelled the save prompt — leave the app open
+            updater.discard_staged(staged)
+            self._close_update_dialog()
+            return  # user cancelled the save prompt — app stays open, nothing queued
+        updater.launch_staged(staged)
         self._shutdown()
 
     def _on_close(self):
