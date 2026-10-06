@@ -15,7 +15,7 @@ jobs:
   tests:
     name: Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -56,11 +56,18 @@ jobs:
         # explicit GUI coverage as skips for CI; a separate interactive run
         # (no --no-gui) is used locally when a display is available.
         run: python -m pytest -q -ra --no-gui --junitxml=test-results/pytest.xml
+      - name: Run window-based tests
+        # The step above skips everything that opens a window (about a quarter
+        # of the suite). "Verify GUI runtime" proves this runner can create
+        # one, so run the full suite here too; a hang hits this step's timeout
+        # instead of the job's.
+        timeout-minutes: 20
+        run: python -m pytest -q -ra --junitxml=test-results/pytest-gui.xml
       - name: Upload test report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tests-${{ matrix.os }}
-          path: test-results/pytest.xml
+          path: test-results/
           if-no-files-found: ignore
           retention-days: 7
