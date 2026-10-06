@@ -584,8 +584,10 @@ def test_worksheet_snapshot_keeps_mid_generation_edits_stale_for_chart(export_co
     from session import worksheet_fingerprint
     assert controller.session.worksheet_path == str(controller.dmp_path)
     assert controller.session.worksheet_fingerprint != worksheet_fingerprint(controller.session.design)
+    seen = []
+    controller._confirm_chart_source = lambda src, status: (seen.append(status), "cancel")[1]
     controller._generate_door_chart()
-    assert messages and messages[-1][0] == "Worksheet may be stale"
+    assert seen == ["stale"]
 
 
 def test_source_free_manual_session_saves_reopens_and_exports_all_deliverables(export_controller):

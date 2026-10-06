@@ -1594,20 +1594,47 @@ class App:
         return self._door_chart_source()[0]
 
     def _confirm_chart_source(self, src: Path, status: str) -> str:
-        """Ask before building from a worksheet that may not match. 'use' | 'cancel'."""
+        """Ask before building a door chart from a worksheet that may not match
+        the project. Returns 'regenerate', 'use', or 'cancel'."""
         if status == "stale":
-            title = "Worksheet may be stale"
-            body = (f"The design has changed since {src.name} was generated.\n\n"
-                    "The door chart is built from that file, so it won't include "
-                    "the newer edits. Generate the door chart anyway?\n\n"
-                    "(Tip: regenerate the worksheet first to pick up your edits.)")
+            title = "Worksheet is out of date"
+            body = (f"You've changed this project since {src.name} was made. "
+                    "The door chart is built from that file, so it won't "
+                    "include those changes.")
         else:
-            title = "Confirm worksheet"
-            body = (f"This project has no record of generating a worksheet. The "
-                    f"newest one saved for this school is {src.name}, but it may "
-                    "belong to a different project or be out of date.\n\n"
-                    "Build the door chart from it anyway?")
-        return "use" if messagebox.askyesno(title, body) else "cancel"
+            title = "Check the worksheet"
+            body = (f"This project has no record of making a worksheet. The newest "
+                    f"one saved for this school is {src.name}, but it may belong "
+                    "to a different project or be out of date.")
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title(title)
+        dlg.geometry("560x230")
+        dlg.configure(fg_color=theme.APP_BG)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        choice = "cancel"
+        ctk.CTkLabel(dlg, text=title, font=theme.ui_font(16, "bold"),
+                     text_color=theme.TEXT).pack(anchor="w", padx=20, pady=(20, 8))
+        ctk.CTkLabel(dlg, text=body, wraplength=520, justify="left", anchor="w",
+                     text_color=theme.TEXT_SECOND).pack(fill="x", padx=20)
+
+        def pick(value):
+            nonlocal choice
+            choice = value
+            dlg.destroy()
+
+        buttons = ctk.CTkFrame(dlg, fg_color="transparent")
+        buttons.pack(fill="x", side="bottom", padx=20, pady=16)
+        ctk.CTkButton(buttons, text="Regenerate worksheet first", width=210,
+                      command=lambda: pick("regenerate")).pack(side="right")
+        ctk.CTkButton(buttons, text="Use this file anyway", width=160,
+                      fg_color=theme.SURFACE_CHIP, text_color=theme.TEXT,
+                      command=lambda: pick("use")).pack(side="right", padx=8)
+        ctk.CTkButton(buttons, text="Cancel", width=80,
+                      command=dlg.destroy).pack(side="left")
+        dlg.bind("<Escape>", lambda _event: dlg.destroy())
+        self.root.wait_window(dlg)
+        return choice
 
     def _set_generating(self, which: str | None):
         self._generating = which
@@ -1626,7 +1653,7 @@ class App:
             return True
         return self.editor.save()
 
-    def _generate_worksheet(self):
+    def _generate_worksheet(self, *, then=None):
         """Generate the next worksheet revision without leaving the editor.
 
         Validation warns but never blocks — the printed sheet is itself a
@@ -1667,10 +1694,13 @@ class App:
                     ensure_searchable_pdf(pdf_path)
                 out_dir.mkdir(parents=True, exist_ok=True)
                 out_path = next_rev_path(out_dir, f"{slug}_dmp")
+                # Fingerprint before writing: the writer fills in details on
+                # its copy, and the record must match the project, not that.
+                fingerprint = worksheet_fingerprint(design)
                 with contextlib.redirect_stdout(self._redirector), \
                      contextlib.redirect_stderr(self._redirector):
                     write_dmp_xlsx(design, DEFAULT_TEMPLATE, out_path)
-                return out_path, worksheet_fingerprint(design)
+                return out_path, fingerprint
 
             def on_done(result):
                 out_path, fingerprint = result
@@ -1685,6 +1715,10 @@ class App:
                     action=("Open", lambda: open_file(out_path)),
                     meta=f"{out_path.name} · {len(design.zones)} zones",
                     folder=out_path)
+                if then is not None and self.session is session:
+                    # Only after a successful write for this same project, so a
+                    # failed or cancelled worksheet can't loop back into the chart.
+                    self.root.after(0, then)
 
             def on_error(exc):
                 self._set_generating(None)
@@ -1822,8 +1856,13 @@ class App:
             return
         # The chart reads the worksheet FILE, so editor changes newer than
         # that file won't be in it. Warn (never block) when that's the case.
-        if status != "current" and self._confirm_chart_source(src, status) != "use":
-            return
+        if status != "current":
+            choice = self._confirm_chart_source(src, status)
+            if choice == "regenerate":
+                self._generate_worksheet(then=self._generate_door_chart)
+                return
+            if choice != "use":
+                return
 
         out_dir = self.output_dir
         self._set_generating("chart")
@@ -1848,7 +1887,7 @@ class App:
             self._show_toast(
                 f"Door chart rev {rev} ready",
                 action=("Open", lambda: open_file(chart_path)),
-                meta=f"{chart_path.name} · {zones} zones",
+                meta=f"{chart_path.name} · from {src.name}",
                 folder=chart_path)
 
         def on_error(exc):

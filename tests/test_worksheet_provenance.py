@@ -6,6 +6,7 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -157,3 +158,65 @@ def test_generating_worksheet_records_it_on_disk(controller, tmp_path, monkeypat
     assert controller.session.worksheet_path == str(sheet)
     assert controller.session.worksheet_fingerprint == worksheet_fingerprint(controller.session.design)
     assert load_session(path).worksheet_path == str(sheet)   # survives closing without saving
+
+
+def test_regenerate_choice_makes_worksheet_then_chart(controller, tmp_path):
+    sheet = tmp_path / "TRACK_SCHOOL_dmp_rev3.xlsx"
+    _record_current(controller, sheet)
+    controller.session.design.site_info.school_code = "EDITED"
+    controller._confirm_chart_source = lambda src, status: "regenerate"
+    chained = []
+    controller._generate_worksheet = lambda then=None: chained.append(then)
+
+    controller._generate_door_chart()
+
+    assert chained == [controller._generate_door_chart]
+    assert controller.started == []
+
+
+def _worksheet_ready(controller, monkeypatch, write):
+    controller.editor.show_issues_dialog = lambda proceed, **kw: proceed()
+    controller._show_toast = lambda *a, **k: None
+    monkeypatch.setattr(app_module, "load_prefs", lambda: {})
+    monkeypatch.setattr(app_module, "save_prefs", lambda prefs: None)
+    monkeypatch.setattr(app_module, "write_dmp_xlsx", write)
+
+
+def test_continuation_runs_after_successful_worksheet(controller, monkeypatch):
+    _worksheet_ready(controller, monkeypatch, lambda d, t, out: out.touch())
+    controller._run_async = lambda work, done, error: done(work())
+    then = Mock()
+    controller._generate_worksheet(then=then)
+    then.assert_called_once_with()
+
+
+def test_failed_worksheet_never_chains_into_chart(controller, monkeypatch):
+    def broken(design, template, out):
+        raise OSError("disk full")
+    _worksheet_ready(controller, monkeypatch, broken)
+    monkeypatch.setattr(app_module.messagebox, "showerror", lambda *a, **k: None)
+
+    def run(work, done, error):
+        try:
+            done(work())
+        except OSError as exc:
+            error(exc)
+
+    controller._run_async = run
+    then = Mock()
+    controller._generate_worksheet(then=then)
+    then.assert_not_called()
+
+
+def test_fresh_worksheet_is_current_even_if_writer_touches_its_copy(controller, monkeypatch):
+    # The real writer fills in power-supply details on the design copy it is
+    # handed; the record must describe the project, not the writer's scratch copy.
+    def mutating_writer(design, template, out):
+        design.site_info.school_code = "WRITER SCRATCH"
+        out.touch()
+    _worksheet_ready(controller, monkeypatch, mutating_writer)
+    controller._run_async = lambda work, done, error: done(work())
+
+    controller._generate_worksheet()
+
+    assert controller._door_chart_source()[1] == "current"
