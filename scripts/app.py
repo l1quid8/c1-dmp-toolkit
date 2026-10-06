@@ -685,16 +685,23 @@ class App:
         save_prefs({**load_prefs(), "appearance_mode": mode})
 
     def _set_project_title(self, text: str | None, dirty: bool = False,
-                           status: str = ""):
+                           status: str = "", backup_failed: bool = False):
         """Paint the header's project block. `status` is the editor's save
-        string ("Saved 2:41 PM ✓"), which the saved pill shows verbatim."""
+        string ("Saved 2:41 PM ✓"), which the saved pill shows verbatim. A
+        failed crash-protection backup shows the editor's warning instead of
+        the ordinary unsaved label."""
         if text:
             self._title_lbl.configure(text=text.upper(), text_color=theme.TEXT)
             if self._source_lbl.winfo_manager() != "pack":
                 self._source_lbl.pack(anchor="w")
-            self._save_pill.set_variant("warning" if dirty else "success")
-            self._save_pill.set_text(
-                "● Unsaved changes" if dirty else (status or "Saved ✓"))
+            if dirty and backup_failed:
+                variant, label = "error", status
+            elif dirty:
+                variant, label = "warning", "● Unsaved changes"
+            else:
+                variant, label = "success", status or "Saved ✓"
+            self._save_pill.set_variant(variant)
+            self._save_pill.set_text(label)
             self._save_pill.grid(row=0, column=2, padx=(theme.PAD["md"], 0))
         else:
             self._title_lbl.configure(text="No project open",
@@ -711,7 +718,8 @@ class App:
         school = ""
         if self.session:
             school = self.session.design.site_info.school_name or "Untitled project"
-        self._set_project_title(school, dirty, status=text)
+        backup_failed = bool(getattr(self.editor, "backup_failed", False))
+        self._set_project_title(school, dirty, status=text, backup_failed=backup_failed)
         # The first save creates session.path, which enables Revert.
         self._set_toolbar_enabled(self.state == "editing")
 

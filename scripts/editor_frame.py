@@ -392,6 +392,11 @@ class EditorFrame(ctk.CTkFrame):
         delay = 0 if write_now else RECOVERY_DEBOUNCE_MS
         self._recovery_job = self.root.after(delay, self._write_recovery)
 
+    @property
+    def backup_failed(self) -> bool:
+        """True while the crash-protection snapshot can't be written."""
+        return self._recovery_failed
+
     def _write_recovery(self):
         self._recovery_job = None
         if not self.dirty:

@@ -43,8 +43,8 @@ def background_editor(tmp_path):
     app.state, app.editor, app.session = "editing", editor, project
     app.root = editor.root
     header = {}
-    app._set_project_title = lambda title, dirty=False, status="": header.update(
-        title=title, dirty=dirty, status=status)
+    app._set_project_title = lambda title, dirty=False, status="", backup_failed=False: \
+        header.update(title=title, dirty=dirty, status=status)
     app._set_toolbar_enabled = lambda enabled: None
     app.test_header = header
 
